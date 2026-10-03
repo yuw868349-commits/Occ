@@ -13,3 +13,4 @@ function(occ_add_test name)
 endfunction()
 
 occ_add_test(occ_test_seccomp test_seccomp.cpp)
+occ_add_test(occ_test_container test_container.cpp)

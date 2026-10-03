@@ -118,6 +118,7 @@ add_library(occ_core STATIC
     src/util/fs.cpp
     src/probe/doctor.cpp
     src/isolation/seccomp.cpp
+    src/isolation/container.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

@@ -65,6 +65,14 @@ inline constexpr unsigned long kMsRelatime  = 1UL << 21;
 inline constexpr unsigned long kMsNosuid    = 2UL;
 inline constexpr unsigned long kMsNodev     = 4UL;
 inline constexpr unsigned long kMsNoexec    = 8UL;
+inline constexpr unsigned long kMsRdonly    = 1UL;
+
+// A bind mount's attributes can only be changed by a second mount call on
+// the same source and target, and that call has to carry MS_REMOUNT.
+// MS_BIND with MS_RDONLY and no MS_REMOUNT is refused with EINVAL, which
+// reads as "the filesystem does not support read-only" rather than as "the
+// flag combination is not the one that remounts".
+inline constexpr unsigned long kMsRemount   = 32UL;
 
 inline constexpr int kMntDetach = 2;
 
