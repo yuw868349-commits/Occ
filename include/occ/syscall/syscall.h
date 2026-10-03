@@ -305,4 +305,19 @@ Result setgroups(std::size_t size, const void* list) noexcept;
 Result capget(void* hdrp, void* datap) noexcept;
 Result capset(void* hdrp, const void* datap) noexcept;
 
+// ------------------------------------------------------------------ session
+
+Result getpgid(int pid) noexcept;
+Result setpgid(int pid, int pgid) noexcept;
+Result umask_syscall(unsigned int mask) noexcept;
+Result readlink(const char* path, char* buf, std::size_t size) noexcept;
+Result symlink(const char* target, const char* linkpath) noexcept;
+Result mknodat(int dirfd, const char* path, unsigned int mode,
+               unsigned long dev) noexcept;
+Result mknod(const char* path, unsigned int mode, unsigned long dev) noexcept;
+Result flock(int fd, int operation) noexcept;
+Result fchmodat(int dirfd, const char* path, unsigned int mode,
+                int flags) noexcept;
+Result chdir_syscall(const char* path) noexcept;
+
 } // namespace occ::sys

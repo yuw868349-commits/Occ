@@ -88,6 +88,13 @@ inline constexpr std::uint32_t kSeccompDataArgsOffset = 16;
 
 inline constexpr std::uint32_t kAudArchX8664 = 0xc000003eU;
 
+// SECCOMP_MODE_FILTER is 2; SECCOMP_MODE_DISABLED is 0 and
+// SECCOMP_MODE_STRICT is 1. <linux/seccomp.h> defines all three.
+//
+// PR_SET_SECCOMP and PR_SET_NO_NEW_PRIVS come from <linux/prctl.h>, which is
+// included at the use site. They are restated nowhere: a wrong prctl option
+// number is not diagnosable from the error.
+
 // -------------------------------------------------------------------- ptrace
 
 inline constexpr unsigned long kPtraceTracerPid = 0x4200;

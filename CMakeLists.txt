@@ -111,10 +111,13 @@ endif()
 
 add_library(occ_core STATIC
     src/syscall/syscall.cpp
+    src/syscall/capability.cpp
     src/util/log.cpp
     src/util/string.cpp
+    src/util/errno.cpp
     src/util/fs.cpp
     src/probe/doctor.cpp
+    src/isolation/seccomp.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)

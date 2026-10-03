@@ -492,4 +492,49 @@ Result capset(void* hdrp, const void* datap) noexcept {
                          detail::arg(datap));
 }
 
+Result getpgid(int pid) noexcept { return detail::call1(N(SYS_getpgid), pid); }
+
+Result setpgid(int pid, int pgid) noexcept {
+    return detail::call2(N(SYS_setpgid), pid, pgid);
+}
+
+Result umask_syscall(unsigned int mask) noexcept {
+    return detail::call1(N(SYS_umask), detail::arg(mask));
+}
+
+Result readlink(const char* path, char* buf, std::size_t size) noexcept {
+    return detail::call3(N(SYS_readlink), detail::arg(path), detail::arg(buf),
+                         detail::arg(size));
+}
+
+Result symlink(const char* target, const char* linkpath) noexcept {
+    return detail::call2(N(SYS_symlink), detail::arg(target),
+                         detail::arg(linkpath));
+}
+
+Result mknodat(int dirfd, const char* path, unsigned int mode,
+               unsigned long dev) noexcept {
+    return detail::call4(N(SYS_mknodat), dirfd, detail::arg(path),
+                         detail::arg(mode), detail::arg(dev));
+}
+
+Result mknod(const char* path, unsigned int mode, unsigned long dev) noexcept {
+    return detail::call3(N(SYS_mknod), detail::arg(path), detail::arg(mode),
+                         detail::arg(dev));
+}
+
+Result flock(int fd, int operation) noexcept {
+    return detail::call2(N(SYS_flock), fd, operation);
+}
+
+Result fchmodat(int dirfd, const char* path, unsigned int mode,
+                int flags) noexcept {
+    return detail::call4(N(SYS_fchmodat), dirfd, detail::arg(path),
+                         detail::arg(mode), flags);
+}
+
+Result chdir_syscall(const char* path) noexcept {
+    return detail::call1(N(SYS_chdir), detail::arg(path));
+}
+
 } // namespace occ::sys
