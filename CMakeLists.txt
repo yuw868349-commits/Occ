@@ -118,6 +118,7 @@ add_library(occ_core STATIC
     src/util/fs.cpp
     src/probe/doctor.cpp
     src/parser/detect.cpp
+    src/parser/elf.cpp
     src/isolation/seccomp.cpp
     src/isolation/container.cpp
 )
