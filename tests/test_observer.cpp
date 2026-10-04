@@ -664,7 +664,11 @@ void test_connection_round_trip() {
         std::uint32_t addr;
         std::uint8_t zero[8];
     } addr{};
-    addr.family = 2; // AF_INET, big endian on the wire
+    // The family is a host-order number. Writing it in network order, as the
+    // other two fields are, is a mistake the kernel answers with an
+    // address-family error that reads like a policy refusal rather than a
+    // bug -- and it is why a listener written this way binds nowhere.
+    addr.family = 2; // AF_INET
     addr.port = static_cast<std::uint16_t>((listener.port() >> 8) |
                                             (listener.port() << 8));
     addr.addr = 0x0100007f; // 127.0.0.1

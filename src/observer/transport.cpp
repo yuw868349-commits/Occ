@@ -19,7 +19,7 @@ namespace {
 // because a socket a debugger uses to read and write a traced process's
 // memory is a capability, and a capability should not be reachable from off
 // the machine by default.
-constexpr std::uint32_t kLoopbackV4 = 0x0100007f; // 127.0.0.1
+constexpr std::uint32_t kLoopbackV4 = 0x0100007f; // 127.0.0.1, network order
 
 // The socket address layout the kernel expects. Written out rather than
 // included because <netinet/in.h> drags in a libc the rest of this project
@@ -110,8 +110,14 @@ bool Listener::open(std::uint16_t port, std::string& error) noexcept {
     }
     fd_ = static_cast<int>(sock.value);
 
+    // The three fields have three different byte orders, which is the whole
+    // reason this structure is written out. sin_family is the address family
+    // as a host-order number -- 2 for AF_INET -- and swapping its bytes makes
+    // it 512, which the kernel rejects with an address-family error that
+    // looks like a policy refusal rather than a mistake. sin_port and
+    // sin_addr are in network order.
     SockAddrIn addr{};
-    addr.family = to_be16(kAfInet);
+    addr.family = kAfInet;
     addr.port = sin_port(port);
     addr.addr = kLoopbackV4;
 
