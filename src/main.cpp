@@ -2,6 +2,7 @@
 #include "occ/util/log.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 
@@ -40,6 +41,16 @@ int main(int argc, char** argv) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 2;
+    }
+
+    // Whether the event stream is wanted is decided here, once, and handed
+    // to the commands through the environment. A command that re-derived it
+    // could disagree with this call if the descriptor changed in between,
+    // and the two answers would be for the same stream.
+    if (stdout_is_tty()) {
+        ::setenv("OCC_EVENT_STREAM", "0", 1);
+    } else {
+        ::setenv("OCC_EVENT_STREAM", "1", 1);
     }
 
     const std::string_view cmd = argv[1];

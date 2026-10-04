@@ -121,6 +121,8 @@ add_library(occ_core STATIC
     src/parser/elf.cpp
     src/isolation/seccomp.cpp
     src/isolation/container.cpp
+    src/observer/event.cpp
+    src/runner/run.cpp
 )
 
 target_include_directories(occ_core PUBLIC include)
