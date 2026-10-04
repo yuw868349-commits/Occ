@@ -128,6 +128,35 @@ struct SessionResult {
 [[nodiscard]] SessionResult observe(const SessionConfig& config,
                                     Writer& events) noexcept;
 
+// ------------------------------------------------------------------- packets
+//
+// These three are the parts of the packet layer that do not need a live
+// process to exercise. They are free functions rather than members because a
+// test can then check that every feature announced in qSupported is actually
+// answered, which is a contract that is easy to break and impossible to
+// notice without a debugger on the other end of a socket.
+//
+// The target description is the important one. A remote stub that does not
+// answer qXfer:features:read makes GDB fall back to its built-in default,
+// which describes a 32-bit i386 target, and every register the debugger
+// displays is then read at the wrong width from the wrong offset.
+
+// The target description served through qXfer:features:read.
+[[nodiscard]] std::string_view target_description() noexcept;
+
+// Answers the packet body after "qXfer:features:read:", which is the annex
+// and the range separated by a colon, for example "target.xml:0,400".
+// Returns an empty string for a malformed packet, "l" for an annex that does
+// not exist, and otherwise the chunk prefixed by 'm' or 'l'.
+[[nodiscard]] std::string serve_target_description(std::string_view args) noexcept;
+
+// Answers the packet body after "vCont". Consumes and step_requested() are
+// set when the packet asked for a resume, which the session loop performs
+// rather than the packet layer.
+[[nodiscard]] std::string parse_vcont(std::string_view args, int pid,
+                                      bool& consume, bool& step,
+                                      int& signal) noexcept;
+
 // The remote debugger protocol, as a state machine over one process. Kept
 // separate from the loop so that the packet handling can be tested by
 // feeding it packets, without a live process to trace.
@@ -161,6 +190,15 @@ public:
 
 private:
     std::string handle_query(std::string_view kind) noexcept;
+    // Serves "qXfer:features:read:target.xml:OFFSET,LENGTH". The target
+    // description is what tells GDB the register file is 64 bits wide; the
+    // protocol's built-in default describes a 32-bit i386 target, which
+    // makes every offset in a register read wrong.
+    std::string handle_qxfer_features(std::string_view args) noexcept;
+    // Serves "vCont", the multiplexed form of continue and single step.
+    // Implemented alongside the older packets rather than instead of them, so
+    // a debugger that does not use vCont is unaffected.
+    std::string handle_vcont(std::string_view args) noexcept;
     std::string handle_read_memory(std::string_view args) noexcept;
     std::string handle_write_memory(std::string_view args) noexcept;
     std::string handle_read_registers() noexcept;

@@ -32,21 +32,173 @@ constexpr std::uint64_t kSysMremap = 25;
 
 namespace {
 
-// The register block GDB expects for x86-64, in its order. The session
-// fills this from the kernel's own register struct rather than maintaining
-// a second copy of the state.
+// The number of registers the 'g' reply carries. It has to agree with the
+// target description below, and a static_assert in fill_gdb_registers is
+// what keeps the two from drifting apart. Declared here so both the fill and
+// the parse paths can size themselves from one number.
+constexpr std::size_t kGdbRegisterCount = 27;
+
+// The register GDB treats as the program counter, per the description below.
+constexpr std::size_t kPcRegnum = 16;
+
+// One register out of the block, by the index the target description gives.
+//
+// The indexing is shared by the 'g', 'p' and 'G' paths so a register cannot
+// be written at one index and read at another. That is not a theoretical
+// concern: this file did exactly that once, describing twenty-seven
+// registers and supplying twenty-four, and every register after the gap
+// displayed under the wrong name with a plausible-looking value.
+std::uint64_t gdb_register(const Registers& r, std::size_t index) noexcept {
+    switch (index) {
+    case 0: return r.rax;
+    case 1: return r.rbx;
+    case 2: return r.rcx;
+    case 3: return r.rdx;
+    case 4: return r.rsi;
+    case 5: return r.rdi;
+    case 6: return r.rbp;
+    case 7: return r.rsp;
+    case 8: return r.r8;
+    case 9: return r.r9;
+    case 10: return r.r10;
+    case 11: return r.r11;
+    case 12: return r.r12;
+    case 13: return r.r13;
+    case 14: return r.r14;
+    case 15: return r.r15;
+    case 16: return r.rip;
+    case 17: return r.eflags;
+    case 18: return r.cs;
+    case 19: return r.ss;
+    case 20: return r.ds;
+    case 21: return r.es;
+    case 22: return r.fs;
+    case 23: return r.gs;
+    case 24: return r.orig_rax;
+    case 25: return r.fs_base;
+    case 26: return r.gs_base;
+    default: return 0;
+    }
+}
+
+// Writes the writable registers of the block back. The three the kernel does
+// not accept from SETREGS on this architecture are ignored: the description
+// names them because GDB needs a coherent register list, not because the
+// debugger can change them, and silently writing zeros into a thread
+// selector would be far worse than ignoring the request.
+void set_gdb_register(Registers& r, const std::uint64_t* values) noexcept {
+    r.rax = values[0];
+    r.rbx = values[1];
+    r.rcx = values[2];
+    r.rdx = values[3];
+    r.rsi = values[4];
+    r.rdi = values[5];
+    r.rbp = values[6];
+    r.rsp = values[7];
+    r.r8 = values[8];
+    r.r9 = values[9];
+    r.r10 = values[10];
+    r.r11 = values[11];
+    r.r12 = values[12];
+    r.r13 = values[13];
+    r.r14 = values[14];
+    r.r15 = values[15];
+    r.rip = values[16];
+    r.eflags = values[17];
+    r.cs = values[18];
+    r.ss = values[19];
+    r.ds = values[20];
+    r.es = values[21];
+    r.fs = values[22];
+    r.gs = values[23];
+    // values[24..26] are orig_rax, fs_base and gs_base. Not writable here.
+}
+
+// The register block GDB expects for x86-64, in the order the target
+// description below declares. The two lists have to agree: the document
+// tells GDB how wide each register is, and this function supplies the bytes
+// in that same order. A register described but not supplied leaves the block
+// short, and every register after the gap reads as the wrong value -- which
+// looks like a target that corrupted its own state rather than a stub that
+// filled in too few.
+//
+// The four segment selectors are 32 bits wide in the description and are
+// sent as eight bytes here, because the register block is a fixed-width
+// array in the protocol: GDB masks the surplus rather than misreading
+// everything after it, and sending four bytes for them would shift the rest.
 void fill_gdb_registers(const Registers& r, std::string& out) noexcept {
     out.clear();
-    out.reserve(27 * 8);
+    out.reserve(kGdbRegisterCount * 16);
     const std::uint64_t order[] = {
         r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp,
         r.r8,  r.r9,  r.r10, r.r11, r.r12, r.r13, r.r14, r.r15,
         r.rip, r.eflags, r.cs, r.ss, r.ds, r.es, r.fs, r.gs,
+        // The three the description adds past the classic block. orig_rax
+        // is the syscall the thread is stopped in, which is the most
+        // valuable thing this stub can show a debugger that asked, and the
+        // two base registers are the thread and the group selector.
+        r.orig_rax, r.fs_base, r.gs_base,
     };
-    for (std::uint64_t v : order) {
-        out += hex_u64_le(v);
+    static_assert(sizeof(order) / sizeof(order[0]) == kGdbRegisterCount,
+                  "the register block and the target description disagree on "
+                  "how many registers x86-64 has");
+    (void)order;
+    for (std::size_t i = 0; i < kGdbRegisterCount; ++i) {
+        out += hex_u64_le(gdb_register(r, i));
     }
 }
+
+// The target description GDB reads through qXfer:features:read.
+//
+// The register block has to be described here rather than left to the
+// protocol's defaults, because the defaults describe a 32-bit i386 target:
+// GDB sizes every register from this document, and a register it believes is
+// four bytes wide makes every offset in the 'g' packet wrong. The order in
+// this list is the order of the 'g' reply, which is also the order
+// fill_gdb_registers writes, and the two are cross-checked by the register
+// count below.
+//
+// The names are the ones GDB uses for x86-64. Two are not register names at
+// all -- orig_rax and fs_base are the syscall the thread is in and the
+// thread pointer -- and they are included because a debugger reading them
+// gets a coherent view rather than a shifted one.
+//
+// The vector size is in bytes and is the x86-64 requirement.
+constexpr std::string_view kTargetXml = R"(<?xml version="1.0"?>
+<!DOCTYPE target SYSTEM "gdb-target.dtd">
+<target version="1.0">
+  <architecture>i386:x86-64</architecture>
+  <feature name="org.gnu.gdb.i386.core">
+    <reg name="rax" bitsize="64" type="int64" regnum="0"/>
+    <reg name="rbx" bitsize="64" type="int64" regnum="1"/>
+    <reg name="rcx" bitsize="64" type="int64" regnum="2"/>
+    <reg name="rdx" bitsize="64" type="int64" regnum="3"/>
+    <reg name="rsi" bitsize="64" type="int64" regnum="4"/>
+    <reg name="rdi" bitsize="64" type="int64" regnum="5"/>
+    <reg name="rbp" bitsize="64" type="data_ptr" regnum="6"/>
+    <reg name="rsp" bitsize="64" type="data_ptr" regnum="7"/>
+    <reg name="r8" bitsize="64" type="int64" regnum="8"/>
+    <reg name="r9" bitsize="64" type="int64" regnum="9"/>
+    <reg name="r10" bitsize="64" type="int64" regnum="10"/>
+    <reg name="r11" bitsize="64" type="int64" regnum="11"/>
+    <reg name="r12" bitsize="64" type="int64" regnum="12"/>
+    <reg name="r13" bitsize="64" type="int64" regnum="13"/>
+    <reg name="r14" bitsize="64" type="int64" regnum="14"/>
+    <reg name="r15" bitsize="64" type="int64" regnum="15"/>
+    <reg name="rip" bitsize="64" type="code_ptr" regnum="16"/>
+    <reg name="eflags" bitsize="32" regnum="17"/>
+    <reg name="cs" bitsize="32" regnum="18"/>
+    <reg name="ss" bitsize="32" regnum="19"/>
+    <reg name="ds" bitsize="32" regnum="20"/>
+    <reg name="es" bitsize="32" regnum="21"/>
+    <reg name="fs" bitsize="32" regnum="22"/>
+    <reg name="gs" bitsize="32" regnum="23"/>
+    <reg name="orig_rax" bitsize="64" type="int64" regnum="24"/>
+    <reg name="fs_base" bitsize="64" type="int64" regnum="25"/>
+    <reg name="gs_base" bitsize="64" type="int64" regnum="26"/>
+  </feature>
+</target>
+)";
 
 } // namespace
 
@@ -60,10 +212,29 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
                                                     : std::string_view{};
 
     switch (cmd) {
-    case '?':
-        // Why did we stop. Answered with the last stop, which the loop has
-        // already reported.
-        return encode_stop_reply(gdb_signal_for_trap(), 0);
+    case '?': {
+        // Why did we stop. The stop reply carries the program counter,
+        // because that is the register a debugger needs to decide what the
+        // stop was and it should not have to ask for it separately. Reading
+        // it here rather than answering with zero matters: a debugger that
+        // resumes from address zero because this returned zero is looking
+        // at a target that has already faulted.
+        Registers now{};
+        std::uint64_t pc = 0;
+        if (tracer_->get_regs(pid_, now).ok()) {
+            pc = gdb_register(now, kPcRegnum);
+        }
+        return encode_stop_reply(gdb_signal_for_trap(), pc);
+    }
+
+    case 'v':
+        // Only vCont is implemented. A 'v' packet for anything else answers
+        // empty, which is what the protocol defines as unsupported, and the
+        // debugger falls back to the single-threaded packets it knows.
+        if (starts_with(args, "Cont")) {
+            return handle_vcont(args.substr(std::string_view{"Cont"}.size()));
+        }
+        return {};
 
     case 'q':
         return handle_query(args);
@@ -75,26 +246,28 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         return handle_write_registers(args);
 
     case 'p': {
-        // Read one register by number. Only the ones the session knows are
-        // answered; the rest come back empty, which means unsupported.
-        std::uint32_t which = 0;
-        if (!parse_hex_u32_le(std::string_view(args.data(), args.size() < 8 ? args.size() : 8),
-                              which)) {
+        // Read one register by number. The numbering is the one the target
+        // description gives, which is the same one the 'g' reply is built
+        // from -- reading a register by a different index than it was
+        // written by is how a debugger ends up displaying one register's
+        // value under another's name.
+        //
+        // The number arrives as a variable-width hexadecimal value, so "p0"
+        // asks for the first register and "p1a" for the twenty-sixth. It is
+        // read as a protocol number rather than as a register block: the
+        // latter wants eight digits and would refuse both.
+        std::uint64_t which = 0;
+        if (!parse_hex_number(args, which)) {
+            return {};
+        }
+        if (which >= kGdbRegisterCount) {
             return {};
         }
         Registers r{};
         if (tracer_->get_regs(pid_, r).failed()) {
             return "E01";
         }
-        const std::uint64_t order[] = {
-            r.rax, r.rbx, r.rcx, r.rdx, r.rsi, r.rdi, r.rbp, r.rsp,
-            r.r8,  r.r9,  r.r10, r.r11, r.r12, r.r13, r.r14, r.r15,
-            r.rip, r.eflags, r.cs, r.ss, r.ds, r.es, r.fs, r.gs,
-        };
-        if (which >= sizeof(order) / sizeof(order[0])) {
-            return {};
-        }
-        return hex_u64_le(order[which]);
+        return hex_u64_le(gdb_register(r, static_cast<std::size_t>(which)));
     }
 
     case 'm':
@@ -118,8 +291,10 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
         step_ = false;
         resume_signal_ = 0;
         if (!args.empty()) {
-            std::uint32_t sig = 0;
-            if (parse_hex_u32_le(std::string_view(args.data(), args.size() < 8 ? args.size() : 8), sig)) {
+            std::uint64_t sig = 0;
+            // A signal number is a variable-width hexadecimal value, which
+            // the protocol conventionally writes with two digits.
+            if (parse_hex_number(args, sig)) {
                 resume_signal_ = static_cast<int>(sig);
             }
         }
@@ -154,11 +329,23 @@ std::string DebugServer::handle(std::string_view packet) noexcept {
 
 std::string DebugServer::handle_query(std::string_view kind) noexcept {
     if (starts_with(kind, "Supported")) {
-        // The features this stub implements. The list is deliberately short
-        // and honest: claiming a feature that is not implemented makes the
-        // debugger take a code path that then fails in a way that looks
-        // like a bug in the debugger.
+        // The features this stub implements.
+        //
+        // The list is a contract and it is kept honest in both directions.
+        // Claiming a feature that is not implemented makes the debugger take
+        // a code path that then fails in a way that looks like a bug in the
+        // debugger; omitting one that is implemented makes the debugger fall
+        // back to a slower or less precise path it did not have to take.
+        // Every entry below names the packet that implements it.
+        //
+        // vContSupported+ is here because handle_vcont() implements the
+        // actions, and qXfer:features:read+ because
+        // handle_qxfer_features() serves the target description.
         return "qXfer:features:read+;swbreak+;hwbreak+;vContSupported+";
+    }
+    if (starts_with(kind, "Xfer:features:read:")) {
+        return handle_qxfer_features(
+            kind.substr(std::string_view{"Xfer:features:read:"}.size()));
     }
     if (starts_with(kind, "Attached")) {
         // Already attached, because the session was created from a process
@@ -168,10 +355,10 @@ std::string DebugServer::handle_query(std::string_view kind) noexcept {
     if (starts_with(kind, "C")) {
         // The current thread. This stub observes one process, so the answer
         // is always that process.
-        return "QC" + hex_u32_le(static_cast<std::uint32_t>(pid_));
+        return "QC" + hex_number(static_cast<std::uint64_t>(pid_));
     }
     if (starts_with(kind, "fThreadInfo")) {
-        return "m" + hex_u32_le(static_cast<std::uint32_t>(pid_));
+        return "m" + hex_number(static_cast<std::uint64_t>(pid_));
     }
     if (starts_with(kind, "sThreadInfo")) {
         return "l";
@@ -179,7 +366,176 @@ std::string DebugServer::handle_query(std::string_view kind) noexcept {
     if (starts_with(kind, "TStatus")) {
         return "T0";
     }
+    // qSymbol and every other query this stub does not answer fall through
+    // to an empty response, which the protocol defines as "not supported".
     return {};
+}
+
+std::string_view target_description() noexcept {
+    return kTargetXml;
+}
+
+std::string serve_target_description(std::string_view args) noexcept {
+    // The packet is "qXfer:features:read:ANNEX:OFFSET,LENGTH" and the
+    // dispatcher has already removed the "qXfer:features:read:" prefix, so
+    // what arrives here is the annex and the range, separated by one colon.
+    //
+    // The prefix that comes off is fixed text naming this one object, so the
+    // annex is whatever is left before the colon. Only "target.xml" exists;
+    // a request for any other annex answers "l", the protocol's way of
+    // saying there is no such object, so a debugger that asks for a file it
+    // might find elsewhere stops asking rather than treating the absence as
+    // an error.
+    const std::size_t colon = args.find(':');
+    if (colon == std::string_view::npos) {
+        return {};
+    }
+    const std::string_view annex = args.substr(0, colon);
+    const std::string_view range = args.substr(colon + 1);
+
+    if (annex != "target.xml") {
+        return "l";
+    }
+
+    const std::size_t comma = range.find(',');
+    if (comma == std::string_view::npos) {
+        return {};
+    }
+    std::uint64_t offset = 0;
+    std::uint64_t length = 0;
+    if (!parse_hex_number(range.substr(0, comma), offset) ||
+        !parse_hex_number(range.substr(comma + 1), length)) {
+        return {};
+    }
+
+    const std::string_view xml = kTargetXml;
+
+    // An offset at or past the end answers 'l' rather than an error. GDB
+    // fetches the document in chunks and the final request legitimately
+    // lands exactly at the end, which is not the same as running off it.
+    if (offset >= xml.size() || length == 0) {
+        return "l";
+    }
+
+    // The subtraction cannot underflow: offset is below xml.size() and both
+    // are the same type, so available is at least one and take is at most
+    // that. The clamp is what keeps a length larger than the remainder from
+    // asking substr for more than the document holds.
+    const std::size_t available = xml.size() - static_cast<std::size_t>(offset);
+    const std::size_t take = length < available
+                                 ? static_cast<std::size_t>(length)
+                                 : available;
+
+    // The leading 'm' or 'l' says whether more remains. Deciding it here
+    // rather than always answering 'm' is what stops GDB from asking for one
+    // more chunk forever.
+    std::string out;
+    out.reserve(take + 1);
+    out += (take < available) ? 'm' : 'l';
+    // The document is ASCII, so its bytes are already the wire form. The
+    // escaping a binary packet needs is applied by encode_packet.
+    out.append(xml.substr(static_cast<std::size_t>(offset), take));
+    return out;
+}
+
+std::string parse_vcont(std::string_view args, int pid, bool& consume,
+                        bool& step, int& signal) noexcept {
+    // vCont is the multiplexed form of c, s, C and S. The packet is
+    // "vCont[;action[:thread-id]]...", where an action is a letter
+    // optionally followed by a condition, and an absent thread-id means every
+    // thread. The older packets remain the fallback for a debugger that does
+    // not use it, so implementing vCont does not replace them.
+    //
+    // "vCont?" asks which actions are supported. The answer is the list of
+    // them, separated by colons, exactly as it would appear in a request,
+    // and it is the answer that lets a debugger choose vCont at all.
+    //
+    // The outputs are cleared before the query is answered rather than
+    // after. A debugger sends the query before any action, and a stub that
+    // answered it while leaving the caller's flags as they were would resume
+    // with whatever an earlier packet happened to set: a debugger that asked
+    // what is supported and then asked to continue would single-step.
+    consume = false;
+    step = false;
+    signal = 0;
+
+    if (args.empty()) {
+        return "c:C;s:S;r:t";
+    }
+
+    std::size_t pos = 0;
+    while (pos <= args.size()) {
+        const std::size_t next = args.find(';', pos);
+        const std::string_view action =
+            args.substr(pos, next == std::string_view::npos
+                                 ? std::string_view::npos
+                                 : next - pos);
+        if (!action.empty()) {
+            // An action is one letter followed by an optional signal, then an
+            // optional thread id: "c", "C05", "s:2", "S0b:2". The signal
+            // follows the letter directly and is hexadecimal, which is why it
+            // is split off by taking the single leading letter rather than by
+            // looking for a separator -- reading "C05" as a whole word finds
+            // neither a known verb nor a signal, and the action is then
+            // silently dropped and the process never resumes.
+            const std::string_view verb = action.substr(0, 1);
+
+            if (verb == "c" || verb == "C" || verb == "s" || verb == "S") {
+                step = (verb == "s" || verb == "S");
+                consume = true;
+                signal = 0;
+                // Only the capitalised forms carry a signal. The lowercase
+                // "c" and "s" resume without one, and a digit after them
+                // would be the thread id rather than a signal, so nothing
+                // here is read.
+                if (verb == "C" || verb == "S") {
+                    const std::size_t sig_begin = 1;
+                    std::size_t sig_end = action.find(':');
+                    if (sig_end == std::string_view::npos) {
+                        sig_end = action.size();
+                    }
+                    std::uint64_t sig = 0;
+                    if (sig_end > sig_begin &&
+                        parse_hex_number(action.substr(sig_begin, sig_end - sig_begin),
+                                         sig)) {
+                        signal = static_cast<int>(sig);
+                    }
+                }
+                break;
+            }
+            // "r" starts and "t" stops. A remote target may support them, but
+            // this stub owns the process it traces and the session loop is
+            // the only thing that resumes it, so neither can be honoured
+            // here and neither is advertised by vCont?.
+        }
+
+        if (next == std::string_view::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    if (!consume) {
+        return {};
+    }
+    // The reply is the thread that was selected, which is the only thread
+    // there is. The session does not resume inside the packet layer: the
+    // loop owns the tracee and decides when it runs.
+    return "T" + hex_number(static_cast<std::uint64_t>(pid));
+}
+
+
+std::string DebugServer::handle_qxfer_features(std::string_view args) noexcept {
+    return serve_target_description(args);
+}
+
+std::string DebugServer::handle_vcont(std::string_view args) noexcept {
+    // The reply is returned unchanged whether or not a resume was requested:
+    // "vCont?" produces an answer with no resume behind it, and a resume the
+    // loop has not yet performed still answers with the thread it named. The
+    // flags come back through the same references the loop reads, so the
+    // packet layer does not decide when the tracee runs.
+    return parse_vcont(args, pid_, resume_requested_, step_, resume_signal_);
 }
 
 std::string DebugServer::handle_read_registers() noexcept {
@@ -194,47 +550,36 @@ std::string DebugServer::handle_read_registers() noexcept {
 }
 
 std::string DebugServer::handle_write_registers(std::string_view args) noexcept {
-    if (args.size() < 27 * 16) {
+    // A 'G' packet carries every register, so the length is fixed by the
+    // target description rather than by what the debugger happened to send.
+    // The sixteen segment selectors and flags are declared 32 bits wide and
+    // arrive in sixteen-byte slots, which is why the multiply is by two
+    // characters rather than one.
+    if (args.size() < kGdbRegisterCount * 16) {
         return "E01";
     }
+
+    std::uint64_t values[kGdbRegisterCount];
+    for (std::size_t i = 0; i < kGdbRegisterCount; ++i) {
+        if (!parse_hex_u64_le(args.substr(i * 16, 16), values[i])) {
+            return "E01";
+        }
+    }
+
+    // The current values are read rather than zeroed, because three of the
+    // registers the block names -- orig_rax, fs_base and gs_base -- are not
+    // writable through SETREGS on this architecture. Starting from zero and
+    // writing the whole block would clear the thread and group selectors,
+    // and a debugger that set one register would corrupt two it never
+    // mentioned. Reading first and overwriting only the writable fields is
+    // what makes a partial intent harmless.
     Registers r{};
     auto res = tracer_->get_regs(pid_, r);
     if (res.failed()) {
         return "E01";
     }
 
-    std::uint64_t values[27];
-    for (int i = 0; i < 27; ++i) {
-        if (!parse_hex_u64_le(args.substr(static_cast<std::size_t>(i) * 16, 16),
-                              values[i])) {
-            return "E01";
-        }
-    }
-
-    r.rax = values[0];
-    r.rbx = values[1];
-    r.rcx = values[2];
-    r.rdx = values[3];
-    r.rsi = values[4];
-    r.rdi = values[5];
-    r.rbp = values[6];
-    r.rsp = values[7];
-    r.r8 = values[8];
-    r.r9 = values[9];
-    r.r10 = values[10];
-    r.r11 = values[11];
-    r.r12 = values[12];
-    r.r13 = values[13];
-    r.r14 = values[14];
-    r.r15 = values[15];
-    r.rip = values[16];
-    r.eflags = values[17];
-    r.cs = values[18];
-    r.ss = values[19];
-    r.ds = values[20];
-    r.es = values[21];
-    r.fs = values[22];
-    r.gs = values[23];
+    set_gdb_register(r, values);
 
     if (tracer_->set_regs(pid_, r).failed()) {
         return "E01";

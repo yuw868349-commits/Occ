@@ -1,5 +1,7 @@
 #include "occ/observer/rsp.h"
 
+#include <limits>
+
 namespace occ::obs {
 
 namespace {
@@ -240,6 +242,31 @@ std::string hex_u8(std::uint8_t value) noexcept {
     return out;
 }
 
+std::string hex_number(std::uint64_t value) noexcept {
+    // The counterpart of parse_hex_number: most significant digit first, and
+    // no leading zeros, because that is the form the protocol's readers
+    // accept and the form GDB sends. A thread id of 4242 is "1092", not the
+    // eight digits a register value of the same number would occupy.
+    //
+    // Zero is the one value that cannot drop a leading digit, so it is
+    // spelled out rather than producing an empty field.
+    char digits[16];
+    int n = 0;
+    if (value == 0) {
+        digits[n++] = '0';
+    }
+    while (value != 0) {
+        digits[n++] = hex_char(static_cast<int>(value & 0xf));
+        value >>= 4;
+    }
+    std::string out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = n - 1; i >= 0; --i) {
+        out.push_back(digits[i]);
+    }
+    return out;
+}
+
 bool parse_hex_u64_le(std::string_view s, std::uint64_t& out) noexcept {
     if (s.size() < 16) {
         return false;
@@ -269,6 +296,40 @@ bool parse_hex_u32_le(std::string_view s, std::uint32_t& out) noexcept {
             return false;
         }
         v |= static_cast<std::uint32_t>((hi << 4) | lo) << (8 * i);
+    }
+    out = v;
+    return true;
+}
+
+bool parse_hex_number(std::string_view s, std::uint64_t& out) noexcept {
+    // A protocol number is hexadecimal and variable width, and it is not in
+    // the target's byte order: an offset is an offset whichever way the
+    // target stores integers, so the digits are read most significant first.
+    // "0" is zero, "400" is one thousand and twenty eight, and a leading zero
+    // is not significant, which is what lets the two-digit signal numbers the
+    // protocol writes as "05" mean five rather than being read as a byte.
+    //
+    // This is deliberately a different function from parse_hex_u64_le. That
+    // one reads a register block, where every field is exactly eight bytes
+    // and the byte order is the target's; using it on a number whose width is
+    // whatever the sender chose reads the digits in the wrong order and
+    // refuses every value short of sixteen digits.
+    if (s.empty() || s.size() > 16) {
+        return false;
+    }
+    std::uint64_t v = 0;
+    for (const char c : s) {
+        const int d = hex_digit(c);
+        if (d < 0) {
+            return false;
+        }
+        // The width is capped above, so a full sixteen digits can only
+        // overflow if the leading digit is above one, and that case is
+        // refused rather than allowed to wrap.
+        if (v > (std::numeric_limits<std::uint64_t>::max() >> 4)) {
+            return false;
+        }
+        v = (v << 4) | static_cast<std::uint64_t>(d);
     }
     out = v;
     return true;
@@ -314,7 +375,9 @@ std::string encode_stop_reply(int signal, std::uint64_t rip) noexcept {
     std::string out = "T";
     out.push_back(hex_char((signal >> 4) & 0xf));
     out.push_back(hex_char(signal & 0xf));
-    // Register 16 is rip in the x86-64 register numbering GDB uses.
+    // Register 16 is rip in the x86-64 register numbering GDB uses, and the
+    // number is written as the protocol requires: hexadecimal, without a
+    // leading zero, and with its own trailing colon.
     out += "10:";
     out += hex_u64_le(rip);
     out += ";";

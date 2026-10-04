@@ -112,10 +112,23 @@ private:
 [[nodiscard]] std::string hex_u32_le(std::uint32_t value) noexcept;
 [[nodiscard]] std::string hex_u8(std::uint8_t value) noexcept;
 
+// Writes a protocol number: hexadecimal, most significant digit first, no
+// leading zeros. This is the form thread ids, offsets and signal numbers take
+// on the wire, and it is not the form a register value takes.
+[[nodiscard]] std::string hex_number(std::uint64_t value) noexcept;
+
 [[nodiscard]] bool parse_hex_u64_le(std::string_view s,
                                     std::uint64_t& out) noexcept;
 [[nodiscard]] bool parse_hex_u32_le(std::string_view s,
                                     std::uint32_t& out) noexcept;
+
+// Reads a protocol number: hexadecimal, variable width, most significant
+// digit first, with no padding significance. Offsets, lengths, register
+// numbers and signals are all this, and all of them arrive narrower than the
+// eight or sixteen digits the register-block readers above require.
+[[nodiscard]] bool parse_hex_number(std::string_view s,
+                                    std::uint64_t& out) noexcept;
+
 [[nodiscard]] bool parse_hex_bytes(std::string_view s,
                                    std::vector<std::uint8_t>& out) noexcept;
 

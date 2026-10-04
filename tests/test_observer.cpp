@@ -12,6 +12,7 @@
 // and a payload that contains the framing characters.
 
 #include "occ/observer/rsp.h"
+#include "occ/observer/session.h"
 #include "occ/observer/watchpoint.h"
 #include "occ/observer/wx.h"
 
@@ -205,6 +206,57 @@ void test_hex_round_trip() {
     // Too short is a refusal, not a partial read.
     check(!parse_hex_u64_le("8877", v), "a short value is refused");
     check(!parse_hex_u32_le("ab", w), "a short 32-bit value is refused");
+}
+
+void test_hex_number() {
+    // A protocol number is not a register value. The difference is both the
+    // byte order and the width: an offset or a thread id is written most
+    // significant digit first with no padding, so reading one with the
+    // register-block reader reverses its digits and refuses it for being
+    // shorter than eight.
+    check(hex_number(0) == "0", "zero is one digit");
+    check(hex_number(1) == "1", "a small number has no padding");
+    check(hex_number(10) == "a", "ten is hexadecimal a");
+    check(hex_number(0x1092) == "1092",
+          "a thread id is most significant digit first");
+    check(hex_number(0xdeadbeefULL) == "deadbeef",
+          "a large number keeps every digit");
+
+    // The encoding is the one GDB sends, so reading it back has to give the
+    // original. A round trip is the property the packet handlers rely on.
+    for (const std::uint64_t original : {std::uint64_t{0},
+                                         std::uint64_t{1},
+                                         std::uint64_t{5},
+                                         std::uint64_t{11},
+                                         std::uint64_t{255},
+                                         std::uint64_t{4242},
+                                         std::uint64_t{0x7fffffff},
+                                         std::uint64_t{0xffffffffffffffffULL}}) {
+        std::uint64_t back = 0;
+        check(parse_hex_number(hex_number(original), back) && back == original,
+              "a protocol number round trips");
+    }
+
+    // The signal numbers the protocol writes with two digits must mean the
+    // number a person would write, which is the whole reason a leading zero
+    // is not significant.
+    std::uint64_t sig = 0;
+    check(parse_hex_number("05", sig) && sig == 5, "a padded signal means five");
+    check(parse_hex_number("0b", sig) && sig == 11, "a padded signal means eleven");
+
+    // Empty is not a number. A field with nothing in it is malformed rather
+    // than zero, because zero is spelled "0".
+    check(!parse_hex_number("", sig), "an empty number is refused");
+    check(!parse_hex_number("zz", sig), "a non-hexadecimal digit is refused");
+    check(!parse_hex_number("0x10", sig), "a prefix is refused");
+    check(!parse_hex_number(" 10", sig), "a leading space is refused");
+
+    // Seventeen digits cannot fit, and the value that would wrap is refused
+    // rather than silently truncated.
+    check(!parse_hex_number("00000000000000000", sig),
+          "an over-long number is refused");
+    check(!parse_hex_number("fffffffffffffffff", sig),
+          "an over-long number does not wrap");
 }
 
 void test_hex_bytes() {
@@ -518,6 +570,242 @@ void test_wx_permission_transition() {
     check(plain.transitions().empty(), "and no transition is recorded");
 }
 
+// ------------------------------------------------------- target description
+
+// Counts the regnum attributes in the description. The count is what has to
+// agree with the 'g' reply, and it is checked against the wire format rather
+// than against a constant so that a register added to one place and not the
+// other is caught here instead of by a debugger showing shifted values.
+std::size_t count_registers(std::string_view xml) {
+    std::size_t seen = 0;
+    std::size_t pos = 0;
+    while ((pos = xml.find("regnum=\"", pos)) != std::string_view::npos) {
+        pos += 8;
+        ++seen;
+    }
+    return seen;
+}
+
+void test_target_description() {
+    const std::string_view xml = target_description();
+    check(!xml.empty(), "the target description is not empty");
+    check(xml.find("i386:x86-64") != std::string_view::npos,
+          "the description names the x86-64 architecture");
+    check(count_registers(xml) == 27,
+          "the description carries all twenty-seven registers");
+
+    // The program counter is the register a debugger reads first, and its
+    // number is load-bearing: it is the index the 'g' reply and the 'p'
+    // packet both use. A description that renumbered it would make every
+    // register after it wrong too.
+    check(xml.find("name=\"rip\" bitsize=\"64\" type=\"code_ptr\" regnum=\"16\"") !=
+              std::string_view::npos,
+          "rip is register sixteen at sixty-four bits");
+
+    // eflags and the segment selectors are thirty-two bit. Describing them
+    // as sixty-four makes the 'g' reply longer than the debugger expects and
+    // every field after them shifts.
+    check(xml.find("name=\"eflags\" bitsize=\"32\" regnum=\"17\"") !=
+              std::string_view::npos,
+          "eflags is thirty-two bits");
+
+    // orig_rax and the two base registers are not architectural state a
+    // debugger can set, but a debugger that reads them gets a coherent view
+    // of where the thread is. Their presence is why the count is 27 rather
+    // than the 24 a plain x86-64 layout would give.
+    check(xml.find("name=\"orig_rax\"") != std::string_view::npos,
+          "orig_rax is described");
+    check(xml.find("name=\"fs_base\"") != std::string_view::npos,
+          "fs_base is described");
+    check(xml.find("name=\"gs_base\"") != std::string_view::npos,
+          "gs_base is described");
+}
+
+void test_serve_target_description() {
+    const std::string_view xml = target_description();
+
+    // A request for an annex that does not exist answers "l", which is how
+    // the protocol says there is nothing here. Answering an error instead
+    // makes a debugger that probes for optional files treat the stub as
+    // broken.
+    check(serve_target_description("features:read:no-such.xml:0,100") == "l",
+          "an unknown annex answers l");
+
+    // Malformed packets answer empty, the protocol's "not supported".
+    check(serve_target_description("").empty(),
+          "an empty request is refused");
+    check(serve_target_description("target.xml").empty(),
+          "a request without a range is refused");
+    check(serve_target_description("target.xml:0").empty(),
+          "a range without a length is refused");
+    check(serve_target_description("target.xml:zz,10").empty(),
+          "a non-hexadecimal offset is refused");
+
+    // A zero-length read answers "l": there is nothing to send and saying
+    // "m" would invite the debugger to ask again forever.
+    check(serve_target_description("target.xml:0,0") == "l",
+          "a zero length answers l");
+
+    // An offset exactly at the end is what the last chunked request looks
+    // like, so it answers "l" rather than being treated as out of range.
+    const std::string at_end =
+        serve_target_description("target.xml:" + hex_number(xml.size()) + ",10");
+    check(at_end == "l", "an offset at the end answers l");
+
+    // An offset past the end is out of range, and also answers "l".
+    const std::string past_end = serve_target_description(
+        "target.xml:" + hex_number(xml.size() + 4096) + ",10");
+    check(past_end == "l", "an offset past the end answers l");
+
+    // A short read in the middle is prefixed 'm', meaning more follows. The
+    // range is hexadecimal, so the length is written with hex_number rather
+    // than spelled as a decimal count -- "64" is one hundred bytes, which is
+    // the mistake that makes a stub appear to work in a hand-written test
+    // and fail against a real debugger.
+    const std::string first =
+        serve_target_description("target.xml:0," + hex_number(64));
+    check(first.size() == 65, "a chunk is the requested length plus a marker");
+    check(!first.empty() && first[0] == 'm', "a partial chunk is marked m");
+    check(std::string_view(first).substr(1) == xml.substr(0, 64),
+          "the chunk is the document from the requested offset");
+
+    // The length is read as hexadecimal, not as a decimal digit count. This
+    // is the property the check above depends on and the one a debugger
+    // depends on: it sends "400" meaning one kilobyte and expects a
+    // thousand and twenty eight bytes back.
+    check(serve_target_description("target.xml:0,10").size() == 17,
+          "a length is read as hexadecimal");
+
+    // A read that reaches the end is prefixed 'l', meaning the document is
+    // complete. Always answering 'm' is what makes a debugger loop.
+    const std::string whole =
+        serve_target_description("target.xml:0," + hex_number(xml.size()));
+    check(whole.size() == xml.size() + 1, "a full read covers the document");
+    check(!whole.empty() && whole[0] == 'l', "a complete chunk is marked l");
+    check(std::string_view(whole).substr(1) == xml,
+          "a full read is the whole document");
+
+    // A read that asks for more than remains is clamped and marked 'l' rather
+    // than being reported as a short read.
+    const std::string over =
+        serve_target_description("target.xml:0," + hex_number(xml.size() + 1000));
+    check(over.size() == xml.size() + 1, "an over-long read is clamped");
+    check(over[0] == 'l', "a clamped read is marked l");
+
+    // Reassembling the chunks the way GDB does must reproduce the document
+    // exactly. This is the property that matters and the one no single
+    // request above establishes.
+    std::string rebuilt;
+    std::size_t offset = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+        const std::string chunk =
+            serve_target_description("target.xml:" + hex_number(offset) + "," + hex_number(200));
+        if (chunk.empty()) {
+            check(false, "a chunk request in the middle returned empty");
+            break;
+        }
+        // The marker is the first character and the data follows it, so the
+        // last chunk is "l" plus the tail of the document rather than the
+        // one-character "l" that means "no such object". Appending from the
+        // second character either way is what makes the reassembly
+        // independent of where the chunks happened to be cut.
+        const bool last = chunk[0] == 'l';
+        rebuilt.append(chunk, 1, std::string::npos);
+        offset += chunk.size() - 1;
+        if (last) {
+            break;
+        }
+    }
+    check(rebuilt == xml, "the chunked reads reassemble into the document");
+    check(offset == xml.size(), "the reassembly consumed the whole document");
+}
+
+void test_parse_vcont() {
+    // The capability query. A debugger sends this to decide whether to use
+    // vCont at all, and answers with the actions it may then send. Advertising
+    // an action that is not implemented is worse than advertising none.
+    bool consume = true;
+    bool step = true;
+    int signal = 0;
+    const std::string q = parse_vcont("", 4242, consume, step, signal);
+    check(q == "c:C;s:S;r:t",
+          "the capability query lists the supported actions");
+    check(!consume, "the capability query asks for no resume");
+    check(!step, "the capability query sets no step");
+    check(signal == 0, "the capability query carries no signal");
+
+    // A continue consumes without stepping.
+    consume = false;
+    step = true;
+    signal = 0;
+    std::string reply = parse_vcont(";c", 4242, consume, step, signal);
+    check(consume, "a continue consumes");
+    check(!step, "a continue does not step");
+    check(signal == 0, "a continue carries no signal");
+    check(reply == "T" + hex_number(4242), "the reply names the thread");
+
+    // A step consumes and steps.
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";s", 7, consume, step, signal);
+    check(consume, "a step consumes");
+    check(step, "a step steps");
+    check(signal == 0, "a step carries no signal");
+
+    // The capitalised forms carry the signal to deliver, as a two digit hex
+    // number. Signal 5 is SIGTRAP and signal 11 is SIGSEGV, both of which a
+    // debugger sends when it wants the target to take a fault deliberately.
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";C05", 9, consume, step, signal);
+    check(consume && !step, "a continue with a signal consumes without stepping");
+    check(signal == 5, "the signal is carried through");
+
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";S0b", 9, consume, step, signal);
+    check(consume && step, "a step with a signal steps");
+    check(signal == 11, "the signal is carried through a step");
+
+    // A lowercase verb ignores a trailing condition. "c:thread" selects a
+    // thread, not a signal, and reading a thread number as a signal would
+    // deliver a signal the debugger never asked for.
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";c:2", 9, consume, step, signal);
+    check(consume && !step, "a threaded continue consumes");
+    check(signal == 0, "a thread number is not read as a signal");
+
+    // The first resume action wins. A debugger sends one per thread, and
+    // acting on the last would resume a thread the debugger listed first.
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";s;c", 9, consume, step, signal);
+    check(consume && step, "the first action decides the step");
+
+    consume = false;
+    step = false;
+    signal = 0;
+    (void)parse_vcont(";r;c", 9, consume, step, signal);
+    check(consume && !step, "an unsupported leading action is skipped");
+
+    // Nothing resumable in the packet means no resume, which the protocol
+    // defines as an empty answer.
+    consume = true;
+    step = true;
+    signal = 7;
+    check(parse_vcont(";t", 9, consume, step, signal).empty(),
+          "a stop-only packet asks for no resume");
+    check(!consume, "a stop-only packet does not consume");
+    check(!step, "a stop-only packet does not step");
+    check(signal == 0, "a stop-only packet clears the signal");
+}
+
 } // namespace
 
 int main() {
@@ -532,6 +820,7 @@ int main() {
     test_escape_helpers();
     test_split_packet_helper();
     test_hex_round_trip();
+    test_hex_number();
     test_hex_bytes();
     test_stop_reply();
     test_decode_store();
@@ -548,6 +837,9 @@ int main() {
     test_write_watch_width();
     test_wx_chase_prefers_new_mapping();
     test_wx_permission_transition();
+    test_target_description();
+    test_serve_target_description();
+    test_parse_vcont();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;
