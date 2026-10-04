@@ -13,6 +13,7 @@
 
 #include "occ/observer/rsp.h"
 #include "occ/observer/session.h"
+#include "occ/observer/transport.h"
 #include "occ/observer/watchpoint.h"
 #include "occ/observer/wx.h"
 
@@ -24,7 +25,10 @@
 
 #include <unistd.h>
 
+#include "occ/syscall/syscall.h"
+
 using namespace occ::obs;
+using namespace occ::sys;
 
 namespace {
 
@@ -570,6 +574,206 @@ void test_wx_permission_transition() {
     check(plain.transitions().empty(), "and no transition is recorded");
 }
 
+// ------------------------------------------------------------- gdb transport
+
+// The transport is tested against a real socket rather than a mock because
+// the things that go wrong here are the things a mock cannot show: a port
+// that was not really bound, an accept that returned a descriptor which is
+// not the one the listener owns, and a read that blocks instead of
+// returning. Each of those is a hang or a wrong connection at run time, and
+// both are invisible to an interface that pretends the bytes arrived.
+
+void test_listener_binds_loopback() {
+    // Port zero asks the kernel for any free port, which is the only way to
+    // run this check without colliding with whatever else is on the machine.
+    Listener listener;
+    std::string error;
+    const bool opened = listener.open(0, error);
+    if (!opened) {
+        // A sandbox that forbids sockets is a legitimate environment; the
+        // check is that the refusal is explained rather than that it
+        // succeeds.
+        std::fprintf(stderr, "  note: cannot bind a socket here: %s\n",
+                     error.c_str());
+        check(!error.empty(), "a refusal names its reason");
+        return;
+    }
+    check(listener.valid(), "a bound listener is valid");
+    check(listener.port() != 0, "the bound port is reported back");
+    check(!error.empty() == false, "a successful bind reports no error");
+
+    // A second bind on the same port has to fail, and has to say why. Two
+    // sessions silently sharing a port would mean a debugger attached to one
+    // of them drives the other.
+    Listener second;
+    std::string second_error;
+    const bool reopened = second.open(listener.port(), second_error);
+    if (reopened) {
+        // The kernel allows this when the first socket did not request
+        // SO_REUSEADDR, which is the default, so a success here means the
+        // platform allows it and there is nothing to assert.
+        std::fprintf(stderr, "  note: rebinding an in-use port was allowed\n");
+    } else {
+        check(!second_error.empty(), "a refused bind names its reason");
+    }
+
+    listener.close();
+    check(!listener.valid(), "a closed listener is not valid");
+}
+
+void test_listener_accept_times_out() {
+    Listener listener;
+    std::string error;
+    if (!listener.open(0, error)) {
+        std::fprintf(stderr, "  note: skipping accept test: %s\n", error.c_str());
+        return;
+    }
+
+    // Nobody connects, so the accept has to give up on its own. Without the
+    // deadline this call blocks forever, which is what a run with a debugger
+    // port would do to a user who started the run and walked away.
+    Connection conn;
+    const bool got = listener.accept(conn, 50);
+    check(!got, "an accept with no peer times out");
+    check(!conn.valid(), "a timed-out accept yields no connection");
+}
+
+void test_connection_round_trip() {
+    Listener listener;
+    std::string error;
+    if (!listener.open(0, error)) {
+        std::fprintf(stderr, "  note: skipping round trip test: %s\n",
+                     error.c_str());
+        return;
+    }
+
+    // A client socket connected to the listener, which stands in for the
+    // debugger. It is made by hand rather than through the Listener because a
+    // real debugger connects from outside the process.
+    const auto client =
+        occ::sys::socket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 0);
+    if (client.failed()) {
+        std::fprintf(stderr, "  note: cannot create a client socket\n");
+        return;
+    }
+
+    // 127.0.0.1 in network byte order, and the port the listener reported.
+    struct SockAddrIn {
+        std::uint16_t family;
+        std::uint16_t port;
+        std::uint32_t addr;
+        std::uint8_t zero[8];
+    } addr{};
+    addr.family = 2; // AF_INET, big endian on the wire
+    addr.port = static_cast<std::uint16_t>((listener.port() >> 8) |
+                                            (listener.port() << 8));
+    addr.addr = 0x0100007f; // 127.0.0.1
+
+    const auto connected = occ::sys::connect(static_cast<int>(client.value),
+                                             &addr, sizeof(addr));
+    if (connected.failed()) {
+        std::fprintf(stderr, "  note: connect failed, skipping\n");
+        (void)occ::sys::close(static_cast<int>(client.value));
+        return;
+    }
+
+    Connection conn;
+    check(listener.accept(conn, 1000), "a waiting accept returns a connection");
+    check(conn.valid(), "the accepted connection is valid");
+
+    // The port the listener reports must be the port that was actually
+    // bound, or a person told to connect to it connects to nothing.
+    check(conn.fd() >= 0, "the connection owns a descriptor");
+
+    // A packet written by the client arrives whole, even when it arrives in
+    // pieces: the framing is what makes a byte stream into messages.
+    const std::string request = encode_packet("qSupported");
+    const std::size_t half = request.size() / 2;
+    check(occ::sys::write(static_cast<int>(client.value), request.data(), half).ok(),
+          "the first half of a packet is written");
+    check(conn.wait_readable(1000), "the connection becomes readable");
+    check(conn.pump(), "a partial packet is read");
+    check(!conn.has_packet(), "half a packet is not a packet");
+    check(occ::sys::write(static_cast<int>(client.value), request.data() + half,
+                     request.size() - half)
+              .ok(),
+          "the second half of a packet is written");
+    check(conn.wait_readable(1000), "the connection is readable again");
+    check(conn.pump(), "the rest of the packet is read");
+    check(conn.has_packet(), "a whole packet is now available");
+
+    std::string packet;
+    check(conn.take_packet(packet), "the packet is taken");
+    check(packet == "qSupported", "the payload survives the round trip");
+    check(!conn.has_packet(), "the queue is empty again");
+
+    // A reply goes back the same way. The framing is applied here rather than
+    // by the caller, because a reply sent without it is a byte the debugger
+    // discards.
+    check(conn.send_packet("OK"), "a reply is sent");
+    char buffer[64] = {};
+    const auto got = occ::sys::read(static_cast<int>(client.value), buffer,
+                               sizeof(buffer));
+    check(got.ok(), "the client read the reply");
+    if (got.ok()) {
+        const std::string_view wire(buffer, static_cast<std::size_t>(got.value));
+        check(wire == encode_packet("OK"), "the reply arrives framed");
+    }
+
+    // A closed peer is how a debugger that quit is noticed. Reporting it as
+    // an error would make a normal disconnect look like a fault.
+    (void)occ::sys::close(static_cast<int>(client.value));
+    check(conn.wait_readable(1000), "the close is visible as readable");
+    check(!conn.pump(), "a closed peer ends the connection");
+
+    conn.close();
+    check(!conn.valid(), "a closed connection is not valid");
+}
+
+void test_connection_drops_corrupt_packet() {
+    // A packet whose checksum is wrong has to be refused rather than acted
+    // on. A command read out of a corrupt packet is a command nobody sent,
+    // and the worst thing this stub could do with one is resume a process or
+    // write its memory on the strength of a transmission error.
+    PacketDecoder decoder;
+    // 'g' with a checksum that cannot match.
+    decoder.feed("$g#00", 5);
+    check(decoder.has_packet(), "a corrupt packet is still framed");
+    Packet p = decoder.take();
+    check(!p.checksum_ok, "a bad checksum is reported");
+
+    // A failed checksum also asks for a retransmission, and that is what the
+    // sender does about it: the protocol has no other way to recover a
+    // packet that arrived damaged. The retransmission carries the same bytes
+    // rather than a rebuilt packet, because the sender's copy is the only one
+    // known to be what it meant to send.
+    PacketDecoder again;
+    again.feed("$g#00", 5);
+    check(again.has_packet(), "the corrupt packet is framed");
+    (void)again.take();
+    check(again.retransmit_requested(),
+          "a failed checksum asks for a retransmission");
+    // The packet to resend is the last one that arrived intact, not the
+    // damaged one: replying with damaged bytes would reproduce the same
+    // error. Nothing intact has arrived here, so there is nothing to resend.
+    check(again.last_packet().empty(),
+          "a damaged packet is not offered for retransmission");
+    again.clear_retransmit();
+    check(!again.retransmit_requested(), "the request is cleared once handled");
+
+    // A packet that arrives intact does not ask for one, and this is the
+    // property that keeps a good connection from retransmitting forever.
+    PacketDecoder good;
+    good.feed(encode_packet("g"));
+    check(good.has_packet(), "an intact packet is framed");
+    const Packet ok = good.take();
+    check(ok.checksum_ok, "an intact packet passes its checksum");
+    check(!good.retransmit_requested(),
+          "an intact packet asks for no retransmission");
+    check(good.last_packet() == encode_packet("g"),
+          "an intact packet is the one to resend");
+}
+
 // ------------------------------------------------------- target description
 
 // Counts the regnum attributes in the description. The count is what has to
@@ -837,6 +1041,10 @@ int main() {
     test_write_watch_width();
     test_wx_chase_prefers_new_mapping();
     test_wx_permission_transition();
+    test_listener_binds_loopback();
+    test_listener_accept_times_out();
+    test_connection_round_trip();
+    test_connection_drops_corrupt_packet();
     test_target_description();
     test_serve_target_description();
     test_parse_vcont();

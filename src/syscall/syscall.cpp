@@ -452,6 +452,11 @@ Result getsockopt(int sockfd, int level, int optname, void* optval,
                          detail::arg(optval), detail::arg(optlen));
 }
 
+Result getsockname(int sockfd, void* addr, void* addrlen) noexcept {
+    return detail::call3(N(SYS_getsockname), sockfd, detail::arg(addr),
+                         detail::arg(addrlen));
+}
+
 Result socketpair(int domain, int type, int protocol, int sv[2]) noexcept {
     return detail::call4(N(SYS_socketpair), domain, type, protocol,
                          detail::arg(sv));
@@ -470,6 +475,15 @@ Result shutdown(int sockfd, int how) noexcept {
 }
 
 Result setsid(void) noexcept { return detail::call0(N(SYS_setsid)); }
+
+Result poll(PollFd* fds, unsigned long nfds, int timeout_ms) noexcept {
+    // The kernel's nfds_t is unsigned long, but the register is passed as a
+    // signed long by every calling convention on this architecture. The cast
+    // says so explicitly rather than letting the conversion happen silently,
+    // because a negative count reaching the kernel is a hang.
+    return detail::call3(N(SYS_poll), detail::arg(fds),
+                         static_cast<long>(nfds), timeout_ms);
+}
 
 Result setresuid(unsigned int ruid, unsigned int euid,
                  unsigned int suid) noexcept {

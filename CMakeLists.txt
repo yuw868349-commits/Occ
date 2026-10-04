@@ -127,6 +127,7 @@ add_library(occ_core STATIC
     src/observer/wx.cpp
     src/observer/rsp.cpp
     src/observer/session.cpp
+    src/observer/transport.cpp
     src/observer/registry.cpp
     src/runner/run.cpp
 )

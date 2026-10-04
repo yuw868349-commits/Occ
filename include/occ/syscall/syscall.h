@@ -295,11 +295,30 @@ Result setsockopt(int sockfd, int level, int optname, const void* optval,
                   unsigned int optlen) noexcept;
 Result getsockopt(int sockfd, int level, int optname, void* optval,
                   void* optlen) noexcept;
+// Reads the address a socket is bound to, which is how a request for port
+// zero learns which port the kernel chose.
+Result getsockname(int sockfd, void* addr, void* addrlen) noexcept;
 Result socketpair(int domain, int type, int protocol, int sv[2]) noexcept;
 Result sendmsg(int sockfd, const void* msg, int flags) noexcept;
 Result recvmsg(int sockfd, void* msg, int flags) noexcept;
 Result shutdown(int sockfd, int how) noexcept;
 Result setsid(void) noexcept;
+
+// One descriptor to wait on. The layout is the kernel's, so it is spelled
+// out rather than pulled from a header: the fields are read by the kernel and
+// a mismatch here is a silent wrong answer rather than a compile error.
+struct PollFd {
+    int fd;
+    short events;
+    short revents;
+};
+
+// Waits until one of the descriptors is ready or the timeout expires. A
+// negative timeout waits indefinitely, zero returns immediately, and a
+// positive one is a millisecond count. Returns the number of ready
+// descriptors, or a negative errno.
+Result poll(PollFd* fds, unsigned long nfds, int timeout_ms) noexcept;
+
 
 Result setresuid(unsigned int ruid, unsigned int euid,
                  unsigned int suid) noexcept;
