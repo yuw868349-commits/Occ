@@ -35,34 +35,81 @@ void print_run_usage() {
         "  --cgroup <dir>     create the run's cgroup under <dir>\n"
         "  --env <K=V>        set an environment variable for the target\n"
         "  --observe          trace the target with ptrace as it runs\n"
+        "  --track-wx         watch for write-then-execute transitions\n"
+        "  --wx-all           consider file-backed regions too, not just\n"
+        "                     anonymous ones\n"
+        "  --wx-region <b>:<n>  watch a specific region instead of scanning\n"
+        "  --wx-max <bytes>   ignore candidate regions larger than this\n"
         "  --no-events        do not write the event stream\n"
         "  --help             print this text\n"
         "\n"
         "the event stream goes to stdout when it is not a terminal, and is\n"
         "suppressed when it is, so an interactive run shows only the\n"
-        "target's own output\n");
+        "target's own output\n"
+        "\n"
+        "--track-wx needs hardware watch events. There are four debug\n"
+        "registers and a candidate region is a whole page, so the stream\n"
+        "reports how many bytes were actually covered rather than implying\n"
+        "the region was watched in full\n");
 }
 
-// Parses an unsigned decimal. Returns false rather than clamping, because a
-// limit that silently became a different limit is worse than a run that
-// refused to start.
+// Parses an unsigned decimal, or a hexadecimal number written with a 0x
+// prefix. Addresses are habitually written in hex and a length is not, so
+// the prefix is what distinguishes them. Returns false rather than
+// clamping, because a limit that silently became a different limit is worse
+// than a run that refused to start.
 bool parse_u64(std::string_view s, std::uint64_t& out) noexcept {
     if (s.empty()) {
         return false;
     }
+
+    int base = 10;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        base = 16;
+        s.remove_prefix(2);
+    }
+    if (s.empty()) {
+        return false;
+    }
+
     std::uint64_t v = 0;
     for (char c : s) {
-        if (c < '0' || c > '9') {
+        int digit;
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (base == 16 && c >= 'a' && c <= 'f') {
+            digit = c - 'a' + 10;
+        } else if (base == 16 && c >= 'A' && c <= 'F') {
+            digit = c - 'A' + 10;
+        } else {
             return false;
         }
-        const std::uint64_t digit = static_cast<std::uint64_t>(c - '0');
-        if (v > (UINT64_MAX - digit) / 10) {
+        const std::uint64_t d = static_cast<std::uint64_t>(digit);
+        if (v > (UINT64_MAX - d) / static_cast<std::uint64_t>(base)) {
             return false;
         }
-        v = v * 10 + digit;
+        v = v * static_cast<std::uint64_t>(base) + d;
     }
     out = v;
     return true;
+}
+
+// Parses "BASE:LENGTH" into a watch target. The colon is what separates an
+// address from a size, which is the same convention --bind uses and the
+// reason a caller who has learned one does not have to learn the other.
+bool parse_region(std::string_view spec, obs::WatchTarget& out) noexcept {
+    const std::size_t colon = spec.find(':');
+    if (colon == std::string_view::npos || colon == 0 ||
+        colon + 1 >= spec.size()) {
+        return false;
+    }
+    if (!parse_u64(spec.substr(0, colon), out.base)) {
+        return false;
+    }
+    if (!parse_u64(spec.substr(colon + 1), out.length)) {
+        return false;
+    }
+    return out.length != 0;
 }
 
 // Splits "source:target" into its two halves. A bind mount with no target
@@ -216,6 +263,44 @@ int cmd_run(int argc, char** argv) {
             }
             options.env.emplace_back(v);
         } else if (arg == "--observe") {
+            options.observe = true;
+        } else if (arg == "--track-wx") {
+            // Tracking implies tracing: the tracker drains watch events
+            // between stops, and with no stops there is nowhere to drain
+            // them to. Saying so here rather than failing later means the
+            // combination is not a trap.
+            options.track_wx = true;
+            options.observe = true;
+        } else if (arg == "--wx-all") {
+            options.wx_anonymous_only = false;
+        } else if (arg == "--wx-max") {
+            const char* v = value("--wx-max");
+            if (v == nullptr) {
+                return 2;
+            }
+            if (!parse_u64(v, options.wx_max_region_bytes) ||
+                options.wx_max_region_bytes == 0) {
+                std::fprintf(stderr,
+                             "occ run: --wx-max takes a byte count, got "
+                             "'%s'\n",
+                             v);
+                return 2;
+            }
+        } else if (arg == "--wx-region") {
+            const char* v = value("--wx-region");
+            if (v == nullptr) {
+                return 2;
+            }
+            obs::WatchTarget t;
+            if (!parse_region(v, t)) {
+                std::fprintf(stderr,
+                             "occ run: --wx-region takes BASE:LENGTH with "
+                             "hex or decimal BASE, got '%s'\n",
+                             v);
+                return 2;
+            }
+            options.wx_regions.push_back(t);
+            options.track_wx = true;
             options.observe = true;
         } else if (arg == "--no-events") {
             no_events = true;

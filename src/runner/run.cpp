@@ -160,8 +160,23 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
 
     const std::vector<std::string> env = default_environment(options);
 
+    // The target's path is made absolute before the container is built.
+    //
+    // The container pivots its root, and everything after the pivot is
+    // resolved against the new root rather than against the directory occ
+    // happened to be started in. A relative path is therefore a different
+    // file inside the container than it was outside, and the failure is
+    // ENOENT from an execve that looks correct at the call site.
+    //
+    // Resolving here rather than in the child is deliberate: the child has
+    // already pivoted by the time it could do it, and the host's view of
+    // where the file is no longer exists from inside. The path recorded in
+    // the event stream is the resolved one too, so a reader of the stream
+    // can tell what actually ran.
+    const std::string resolved = fs::absolute_path(path);
+
     isolation::SpawnResult spawned =
-        isolation::container_spawn(config, path, argv, env);
+        isolation::container_spawn(config, resolved, argv, env);
     if (!spawned.error.ok()) {
         out.failed = true;
         out.error = spawned.error;
@@ -204,12 +219,26 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
         sc.serve_gdb = options.gdb_read_fd >= 0;
         sc.gdb_read_fd = options.gdb_read_fd;
         sc.gdb_write_fd = options.gdb_write_fd;
+        // The tracker is wired through rather than inferred from observe:
+        // a run that asked for it gets it, and a run that did not is not
+        // charged for the four debug registers it would consume.
+        sc.track_wx = options.track_wx;
+        sc.wx_regions = options.wx_regions;
+        sc.wx_anonymous_only = options.wx_anonymous_only;
+        sc.wx_max_region_bytes = options.wx_max_region_bytes;
 
         const obs::SessionResult sr = obs::observe(sc, events);
         out.stops = sr.stops;
         out.syscall_stops = sr.syscall_stops;
         out.breakpoint_hits = sr.breakpoint_hits;
         out.observed_signals = sr.signals;
+        out.wx_transitions = sr.transitions;
+        out.wx_regions = sr.wx_regions;
+        out.wx_watches = sr.wx_watches;
+        out.wx_bytes_covered = sr.wx_bytes_covered;
+        out.wx_bytes_total = sr.wx_bytes_total;
+        out.wx_lost_samples = sr.wx_lost_samples;
+        out.wx_unavailable = sr.wx_unavailable;
 
         if (sr.failed) {
             out.failed = true;

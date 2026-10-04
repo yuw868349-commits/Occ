@@ -46,7 +46,32 @@ struct SessionConfig {
     bool follow_forks = true;
 
     // Whether to watch for write-then-execute transitions.
+    //
+    // This costs the target: a hardware watch takes a debug register, there
+    // are four, and every write to a watched region stops the session. It is
+    // off by default because a run that is not looking for self-modifying
+    // code should not pay for the possibility.
     bool track_wx = false;
+
+    // Which regions the tracker watches when track_wx is on. Empty means
+    // "work it out from the target's own maps", which is the right answer
+    // for a run that does not know the image in advance. A caller that does
+    // know -- an unpacker that has already located the staging buffer --
+    // names the regions and skips the scan.
+    std::vector<WatchTarget> wx_regions;
+
+    // Whether a region has to be anonymous to be watched. A decoder's
+    // staging buffer is anonymous, and requiring it cuts the number of
+    // candidate regions to roughly one per allocation rather than one per
+    // mapping, which matters when there are four debug registers and a
+    // linker maps dozens.
+    bool wx_anonymous_only = true;
+
+    // The largest total region size the tracker will consider. A target that
+    // maps a gigabyte of writable memory is not going to have its decoder
+    // found by watching the first four words of it, and a limit keeps the
+    // scan from proposing regions that could never be covered.
+    std::uint64_t wx_max_region_bytes = 16u * 1024u * 1024u;
 
     // Whether to serve a remote debugger. When false the session only
     // produces events, and the loop never reads from the client
@@ -73,6 +98,25 @@ struct SessionResult {
     std::uint64_t breakpoint_hits = 0;
     std::uint64_t signals = 0;
     std::uint64_t transitions = 0;
+
+    // What the write tracker managed. These are reported rather than assumed
+    // because the hardware has four debug registers and a candidate region
+    // is a whole page: the honest answer is usually "four bytes of the
+    // first region", and a caller that was told "tracking" with no numbers
+    // would read that as coverage it does not have.
+    std::uint64_t wx_regions = 0;
+    std::uint64_t wx_watches = 0;
+    std::uint64_t wx_bytes_covered = 0;
+    std::uint64_t wx_bytes_total = 0;
+    std::uint64_t wx_regions_unwatched = 0;
+    // Samples the kernel reported as lost, which are accesses the observer
+    // never saw. Nonzero means the record is incomplete.
+    std::uint64_t wx_lost_samples = 0;
+    // True when no hardware watch could be installed at all, which is the
+    // normal result on a host whose policy blocks perf_event_open. It is
+    // reported as a fact rather than as a failure because the rest of the
+    // session is unaffected.
+    bool wx_unavailable = false;
 
     int exit_code = 0;
     int term_signal = 0;

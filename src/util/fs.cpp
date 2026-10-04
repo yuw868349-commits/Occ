@@ -264,6 +264,93 @@ long remove_tree(const std::string& path) noexcept {
     return removed;
 }
 
+std::string current_directory() noexcept {
+    // The kernel returns the length it wrote, and refuses with ERANGE if the
+    // buffer is too small. Starting at a page is not a guess about the
+    // depth: PATH_MAX is the bound the kernel enforces anyway, and anything
+    // longer is not a path this system will accept.
+    std::array<char, 4096> buf{};
+    auto r = sys::getcwd(buf.data(), buf.size());
+    if (r.failed()) {
+        return {};
+    }
+    const auto len = static_cast<std::size_t>(r.value);
+    if (len == 0 || len >= buf.size()) {
+        return {};
+    }
+    return std::string(buf.data(), len);
+}
+
+std::string absolute_path(const std::string& path) noexcept {
+    std::string full;
+    if (!path.empty() && path[0] == '/') {
+        full = path;
+    } else {
+        const std::string cwd = current_directory();
+        if (cwd.empty()) {
+            // With no working directory there is nothing to be relative to,
+            // and returning the input unchanged would let the caller believe
+            // it had a usable path. Returning the input is still better than
+            // returning nothing: the caller's own error message will name the
+            // path the user typed, which is the one worth naming.
+            return path;
+        }
+        full = cwd;
+        if (full.empty() || full.back() != '/') {
+            full.push_back('/');
+        }
+        full += path;
+    }
+
+    // Fold the "." and ".." components.
+    //
+    // This is done lexically rather than by asking the kernel, because
+    // resolving ".." through a symlink is not the same as removing it: the
+    // kernel follows the symlink and then takes the parent of the target,
+    // while folding removes the name. For a path that is about to be handed
+    // to a container the lexical form is the correct one, because the
+    // container's root is about to change and a symlink resolved now would
+    // be resolved against the wrong tree.
+    std::vector<std::string_view> parts;
+    std::size_t pos = 0;
+    while (pos <= full.size()) {
+        const std::size_t next = full.find('/', pos);
+        const std::size_t end = (next == std::string::npos) ? full.size() : next;
+        const std::string_view part(full.data() + pos, end - pos);
+
+        if (part.empty() || part == ".") {
+            // A doubled separator and a "." both mean nothing to the kernel,
+            // and dropping them here is what makes the fold total.
+        } else if (part == "..") {
+            // A ".." at the root stays at the root. Removing it would let a
+            // path escape the tree it was meant to describe, and the kernel
+            // would refuse it, so the fold has to agree with the kernel.
+            if (!parts.empty() && parts.back() != "..") {
+                parts.pop_back();
+            } else if (parts.empty()) {
+                // At the root already: keep the root and drop the "..".
+            }
+        } else {
+            parts.push_back(part);
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    std::string out;
+    for (std::string_view p : parts) {
+        out.push_back('/');
+        out.append(p);
+    }
+    if (out.empty()) {
+        out = "/";
+    }
+    return out;
+}
+
 std::vector<std::string> list_dir(const std::string& path) noexcept {
     std::vector<std::string> out;
 

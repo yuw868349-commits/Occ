@@ -44,6 +44,26 @@ read_file_bytes(const std::string& path) noexcept;
 
 [[nodiscard]] std::vector<std::string> list_dir(const std::string& path) noexcept;
 
+// Makes a path absolute and normal.
+//
+// "Absolute" means joined onto the current working directory, and
+// "normal" means the "." and ".." components are folded away. Both halves
+// matter and neither is optional: a path that is merely made absolute still
+// contains "..", and inside a container whose root is not the host's root
+// those two forms resolve differently.
+//
+// The result is the lexical resolution, not the physical one. Symlinks are
+// not followed, because a container is about to have its own root and a
+// symlink resolved against the host's root is not a path inside it. A
+// caller that needs the physical path asks the kernel for it inside the
+// container, after the pivot, where the answer is the right one.
+[[nodiscard]] std::string absolute_path(const std::string& path) noexcept;
+
+// The current working directory, or an empty string when it cannot be read.
+// An empty result is not a usable path and a caller that treats it as one
+// would build a path out of nothing.
+[[nodiscard]] std::string current_directory() noexcept;
+
 // Reads a symlink target.
 [[nodiscard]] std::optional<std::string> read_link(const std::string& path) noexcept;
 

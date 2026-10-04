@@ -43,6 +43,10 @@ Result wait4(int pid, int* status, int options, void* rusage) noexcept {
 
 Result getpid(void) noexcept { return detail::call0(N(SYS_getpid)); }
 
+Result getcwd(char* buf, std::size_t size) noexcept {
+    return detail::call2(N(SYS_getcwd), detail::arg(buf),
+                         detail::arg(size));
+}
 Result gettid(void) noexcept { return detail::call0(N(SYS_gettid)); }
 
 Result getppid(void) noexcept { return detail::call0(N(SYS_getppid)); }

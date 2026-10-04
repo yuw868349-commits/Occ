@@ -59,7 +59,43 @@ struct HardwareWatch {
     std::uint64_t address = 0;
     WatchKind kind = WatchKind::Write;
     WatchSize size = WatchSize::Bytes8;
+
+    // The perf ring buffer this watch delivers through, and how far the
+    // consumer has read into it. The buffer is mapped once per watch rather
+    // than shared, because each watch is its own perf event with its own
+    // stream, and a shared ring would make the mapping between a fired
+    // address and a watch a matter of bookkeeping rather than of identity.
+    void* ring = nullptr;
+    std::size_t ring_bytes = 0;
+    // Where the record area starts, which is one page past the metadata.
+    // It is stored rather than assumed because the page size is a runtime
+    // fact and a hard-coded 4096 would silently misread the ring on a
+    // machine with a different one.
+    std::size_t ring_data_offset = 0;
+    std::size_t ring_tail = 0;
 };
+
+// One delivered watch event, decoded out of a ring buffer record.
+struct WatchEvent {
+    int pid = 0;
+    // The instruction that performed the access.
+    std::uint64_t rip = 0;
+    // The data address that matched the watch, when the kernel supplied one.
+    // An execute watch has no data address and reports zero.
+    std::uint64_t address = 0;
+    WatchKind kind = WatchKind::Write;
+    // True when the record carried a usable data address. The distinction
+    // matters because zero is a legitimate address on some mappings, and
+    // treating "no address" as "address zero" would attribute an event to
+    // the wrong page.
+    bool has_address = false;
+};
+
+// How many ring buffer bytes one watch allocates. It has to be a power of two
+// number of pages plus one control page, because the kernel's ring buffer
+// arithmetic is a mask rather than a division.
+inline constexpr std::size_t kWatchRingDataPages = 2;
+inline constexpr std::size_t kWatchRingPages = kWatchRingDataPages + 1;
 
 class Watchpoints {
 public:
@@ -70,11 +106,15 @@ public:
 
     // Registers a watch on `address` in `pid`.
     //
-    // The events are delivered on the returned descriptor, which the caller
-    // polls. A synchronous SIGTRAP delivery is not used: a signal would
-    // arrive in the middle of whatever the target was doing, and the
-    // observer would then be reading its state from a handler rather than
-    // from a loop that owns it.
+    // The events are delivered through a mapped ring buffer, which the
+    // caller drains with read_events(). A synchronous SIGTRAP delivery is
+    // not used: a signal would arrive in the middle of whatever the target
+    // was doing, and the observer would then be reading its state from a
+    // handler rather than from a loop that owns it.
+    //
+    // On success the watch is enabled. A watch left disabled would accept
+    // the event and never report it, which is the one failure mode that
+    // cannot be detected from the outside.
     [[nodiscard]] int add(int pid, std::uint64_t address, WatchKind kind,
                           WatchSize size, std::string& detail) noexcept;
 
@@ -85,18 +125,88 @@ public:
 
     int remove_all_for(int pid) noexcept;
 
+    // Every watch descriptor, for poll(). The descriptor is the perf event
+    // fd itself: it becomes readable when the ring buffer has records the
+    // consumer has not taken. Polling the fd is what lets a single loop
+    // watch the target's stops, the debugger's packets, and the watch
+    // events without any of them being able to starve the others.
+    [[nodiscard]] std::vector<int> fds() const noexcept;
+
+    // Takes every record currently in every ring buffer and appends the
+    // decoded ones to `out`. Returns the number of events produced.
+    //
+    // Records that cannot be decoded are skipped rather than guessed at: a
+    // ring buffer that wrapped or was written by a kernel with a different
+    // record layout is reported through the return value being lower than
+    // the record count, and the caller re-syncs its tail.
+    std::size_t read_events(std::vector<WatchEvent>& out) noexcept;
+
     [[nodiscard]] const std::vector<HardwareWatch>& all() const noexcept {
         return watches_;
     }
     [[nodiscard]] std::size_t size() const noexcept { return watches_.size(); }
 
+    // How many samples the kernel reported as lost across every watch. A
+    // lost sample is a real access the observer never saw, and in a tracker
+    // that means a write it cannot account for. The count is kept rather
+    // than discarded because "the ring wrapped" and "no writes happened"
+    // are indistinguishable in the output otherwise, and only one of them
+    // means the target is clean.
+    [[nodiscard]] std::uint64_t lost_samples() const noexcept {
+        return lost_samples_;
+    }
+    void clear_lost_samples() noexcept { lost_samples_ = 0; }
+
     // How many hardware debug registers exist on this machine. Zero when the
     // host reports none, which is the honest answer for a kernel built
     // without the capability.
-    [[nodiscard]] static std::uint32_t hardware_slots() noexcept;
+    //
+    // This counts the registers the machine has, not the ones this object
+    // still has free. The distinction matters and the naming cannot carry
+    // it, so it is stated here: the count is obtained by creating watches on
+    // the calling process until one is refused, so a caller that already
+    // holds every register gets zero back. A caller budgeting an allocation
+    // needs the machine's capacity and must subtract what it already holds.
+    [[nodiscard]] static std::uint32_t machine_slots() noexcept;
+
+    // Runs the probe for machine_slots() without consulting the cache.
+    //
+    // Exposed because the cached answer and the live answer disagree exactly
+    // when the caller is holding watches, and a test that can only see the
+    // cached value cannot tell a machine with four registers from one with
+    // four free registers. This is the raw question; machine_slots() is the
+    // remembered answer.
+    [[nodiscard]] static std::uint32_t probe_slots() noexcept;
+
+    // The cached machine capacity.
+    [[nodiscard]] static std::uint32_t hardware_slots() noexcept {
+        return machine_slots();
+    }
+
+    // How many more watches this object could install right now: the machine
+    // capacity minus the watches already held.
+    //
+    // This is the number an installer wants. Using hardware_slots() for it
+    // fails in the one case that matters -- reallocating onto a new region
+    // while the old watches are still installed reports zero free, and the
+    // reallocation silently installs nothing.
+    [[nodiscard]] std::uint32_t free_slots() const noexcept;
+
+    // Whether this machine can create hardware watches at all. Separate
+    // from hardware_slots() because a machine can report slots and still
+    // refuse the event: a seccomp filter that blocks perf_event_open makes
+    // every watch impossible while the count stays at four. A caller that
+    // only checked the count would arm nothing and believe it had.
+    [[nodiscard]] static bool hardware_available() noexcept;
 
 private:
+    // Frees the ring buffer and the descriptor of one watch. Shared by the
+    // destructor and by remove, because leaking a mapping per watch would
+    // outlive the target it was watching.
+    static void release(HardwareWatch& w) noexcept;
+
     std::vector<HardwareWatch> watches_;
+    std::uint64_t lost_samples_ = 0;
 };
 
 // Reads the instruction at `rip` in a stopped process and reports which

@@ -162,6 +162,10 @@ Result wait4(int pid, int* status, int options, void* rusage) noexcept;
 Result getpid(void) noexcept;
 Result gettid(void) noexcept;
 Result getppid(void) noexcept;
+// The calling process's working directory. The buffer form is what the
+// kernel provides; a caller that wants a std::string has to size a buffer,
+// and the size is the only thing this saves it from getting wrong.
+Result getcwd(char* buf, std::size_t size) noexcept;
 Result getuid_syscall(void) noexcept;
 Result getgid_syscall(void) noexcept;
 Result geteuid(void) noexcept;

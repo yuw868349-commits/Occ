@@ -20,6 +20,7 @@
 
 #include "occ/isolation/container.h"
 #include "occ/observer/event.h"
+#include "occ/observer/wx.h"
 #include "occ/parser/elf.h"
 
 namespace occ::runner {
@@ -57,6 +58,24 @@ struct RunOptions {
     // anything else, so this is off by default: a run that only needs the
     // isolation facts should not pay for observation it did not ask for.
     bool observe = false;
+
+    // Whether to watch for write-then-execute transitions while observing.
+    // It implies observe, because a tracker with no stops has nothing to
+    // drain the watch events between.
+    bool track_wx = false;
+
+    // Which regions to watch. Empty means the target's own maps are scanned
+    // for candidates, which is right for a run that does not know the image
+    // in advance.
+    std::vector<obs::WatchTarget> wx_regions;
+
+    // Whether a candidate region has to be anonymous. A decoder's staging
+    // buffer is, and requiring it keeps the four debug registers from being
+    // spent on the parts of a binary that will never hold generated code.
+    bool wx_anonymous_only = true;
+
+    // The largest region the tracker will consider.
+    std::uint64_t wx_max_region_bytes = 16u * 1024u * 1024u;
 
     // Where the target is, for a run that is being set up for a debugger to
     // reach later. Empty for an ordinary run.
@@ -109,6 +128,18 @@ struct RunResult {
     std::uint64_t syscall_stops = 0;
     std::uint64_t breakpoint_hits = 0;
     std::uint64_t observed_signals = 0;
+
+    // What the write tracker saw and what it could not see. The coverage
+    // numbers are here because "tracking was on" says nothing about whether
+    // it watched anything: the hardware has four debug registers, and a
+    // region is a page.
+    std::uint64_t wx_transitions = 0;
+    std::uint64_t wx_regions = 0;
+    std::uint64_t wx_watches = 0;
+    std::uint64_t wx_bytes_covered = 0;
+    std::uint64_t wx_bytes_total = 0;
+    std::uint64_t wx_lost_samples = 0;
+    bool wx_unavailable = false;
 };
 
 // Reads `path`, reports what the image is, and runs it under the container

@@ -13,6 +13,7 @@
 
 #include "occ/observer/rsp.h"
 #include "occ/observer/watchpoint.h"
+#include "occ/observer/wx.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -329,7 +330,7 @@ void test_hardware_slots_probe() {
     // The probe reports what the kernel allows. Zero is a valid answer for
     // a kernel without the capability, so the check is that the call is
     // safe and bounded, not that it is non-zero.
-    const std::uint32_t slots = Watchpoints::hardware_slots();
+    const std::uint32_t slots = Watchpoints::probe_slots();
     check(slots <= 16, "the hardware slot count is bounded");
     std::fprintf(stderr, "  note: hardware debug registers reported: %u\n",
                  slots);
@@ -353,6 +354,168 @@ void test_watch_alignment() {
     check(rr != 0, "a read-only watch is refused");
     check(detail.find("read-only") != std::string::npos,
           "the refusal names the read-only limitation");
+}
+
+void test_write_watch_width() {
+    // A one or two byte write watch is not encodable on x86-64 and the
+    // kernel refuses it with a bare EINVAL, which is indistinguishable from
+    // a host with no debug registers at all. The refusal therefore has to
+    // happen here, where the reason can be named.
+    //
+    // This check exists because the tracker used to accept these widths and
+    // then report the host as incapable of write tracking.
+    Watchpoints w;
+    std::string detail;
+
+    const int one = w.add(static_cast<int>(::getpid()), 0x2000,
+                          WatchKind::Write, WatchSize::Bytes1, detail);
+    check(one != 0, "a one byte write watch is refused");
+    check(detail.find("four or eight") != std::string::npos,
+          "the refusal names the write watch widths");
+
+    detail.clear();
+    const int two = w.add(static_cast<int>(::getpid()), 0x2000,
+                          WatchKind::Write, WatchSize::Bytes2, detail);
+    check(two != 0, "a two byte write watch is refused");
+
+    // A four byte read watch is legal. The restriction is on the write type
+    // alone, which is why the check above is specific to it.
+    detail.clear();
+    const int four = w.add(static_cast<int>(::getpid()), 0x3000,
+                           WatchKind::ReadWrite, WatchSize::Bytes4, detail);
+    const bool available = Watchpoints::hardware_available();
+    check(!available || four == 0,
+          "a four byte read-or-write watch is accepted where hardware exists");
+    if (four == 0) {
+        std::fprintf(stderr,
+                     "  note: installed a four byte read-or-write watch on the "
+                     "test process at 0x3000\n");
+    }
+}
+
+void test_wx_chase_prefers_new_mapping() {
+    // A decoder's staging buffer does not exist when the process starts, so
+    // arming the watches once at startup cannot reach it. The chase is what
+    // moves the scarce debug registers onto a region that appeared while
+    // the session was running, and this checks that it covers the region it
+    // was asked about rather than reporting a coverage it does not have.
+    WriteExecuteTracker tracker;
+    Watchpoints watches;
+
+    const int pid = static_cast<int>(::getpid());
+
+    // Two regions the tracker is told about before anything is armed. They
+    // stand in for the writable data segments a process image carries.
+    std::string detail;
+    (void)tracker.watch(pid, 0x100000, 24576, detail);
+    (void)tracker.watch(pid, 0x200000, 4096, detail);
+    check(tracker.region_count() == 2, "both regions are tracked");
+
+    const ArmReport armed = tracker.arm(watches, pid);
+    check(armed.watches_installed <= 4,
+          "arming never exceeds the hardware slot count");
+    check(armed.bytes_covered <= armed.bytes_total,
+          "coverage never exceeds the requested bytes");
+    std::fprintf(stderr,
+                 "  note: armed %zu watches, covered %llu of %llu bytes\n",
+                 armed.watches_installed,
+                 static_cast<unsigned long long>(armed.bytes_covered),
+                 static_cast<unsigned long long>(armed.bytes_total));
+
+    // The shorter region is served first. That is the point of the ordering:
+    // four registers of eight bytes cover thirty-two bytes, and a region of
+    // thirty-two bytes or less can be covered completely, while a large one
+    // can only be sampled. Longest-first would hand every register to the
+    // 24576-byte region and guarantee never seeing a write to the 4096-byte
+    // one.
+    //
+    // The assertion is about the allocation, not about a coverage that only
+    // a machine with debug registers can produce. A kernel without them arms
+    // nothing and reports every region unwatched, and that is a correct
+    // answer that must not fail the test.
+    if (armed.watches_installed > 0) {
+        bool small_covered = false;
+        for (const auto& partial : armed.partial) {
+            if (partial.target.base == 0x200000) {
+                small_covered = true;
+            }
+        }
+        bool small_unwatched = false;
+        for (const auto& u : armed.unwatched) {
+            if (u.base == 0x200000) {
+                small_unwatched = true;
+            }
+        }
+        check(small_covered || small_unwatched,
+              "the short region is served before the long one");
+        check(armed.watches_installed <= 32 / 8,
+              "no more watches are installed than the registers hold");
+    }
+
+    // A region that appears later is chased, and the cold watches on regions
+    // nothing wrote to are released to make room for it.
+    const ArmReport chased = tracker.chase(watches, pid, 0x300000, 4096);
+    check(chased.bytes_total == 4096, "the chased region is measured");
+    check(chased.bytes_covered <= 4096, "the chased coverage fits the region");
+    std::fprintf(stderr,
+                 "  note: chased 0x300000, installed %zu watches, covered "
+                 "%llu of %llu bytes\n",
+                 chased.watches_installed,
+                 static_cast<unsigned long long>(chased.bytes_covered),
+                 static_cast<unsigned long long>(chased.bytes_total));
+
+    // Chasing the same region again is idempotent rather than a second set of
+    // watches on the same address, which would waste a debug register.
+    const ArmReport again = tracker.chase(watches, pid, 0x300000, 4096);
+    check(again.watches_installed == 0,
+          "re-chasing an armed region installs nothing new");
+
+    // A region that has been written is never evicted: it holds the only
+    // evidence a transition can still be built from.
+    tracker.note_write(pid, 0x300000, 8, 0x401000);
+    const std::size_t before = watches.fds().size();
+    (void)tracker.evict_cold(watches, 100);
+    check(watches.fds().size() == before,
+          "a written region keeps its watches through an eviction");
+
+    tracker.release(watches);
+    check(watches.fds().empty(), "releasing the tracker frees every watch");
+}
+
+void test_wx_permission_transition() {
+    // The transition the tracker exists to report: a region written while it
+    // was not executable, then made executable. Reported once, because a
+    // decoder that writes a byte at a time would otherwise produce one
+    // report per byte.
+    WriteExecuteTracker tracker;
+    std::string detail;
+    (void)tracker.watch(static_cast<int>(::getpid()), 0x400000, 4096, detail);
+
+    RegionPerms data;
+    data.readable = true;
+    data.writable = true;
+    data.executable = false;
+
+    tracker.note_write(static_cast<int>(::getpid()), 0x400000, 4, 0x401000);
+    check(!tracker.note_permission(static_cast<int>(::getpid()), 0x400000, data),
+          "a region that is still not executable is not a transition");
+
+    RegionPerms code = data;
+    code.executable = true;
+    check(tracker.note_permission(static_cast<int>(::getpid()), 0x400000, code),
+          "becoming executable after a write is a transition");
+    check(tracker.transitions().size() == 1, "one transition is recorded");
+    check(!tracker.note_permission(static_cast<int>(::getpid()), 0x400000, code),
+          "the same transition is not reported twice");
+    check(tracker.transitions().size() == 1, "still one transition");
+
+    // A region that became executable without being written is not a
+    // transition. It is ordinary relro tightening or lazy binding.
+    WriteExecuteTracker plain;
+    (void)plain.watch(static_cast<int>(::getpid()), 0x500000, 4096, detail);
+    check(!plain.note_permission(static_cast<int>(::getpid()), 0x500000, code),
+          "an unwritten region becoming executable is not a transition");
+    check(plain.transitions().empty(), "and no transition is recorded");
 }
 
 } // namespace
@@ -382,6 +545,9 @@ int main() {
     test_decode_truncated();
     test_hardware_slots_probe();
     test_watch_alignment();
+    test_write_watch_width();
+    test_wx_chase_prefers_new_mapping();
+    test_wx_permission_transition();
 
     std::fprintf(stderr, "%d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

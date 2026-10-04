@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include <sched.h>
+#include <poll.h>
 #include <sys/wait.h>
 
 namespace occ::isolation {
@@ -146,15 +147,26 @@ using flags::kNewpid;
 using flags::kNewuser;
 using flags::kNewuts;
 
-// clone3 takes its argument count separately and rejects a size smaller than
-// the kernel expects, so the size is derived from the structure rather than
-// written as a literal.
-constexpr std::uint64_t kCloneArgsSize = sizeof(sys::CloneArgs);
-
 // The signal delivered to the parent when the container's init exits. SIGCHLD
 // is the value that makes the container's process behave like an ordinary
 // child, which is what makes the wait in container_reap terminate.
 constexpr int kCloneExitSignal = 17; // SIGCHLD
+
+// The argument count clone3 is given.
+//
+// It is not the size of the structure. The kernel defines exactly three
+// argument-block layouts and rejects any other count with EINVAL, and the
+// smallest of them -- CLONE_ARGS_SIZE_VER0, 64 bytes, the fields up to
+// stack_size -- covers everything this project asks for. Passing the full
+// 88-byte structure is a mistake that compiles cleanly and fails at runtime
+// on every kernel, because the size is a version number rather than a
+// length.
+//
+// The three are 64, 80 and 88, so a kernel newer than this code has no way
+// to be given a count it does not know; the newest one this build knows is
+// chosen so that a host with a newer kernel still gets a layout it
+// recognises.
+constexpr std::uint64_t kCloneArgsSize = 64;
 
 // ---------------------------------------------------------------- cloning
 //
@@ -198,25 +210,62 @@ struct CloneOutcome {
 };
 
 // Namespaces that go into the child's unshare call on the fallback path.
-// CLONE_NEWPID is excluded: unshare only re-points the namespace of children
-// created afterwards, so it has to be requested by the process that will
-// itself become the init. Applying it in the child, before the child does
-// anything else, has exactly the same effect as clone3's atomic form.
+//
+// Every namespace goes into a single call. Splitting it -- one call for the
+// set without the pid namespace, then a second for the pid namespace -- is
+// wrong in a way that only shows up on a host with a real user namespace,
+// and it is worth being exact about why.
+//
+// The first unshare creates the user namespace and the others alongside it,
+// and the calling process is now inside a user namespace it created. Inside
+// it, the process holds a full set of capabilities over that namespace but
+// none over its parent, and a second unshare of a namespace that requires a
+// capability the process does not hold there is refused with EPERM. The
+// second call therefore fails, and it fails for a reason that has nothing to
+// do with the namespace it asked for.
+//
+// The pid namespace does not actually need a separate call: unshare
+// re-points the namespace of children created after it, and the child is
+// about to become the parent of whatever it execs, which is what makes it
+// pid 1. The comment that used to be here said the pid namespace had to be
+// entered separately, and the separate call is what the code did. One call
+// with every flag produces the same arrangement.
 std::uint64_t fallback_unshare_flags(const NamespaceSet& ns) noexcept {
-    std::uint64_t f = ns.flags();
-    f &= ~flags::kNewpid;
-    return f;
+    return ns.flags();
 }
 
 CloneOutcome clone_child(const ContainerConfig& config) noexcept {
     CloneOutcome out;
 
     sys::CloneArgs args{};
-    args.flags = config.namespaces.flags() | kCloneExitSignal;
+    // The exit signal goes in exit_signal and nowhere else.
+    //
+    // clone2 folds the signal into the low bits of its flags argument, and
+    // carrying that habit over to clone3 is the mistake that costs a day:
+    // the kernel treats any flag bit in the signal range as an unsupported
+    // clone2 flag and answers EINVAL, which reads as a namespace being
+    // refused rather than as an argument placed in the wrong field. The
+    // namespaces here have no bits in that range, so the value has to be
+    // added deliberately and not at all -- it is in exit_signal.
+    args.flags = config.namespaces.flags();
     args.exit_signal = kCloneExitSignal;
 
     auto cr = sys::clone3_raw(&args, kCloneArgsSize);
     if (cr.ok()) {
+        // A zero return means this is the child. clone3 gives every process
+        // the same return point, and the child is told which one it is by
+        // the value being zero rather than by the call not returning.
+        //
+        // Not recognising that is not a small mistake: the child falls
+        // through into the parent's path, and the parent's path writes
+        // /proc/<pid>/uid_map for the pid it was handed -- which for the
+        // child is zero. The run then fails with "write /proc/0/uid_map",
+        // which names neither the child nor the namespace.
+        if (cr.value == 0) {
+            out.in_child = true;
+            out.pid = 0;
+            return out;
+        }
         out.pid = cr.value;
         return out;
     }
@@ -240,8 +289,7 @@ CloneOutcome clone_child(const ContainerConfig& config) noexcept {
     // Forking first keeps the parent outside the user namespace, still the
     // child's owner in the old one, and therefore still the process that
     // gets to define the child's mapping. The child creates the namespaces
-    // for itself. The pid namespace is created by the child's own unshare
-    // rather than inherited, which is what makes the child pid 1 in it.
+    // for itself.
     out.used_fallback = true;
 
     auto fr = sys::fork();
@@ -258,19 +306,6 @@ CloneOutcome clone_child(const ContainerConfig& config) noexcept {
             auto ur = sys::unshare(static_cast<int>(shared));
             if (ur.failed()) {
                 out.error = ur.error;
-                return out;
-            }
-        }
-
-        // The pid namespace has to be entered from the child, and unshare
-        // only affects processes created after it. Creating it here and
-        // having the caller's own fork follow would give the caller's fork
-        // the namespace and this process the old one, so the namespace is
-        // taken now and the child is the init.
-        if (config.namespaces.pid) {
-            auto pr = sys::unshare(static_cast<int>(flags::kNewpid));
-            if (pr.failed()) {
-                out.error = pr.error;
                 return out;
             }
         }
@@ -958,18 +993,14 @@ int child_setup(const ContainerConfig& config, const std::string& scratch,
 
 // Runs the target inside an already-configured container. Never returns on
 // success; returns a positive errno on failure.
+//
+// The tracer is already attached by the time this is called: the child
+// arranged it before it created any namespace, which is the only point at
+// which the arrangement is possible. Repeating it here would fail for the
+// reason the earlier comment describes, so the parameter that used to carry
+// the instruction is gone rather than left in place to be ignored.
 int child_exec(const std::string& path, const std::vector<std::string>& argv,
-               const std::vector<std::string>& envp, bool stop_at_exec) {
-    if (stop_at_exec) {
-        // TRACEME has to be called before the exec, because what it does is
-        // arrange for the process to be stopped when the exec completes.
-        // Called after, there is nothing left to stop.
-        auto tr = sys::ptrace(0 /* PTRACE_TRACEME */, 0, nullptr, nullptr);
-        if (tr.failed()) {
-            return tr.error;
-        }
-    }
-
+               const std::vector<std::string>& envp) {
     std::vector<char*> argv_ptrs;
     argv_ptrs.reserve(argv.size() + 2);
     std::vector<std::string> argv_storage = argv;
@@ -1017,6 +1048,20 @@ SpawnResult container_spawn(const ContainerConfig& config,
         out.error = ContainerError{Stage::Clone, pg.error, "pipe2 for the gate"};
         return out;
     }
+    // The report pipe carries a failure and nothing else: a child that sets
+    // up successfully writes no bytes at all, because the target's own
+    // output is not occ's to report and the target's exit status belongs to
+    // the target.
+    //
+    // It stays a blocking pipe, because two different moments need two
+    // different behaviours from it and both are real. On the fallback path
+    // the parent has to wait for the child's readiness byte, which may not
+    // exist yet, and a non-blocking read would turn that wait into a spin.
+    // At the end the parent must not wait at all, because a child that
+    // succeeded writes nothing and a blocking read would sit there for the
+    // whole life of the run. The second case is handled by polling rather
+    // than by the pipe's mode, so one pipe serves both without either
+    // behaviour being compromised.
     auto pre = sys::pipe2(report, 02000000 /* O_CLOEXEC */);
     if (pre.failed()) {
         out.error =
@@ -1032,9 +1077,16 @@ SpawnResult container_spawn(const ContainerConfig& config,
 
     const CloneOutcome cloned = clone_child(config);
     if (cloned.error != 0) {
+        // The errno is in the message because "creating a process with
+        // flags N" is not a diagnosis. Every failure mode here -- a
+        // namespace refused by policy, a user namespace that cannot be
+        // created, an exhausted process table -- looks identical without it,
+        // and each has a different fix.
         out.error = ContainerError{
             Stage::Clone, cloned.error,
-            "creating a process with flags " + to_decimal(config.namespaces.flags())};
+            "creating a process with flags " +
+                to_decimal(config.namespaces.flags()) + ": " +
+                strerror(cloned.error)};
         (void)sys::close(gate[0]);
         (void)sys::close(gate[1]);
         (void)sys::close(report[0]);
@@ -1047,6 +1099,34 @@ SpawnResult container_spawn(const ContainerConfig& config,
         // may return.
         (void)sys::close(gate[1]);
         (void)sys::close(report[0]);
+
+        // TRACEME is arranged here, before anything else, and the reason is
+        // an ordering constraint rather than a preference.
+        //
+        // PTRACE_TRACEME succeeds only when the caller is about to be traced
+        // by its own parent, and the kernel checks that by comparing the
+        // caller's credentials against the parent's. By the time the code
+        // below has run -- a user namespace created, uid_map written so the
+        // child is uid 0, pivot_root, a mount table rebuilt -- the child is
+        // inside namespaces its parent is not, and the credential comparison
+        // is made across that boundary. It then fails with EPERM even though
+        // nothing about the relationship between the two processes changed.
+        //
+        // The stop it arranges is the exec stop, which happens later still,
+        // so calling it early costs nothing: the flag it sets is a promise
+        // about the next exec, not a stop now.
+        if (config.stop_at_exec) {
+            auto tr = sys::ptrace(0 /* PTRACE_TRACEME */, 0, nullptr,
+                                  nullptr);
+            if (tr.failed()) {
+                const char* m = "PTRACE_TRACEME before the namespaces: ";
+                (void)sys::write(2, m, strlen(m));
+                const char* e = strerror(tr.error);
+                (void)sys::write(2, e, strlen(e));
+                (void)sys::write(2, "\n", 1);
+                sys::exit_group(126);
+            }
+        }
 
         // In the fallback case the parent is waiting for this byte before it
         // can write the mappings. It is sent unconditionally rather than
@@ -1094,14 +1174,18 @@ SpawnResult container_spawn(const ContainerConfig& config,
         }
 
         (void)sys::close(report[1]);
-        const int erc = child_exec(path, argv, envp, config.stop_at_exec);
+        const int erc = child_exec(path, argv, envp);
         // exec failed. Report it the same way, and use a stage of its own so
-        // the message is not confused with a mount failure.
+        // the message is not confused with a mount failure. The errno and a
+        // newline are included because a message naming only the path is
+        // not a diagnosis: ENOENT and EACCES and ENOEXEC are three different
+        // problems with three different fixes, and the run's own exit
+        // status says only that the child gave up.
         {
             std::string message;
             message.push_back(static_cast<char>(Stage::Exec));
             message.push_back(static_cast<char>(erc & 0xff));
-            message += "exec " + path;
+            message += "exec " + path + ": " + strerror(erc) + "\n";
             (void)sys::write(2, message.data(), message.size());
         }
         sys::exit_group(126);
@@ -1212,22 +1296,48 @@ SpawnResult container_spawn(const ContainerConfig& config,
     out.pid = static_cast<int>(cloned.pid);
 
     // The report pipe carries the stage and errno of a child whose own
-    // setup failed. The parent reads it once here, without blocking: the
-    // child either fails within a few hundred microseconds of being
-    // released or it does not fail at all, and blocking on a pipe that will
-    // never be written to is the one thing this must not do. On the fallback
-    // path the readiness byte was already consumed above, so what is read
-    // here is either the genuine failure report or end of file.
+    // setup failed.
+    //
+    // The read is bounded by a poll rather than left blocking, because the
+    // common case is that nothing is ever written: the child execs the
+    // target and the target owns everything after that. A blocking read here
+    // would hold the parent until the target exits, which for a long-running
+    // target is forever, and the run's observation would never begin.
+    //
+    // The window is generous because what it is waiting for is a write that
+    // has already happened by the time the child could be scheduled: the
+    // child writes its report before it exits, and the parent got here by
+    // releasing it. A millisecond of scheduling is ample on any machine, and
+    // a miss is not silent -- the failure detail is empty and the caller
+    // reports a clone-stage error with no reason, which is visibly wrong
+    // rather than quietly so.
     {
+        struct pollfd pfd {};
+        pfd.fd = report[0];
+        pfd.events = POLLIN;
+        // A generous bound, not a tight one. Waiting too little here would
+        // discard a real failure report, and waiting too long costs a
+        // millisecond on a run that succeeded.
+        constexpr int kReportWaitMs = 250;
+        const int pr = ::poll(&pfd, 1, kReportWaitMs);
+
         char buffer[512];
-        auto r = sys::read(report[0], buffer, sizeof(buffer));
-        if (r.ok() && r.value >= 2) {
-            const auto stage_code = static_cast<std::uint8_t>(buffer[0]);
-            const auto err = static_cast<std::uint8_t>(buffer[1]);
-            out.error = ContainerError{
-                static_cast<Stage>(stage_code), err,
-                std::string(buffer + 2, static_cast<std::size_t>(r.value) - 2)};
+        if (pr > 0 && (pfd.revents & POLLIN) != 0) {
+            auto r = sys::read(report[0], buffer, sizeof(buffer));
+            if (r.ok() && r.value >= 2) {
+                const auto stage_code = static_cast<std::uint8_t>(buffer[0]);
+                const auto err = static_cast<std::uint8_t>(buffer[1]);
+                out.error = ContainerError{
+                    static_cast<Stage>(stage_code), err,
+                    std::string(buffer + 2,
+                                static_cast<std::size_t>(r.value) - 2)};
+            }
+        } else if (pr < 0) {
+            out.error = ContainerError{Stage::Clone, -pr,
+                                       "waiting for the child's report"};
         }
+        // pr == 0 is the success case: the child said nothing, which means
+        // it did not fail.
     }
     (void)sys::close(report[0]);
 

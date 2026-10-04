@@ -16,9 +16,25 @@ namespace {
 // wait4 loop that mishandles EINTR would lose a stop, which is a hang. The
 // wrapper here retries explicitly, which is what makes it correct rather
 // than what makes it short.
+//
+// The wait4 flag that makes a wait report ptrace stops. It is spelled as a
+// value because the name moved between <sys/wait.h> and <linux/wait.h> and
+// this file includes neither: the value is ABI and has not changed since
+// the flag was introduced.
+constexpr int kWall = 0x40000000;
+
+// Waits for one traced process, retrying across signals.
+//
+// __WALL is added unconditionally. A ptrace stop is not an ordinary child
+// state: the traced process is a real child, but the stop the kernel raises
+// on the tracer's behalf is reported by a wait4 with no __WALL as nothing at
+// all -- the call returns ECHILD, or blocks for a child that is already
+// stopped. A tracer that omits it therefore sees no stops, which looks
+// exactly like a target that ran to completion without being observed.
 int wait_status(int pid, int options, int& status) {
+    const int with_wall = options | kWall;
     for (;;) {
-        const int r = ::waitpid(pid, &status, options);
+        const int r = ::waitpid(pid, &status, with_wall);
         if (r >= 0) {
             return r;
         }
