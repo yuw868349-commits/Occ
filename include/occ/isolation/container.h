@@ -122,6 +122,20 @@ struct ContainerConfig {
         bool writable = false;
     };
     std::vector<BindMount> extra_mounts;
+
+    // Stop the target at the exec boundary instead of letting it run.
+    //
+    // The child calls PTRACE_TRACEME before exec, so the kernel stops it on
+    // the newly exec'd image and the parent becomes its tracer. This closes
+    // the race that otherwise exists between the child being released and a
+    // tracer attaching: without it, a target can finish before the tracer
+    // reaches it, and the tracer then fails on a process that has already
+    // exited or, worse, attaches to a pid that has been recycled.
+    //
+    // The target may be several processes and the stop applies to the one
+    // that execs. Every process forked from it inherits the tracing, which
+    // is what makes a fork-following session work.
+    bool stop_at_exec = false;
 };
 
 // Where each setup step got to. A caller that sees a failure uses this to

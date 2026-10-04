@@ -122,6 +122,12 @@ add_library(occ_core STATIC
     src/isolation/seccomp.cpp
     src/isolation/container.cpp
     src/observer/event.cpp
+    src/observer/ptrace.cpp
+    src/observer/watchpoint.cpp
+    src/observer/wx.cpp
+    src/observer/rsp.cpp
+    src/observer/session.cpp
+    src/observer/registry.cpp
     src/runner/run.cpp
 )
 

@@ -34,6 +34,7 @@ void print_run_usage() {
         "  --cpu <percent>    cpu bandwidth, 1..100\n"
         "  --cgroup <dir>     create the run's cgroup under <dir>\n"
         "  --env <K=V>        set an environment variable for the target\n"
+        "  --observe          trace the target with ptrace as it runs\n"
         "  --no-events        do not write the event stream\n"
         "  --help             print this text\n"
         "\n"
@@ -214,6 +215,8 @@ int cmd_run(int argc, char** argv) {
                 return 2;
             }
             options.env.emplace_back(v);
+        } else if (arg == "--observe") {
+            options.observe = true;
         } else if (arg == "--no-events") {
             no_events = true;
         } else {

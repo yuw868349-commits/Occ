@@ -52,6 +52,21 @@ struct RunOptions {
     // stream goes to its own descriptor, so the two do not interleave.
     bool stream_events = true;
 
+    // Whether to trace the target with ptrace while it runs. A traced
+    // target is stopped twice per syscall and cannot be attached to by
+    // anything else, so this is off by default: a run that only needs the
+    // isolation facts should not pay for observation it did not ask for.
+    bool observe = false;
+
+    // Where the target is, for a run that is being set up for a debugger to
+    // reach later. Empty for an ordinary run.
+    std::string session_id;
+
+    // The descriptor a remote debugger speaks on, when one is being served.
+    // Negative means none.
+    int gdb_read_fd = -1;
+    int gdb_write_fd = -1;
+
     // Environment for the target. Empty means a minimal environment is
     // built from the host's PATH and TERM, which is enough for a static
     // binary and avoids passing through a variable that changes behaviour.
@@ -86,6 +101,14 @@ struct RunResult {
     std::uint64_t entry = 0;
     std::uint64_t mapping_count = 0;
     std::size_t events = 0;
+
+    // Filled in only when the run was observed. A caller that did not ask
+    // for observation gets zeros here, which is the honest answer: nothing
+    // was observed.
+    std::uint64_t stops = 0;
+    std::uint64_t syscall_stops = 0;
+    std::uint64_t breakpoint_hits = 0;
+    std::uint64_t observed_signals = 0;
 };
 
 // Reads `path`, reports what the image is, and runs it under the container

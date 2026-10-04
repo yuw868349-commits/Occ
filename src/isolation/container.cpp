@@ -959,7 +959,17 @@ int child_setup(const ContainerConfig& config, const std::string& scratch,
 // Runs the target inside an already-configured container. Never returns on
 // success; returns a positive errno on failure.
 int child_exec(const std::string& path, const std::vector<std::string>& argv,
-               const std::vector<std::string>& envp) {
+               const std::vector<std::string>& envp, bool stop_at_exec) {
+    if (stop_at_exec) {
+        // TRACEME has to be called before the exec, because what it does is
+        // arrange for the process to be stopped when the exec completes.
+        // Called after, there is nothing left to stop.
+        auto tr = sys::ptrace(0 /* PTRACE_TRACEME */, 0, nullptr, nullptr);
+        if (tr.failed()) {
+            return tr.error;
+        }
+    }
+
     std::vector<char*> argv_ptrs;
     argv_ptrs.reserve(argv.size() + 2);
     std::vector<std::string> argv_storage = argv;
@@ -1084,7 +1094,7 @@ SpawnResult container_spawn(const ContainerConfig& config,
         }
 
         (void)sys::close(report[1]);
-        const int erc = child_exec(path, argv, envp);
+        const int erc = child_exec(path, argv, envp, config.stop_at_exec);
         // exec failed. Report it the same way, and use a stage of its own so
         // the message is not confused with a mount failure.
         {

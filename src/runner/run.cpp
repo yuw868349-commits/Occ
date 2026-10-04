@@ -1,5 +1,6 @@
 #include "occ/runner/run.h"
 
+#include "occ/observer/session.h"
 #include "occ/parser/detect.h"
 #include "occ/syscall/errno.h"
 #include "occ/syscall/syscall.h"
@@ -141,6 +142,9 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     config.limits.pids = options.pids;
     config.limits.cpu_percent = options.cpu_percent;
     config.extra_mounts = options.extra_mounts;
+    // An observed run has to have its target stop at the exec boundary, or
+    // the target can complete before the observer reaches it.
+    config.stop_at_exec = options.observe;
 
     // A run with no root named still needs a root. The host's own / is bound
     // read-only, which is the smallest setup that gives the target a
@@ -187,6 +191,48 @@ RunResult run(const std::string& path, const std::vector<std::string>& argv,
     // wait, and a wait that observes the target's exit consumes it, which
     // would leave the reap below with nothing to collect and no exit status
     // to report. The sequence a caller sees is still spawn, then reap.
+
+    if (options.observe) {
+        // The observer takes over the wait. It owns the process from here,
+        // which is why the reap below is skipped: a process that has been
+        // traced reports its exit through the trace, and waiting for it a
+        // second time would find nothing.
+        obs::SessionConfig sc;
+        sc.pid = spawned.pid;
+        sc.trace_syscalls = true;
+        sc.follow_forks = true;
+        sc.serve_gdb = options.gdb_read_fd >= 0;
+        sc.gdb_read_fd = options.gdb_read_fd;
+        sc.gdb_write_fd = options.gdb_write_fd;
+
+        const obs::SessionResult sr = obs::observe(sc, events);
+        out.stops = sr.stops;
+        out.syscall_stops = sr.syscall_stops;
+        out.breakpoint_hits = sr.breakpoint_hits;
+        out.observed_signals = sr.signals;
+
+        if (sr.failed) {
+            out.failed = true;
+            out.failure_detail = sr.detail;
+        }
+        out.exit_code = sr.exit_code;
+        out.term_signal = sr.term_signal;
+        out.signaled = sr.signaled;
+
+        (void)isolation::container_cleanup(config);
+
+        auto& end = events.begin(obs::EventKind::SessionEnd);
+        end.add("started", true);
+        end.add("observed", true);
+        end.add("stops", sr.stops);
+        end.add("exit_code", static_cast<std::int64_t>(out.exit_code));
+        end.add("signaled", out.signaled);
+        end.add("term_signal", static_cast<std::uint64_t>(out.term_signal));
+        events.commit();
+
+        out.events = events.events_written();
+        return out;
+    }
 
     const isolation::ContainerResult reaped = isolation::container_reap(spawned.pid);
 
