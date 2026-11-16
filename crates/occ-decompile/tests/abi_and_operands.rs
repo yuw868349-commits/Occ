@@ -348,6 +348,9 @@ fn a_parameter_lists_every_position_up_to_the_last_one_used() {
 fn compile(name: &str, source: &str) -> Option<Loaded> {
     let dir = std::env::temp_dir().join(format!("occ-lift-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).ok()?;
+    // `load` reads the file into memory, so the directory is scratch that has
+    // no reason to survive the run.
+    occ_sys::cleanup::remove_dir_at_exit(&dir);
     let src = dir.join(format!("{name}.c"));
     let out = dir.join(name);
     std::fs::write(&src, source).ok()?;
