@@ -14,9 +14,11 @@ Two things are checked, and they are not equally important:
 
 Usage: objdump_diff.py [binary ...]
 """
+import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 
 DECODER = "target/release/examples/disasm_all"
@@ -134,11 +136,83 @@ def ours(path, count):
     return out
 
 
+def is_relocatable(path):
+    """Whether the file is an ET_REL object.
+
+    A relocatable object has no load address: `sh_addr` is zero for every
+    section, and `objdump` therefore restarts its address column at zero for
+    each section. The decoder gives each section its file offset instead, so
+    that addresses stay unique and a symbol's `st_value` can be rebased onto
+    one. The two listings describe the same instructions in the same order but
+    do not agree on addresses, so they are compared by position.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(20)
+    except OSError:
+        return False
+    return (
+        head[:4] == b"\x7fELF"
+        and len(head) >= 18
+        and int.from_bytes(head[16:18], "little") == 1
+    )
+
+
+def check_in_order(theirs, mine):
+    """Compare two listings position by position, ignoring addresses."""
+    length_bad = 0
+    mnemonic_bad = 0
+    alias_bad = 0
+    compared = 0
+    len_examples = []
+    mne_examples = []
+    len_hist = Counter()
+    mne_hist = Counter()
+
+    for i in range(max(len(theirs), len(mine))):
+        if i >= len(theirs):
+            length_bad += 1
+            len_hist["extra"] += 1
+            if len(len_examples) < 12:
+                len_examples.append(f"#{i}: decoded past the listing ({mine[i][2]})")
+            continue
+        if i >= len(mine):
+            length_bad += 1
+            len_hist["missing"] += 1
+            if len(len_examples) < 12:
+                len_examples.append(f"#{i}: not decoded (objdump: {theirs[i][2]})")
+            continue
+        ta, tl, tm = theirs[i]
+        ma, ml, mm = mine[i]
+        compared += 1
+        if tl != ml:
+            length_bad += 1
+            len_hist[f"{ml}!={tl}"] += 1
+            if len(len_examples) < 12:
+                len_examples.append(
+                    f"#{i} {ta:#x}: ours {ml} byte(s), objdump {tl} ({tm} / {mm})"
+                )
+            continue
+        if mm != tm:
+            if (mm, tm) in ALIASES:
+                alias_bad += 1
+                continue
+            mnemonic_bad += 1
+            mne_hist[f"{mm}!={tm}"] += 1
+            if len(mne_examples) < 12:
+                mne_examples.append(f"#{i} {ta:#x}: ours {mm}, objdump {tm}")
+
+    return (compared, length_bad, mnemonic_bad, alias_bad, len_hist, mne_hist,
+            len_examples, mne_examples)
+
+
 def check(path):
     theirs = objdump(path)
     if not theirs:
-        return 0, 0, 0, Counter(), Counter()
+        return 0, 0, 0, 0, Counter(), Counter(), [], []
     mine = ours(path, len(theirs) * 2)
+    if is_relocatable(path):
+        return check_in_order(theirs, mine)
     by_addr = {a: (l, m) for a, l, m in mine}
 
     length_bad = 0
@@ -185,12 +259,73 @@ def check(path):
             len_examples, mne_examples)
 
 
+def archive_members(path):
+    """Every member of an `ar` archive, or `None` when the file is not one.
+
+    `objdump -d` walks an archive's members and restarts its addresses at zero
+    for each, so comparing an archive as if it were one image compares every
+    member against the wrong address. Writing each member out and checking it
+    on its own puts both sides on the same bytes.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if data[:8] != b"!<arch>\n":
+        return None
+
+    out = []
+    long_names = b""
+    pos = 8
+    while pos + 60 <= len(data):
+        head = data[pos:pos + 60]
+        raw = head[0:16].decode("latin-1").rstrip()
+        try:
+            size = int(head[48:58].decode("latin-1").strip() or "0")
+        except ValueError:
+            break
+        body = data[pos + 60:pos + 60 + size]
+        pos += 60 + size
+        if pos & 1:
+            pos += 1
+        if raw == "/":
+            continue
+        if raw == "//":
+            long_names = body
+            continue
+        if raw.startswith("/") and raw[1:].isdigit():
+            rest = long_names[int(raw[1:]):]
+            end = len(rest)
+            for i, ch in enumerate(rest):
+                if ch in b"/\n":
+                    end = i
+                    break
+            name = rest[:end].decode("latin-1")
+        elif raw.startswith("#1/"):
+            n = int(raw[3:])
+            name = body[:n].decode("latin-1").rstrip("\0")
+            body = body[n:]
+        else:
+            name = raw.rstrip("/")
+        out.append((name, body))
+    return out
+
+
+def check_member(body):
+    """Check one member's bytes, which live in a temporary file."""
+    with tempfile.NamedTemporaryFile(suffix=".o", delete=False) as fh:
+        fh.write(body)
+        tmp = fh.name
+    try:
+        return check(tmp)
+    finally:
+        os.unlink(tmp)
+
+
 if __name__ == "__main__":
     paths = sys.argv[1:] or ["/bin/ls"]
     worst = 0
-    for p in paths:
-        (compared, lbad, mbad, abad, lhist, mhist, lex, mex) = check(p)
-        print(f"{p}: {compared} instruction(s) compared")
+
+    def report(label, compared, lbad, mbad, abad, lhist, mhist, lex, mex):
+        print(f"{label}: {compared} instruction(s) compared")
         print(f"  length mismatches: {lbad}")
         print(f"  mnemonic mismatches: {mbad}")
         if abad:
@@ -205,6 +340,37 @@ if __name__ == "__main__":
         if mhist:
             top = mhist.most_common(8)
             print("  mnemonic histogram: " + ", ".join(f"{k} x{v}" for k, v in top))
+
+    for p in paths:
+        members = archive_members(p)
+        if members is None:
+            compared, lbad, mbad, abad, lhist, mhist, lex, mex = check(p)
+            report(p, compared, lbad, mbad, abad, lhist, mhist, lex, mex)
+            worst += lbad
+            continue
+        # An archive is checked member by member, and the totals are summed:
+        # one broken member is a broken archive, and the report says which.
+        compared = lbad = mbad = abad = 0
+        lhist, mhist = Counter(), Counter()
+        lex, mex = [], []
+        for name, body in members:
+            if not body:
+                continue
+            c, l, m, a, lh, mh, lx, mx = check_member(body)
+            compared += c
+            lbad += l
+            mbad += m
+            abad += a
+            lhist.update(lh)
+            mhist.update(mh)
+            for line in lx:
+                if len(lex) < 12:
+                    lex.append(f"{name}: {line}")
+            for line in mx:
+                if len(mex) < 12:
+                    mex.append(f"{name}: {line}")
+        print(f"{p}: {len(members)} member(s)")
+        report("  total", compared, lbad, mbad, abad, lhist, mhist, lex, mex)
         worst += lbad
     if worst:
         print(f"{worst} length mismatch(es)")

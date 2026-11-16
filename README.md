@@ -399,17 +399,17 @@ the evidence."*
 | `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 2.9k |
 | `occ-json` | JSON value, parser, writer, schema validation. | 1.9k |
 | `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid` as `extern "C"`. | 1.3k |
-| `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, demangling, SHA-256. | 4.4k |
-| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.2k |
+| `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, `ar` archives, demangling, SHA-256. | 4.7k |
+| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.6k |
 | `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 3.8k |
 | `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.3k |
 | `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 13.2k |
 | `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.5k |
 | `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 2.0k |
-| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.5k |
+| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.6k |
 | `occ-mcp` | The 37 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.4k |
 
-52.9k lines of Rust, 393 tests, 82 end-to-end MCP checks.
+53.7k lines of Rust, 403 tests, 82 end-to-end MCP checks.
 
 ## Verification
 
@@ -417,7 +417,7 @@ Unit tests are necessary and not sufficient: most of the serious bugs found whil
 building this were invisible to them and obvious against a real file.
 
 ```bash
-cargo test --workspace                                         # 393 tests
+cargo test --workspace                                         # 403 tests
 cargo clippy --workspace --all-targets -- -D warnings          # clean
 python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
 ```
@@ -528,6 +528,28 @@ Bugs this discipline caught, each of which had passing unit tests at the time:
   return zero and writes are discarded. Lifted as an ordinary register, `beq a0,
   zero` compared against a value nothing had ever set, and the solver had no
   constant to work from.
+- **`xsavec` decoded as one byte** — the state-save family (`0F C7 /3` through
+  `/5`) had no entry at all, so the decoder emitted the opcode alone and every
+  following instruction in the function was compared at the wrong address. The
+  report showed a hundred `not decoded` lines; the cause was one missing row.
+- **Absolute moves read eight address bytes in 32-bit code** — `A1` takes an
+  address as wide as the mode, and `67` switches it to the other width. The
+  decoder read the 64-bit width everywhere, so every `movabs` in a 32-bit
+  library over-read by four bytes.
+- **The instructions 64-bit mode dropped were missing entirely** — `push es`,
+  `daa`, `pusha`, `aam`, `les`, `bound`, `enter`, and the second spelling of the
+  byte-form ALU group at `0x82`. They are rare in code written this century and
+  ordinary in libraries that predate it, and each one cost a byte of alignment.
+- **An undecodable opcode did not consume its prefix** — `rep` in front of an
+  unknown byte is a two-byte instruction in the listing, and answering one byte
+  left the prefix behind and moved the stream by one.
+- **`movddup` renamed to `movhlps`** — the two share an opcode, and the
+  register-form rename was applied without checking the prefix that decides
+  which of them the bytes mean.
+- **`ar` archives were recognised and refused** — the format probe knew the
+  magic and the loader answered "cannot parse it yet". A `.a` is a container of
+  containers, and it now opens as one image per member, named
+  `libfoo.a(member.o)`.
 
 ## Limits
 

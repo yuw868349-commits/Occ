@@ -14,6 +14,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod ar;
 pub mod demangle;
 pub mod elf;
 pub mod macho;

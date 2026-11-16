@@ -20,8 +20,8 @@ use std::sync::{Arc, RwLock};
 use occ_analyze::analysis::{Analysis, AnalysisOptions};
 use occ_analyze::view::View;
 use occ_core::{
-    Addr, Evidence, Function, Handle, HandleKind, Hypothesis, Image, ImageId, Result, SymbolKind,
-    Verdict, CoreError,
+    Addr, Evidence, Format, Function, Handle, HandleKind, Hypothesis, Image, ImageId, Result,
+    SymbolKind, Verdict, CoreError,
 };
 
 /// One loaded image and everything derived from it.
@@ -255,15 +255,72 @@ impl Session {
     }
 
     /// Open a file by path.
-    pub fn open_path(&self, path: &str) -> Result<u32> {
+    pub fn open_path(&self, path: &str) -> Result<Vec<u32>> {
         let data = std::fs::read(path)
             .map_err(|e| CoreError::io(Path::new(path).display().to_string(), e))?;
         self.open_bytes(data, path)
     }
 
     /// Open an image from bytes already in memory.
-    pub fn open_bytes(&self, data: Vec<u8>, path: &str) -> Result<u32> {
+    ///
+    /// An `ar` archive is a container of containers, and it opens as one image
+    /// per member, named `libfoo.a(member.o)`. That keeps the archive from
+    /// becoming a second kind of handle: every tool takes an image id, and a
+    /// member has one. The members that do not parse as an object — a linker
+    /// index, a resource blob — are skipped, and the open fails only when
+    /// nothing in the archive could be read.
+    pub fn open_bytes(&self, data: Vec<u8>, path: &str) -> Result<Vec<u32>> {
         let mut inner = self.inner.write().map_err(|_| poisoned())?;
+        if occ_bin::probe_format(&data) == Format::Archive {
+            let members = occ_bin::ar::members(&data)?;
+            let parts: Vec<(String, Vec<u8>)> = members
+                .into_iter()
+                .map(|m| (m.name.clone(), m.data.to_vec()))
+                .collect();
+            let mut ids = Vec::with_capacity(parts.len());
+            let mut first_error: Option<CoreError> = None;
+            for (name, bytes) in parts {
+                let id = inner.next_id;
+                let label = format!("{path}({name})");
+                match occ_bin::load(&bytes, &label, ImageId(id)) {
+                    Ok(image) => {
+                        let (analysis, dwarf) = {
+                            let view = View::new(&image, &bytes);
+                            (
+                                Analysis::build(&view, &AnalysisOptions::default()),
+                                occ_dwarf::Dwarf::load(&view),
+                            )
+                        };
+                        let opened_seq = self.seq.fetch_add(1, Ordering::Relaxed);
+                        inner.next_id += 1;
+                        inner.images.insert(
+                            id,
+                            Arc::new(ImageFile {
+                                image,
+                                data: bytes,
+                                analysis,
+                                dwarf,
+                                opened_seq,
+                            }),
+                        );
+                        ids.push(id);
+                    }
+                    Err(e) => {
+                        if first_error.is_none() {
+                            first_error = Some(e);
+                        }
+                    }
+                }
+            }
+            if ids.is_empty() {
+                return Err(first_error.unwrap_or_else(|| {
+                    CoreError::UnsupportedFormat(format!(
+                        "{path}: the archive holds no member this build can parse"
+                    ))
+                }));
+            }
+            return Ok(ids);
+        }
         let id = inner.next_id;
         // Parse before taking an id so a failed open does not consume one and
         // leave a hole that a persisted handle would later point into.
@@ -287,7 +344,7 @@ impl Session {
                 opened_seq,
             }),
         );
-        Ok(id)
+        Ok(vec![id])
     }
 
     /// Store a trace and return its handle.
@@ -611,15 +668,23 @@ impl Session {
         let mut warnings = Vec::new();
         for entry in &saved.images {
             match self.open_path(&entry.path) {
-                Ok(id) => {
-                    if let Some(file) = self.image(id)
-                        && !entry.sha256.is_empty()
-                        && file.image.sha256 != entry.sha256
-                    {
-                        warnings.push(format!(
-                            "{} changed on disk since the session was saved",
-                            entry.path
-                        ));
+                Ok(ids) => {
+                    // An archive reopens as one image per member, and a member's
+                    // path carries the archive and the member name, so it never
+                    // equals the path that was saved. There is nothing to
+                    // compare a member's digest against, so the check applies
+                    // only to an image that was saved as itself.
+                    for id in ids {
+                        let Some(file) = self.image(id) else { continue };
+                        if file.image.path != entry.path {
+                            continue;
+                        }
+                        if !entry.sha256.is_empty() && file.image.sha256 != entry.sha256 {
+                            warnings.push(format!(
+                                "{} changed on disk since the session was saved",
+                                entry.path
+                            ));
+                        }
                     }
                 }
                 Err(e) => warnings.push(format!("{}: {e}", entry.path)),

@@ -321,7 +321,7 @@ impl Decoder {
         // differs, and folding them here keeps the "what happens after the
         // opcode" logic in a single place.
         let decoded = match bytes[i] {
-            0xc4 | 0xc5 | 0x62 => {
+            0xc4 | 0xc5 | 0x62 if self.bits == 64 => {
                 let first = bytes[i];
                 self.decode_vector(first, &p, op_size, addr_size, bytes, &mut i)
             }
@@ -340,7 +340,7 @@ impl Decoder {
             }
         };
         let Some((mnemonic, flow, mut target, ops)) = decoded else {
-            return self.raw_byte(bytes);
+            return self.raw_bytes(bytes, i);
         };
 
         // The length is settled: no further bytes will be read. A RIP-relative
@@ -514,15 +514,32 @@ impl Decoder {
     }
 
     fn raw_byte(&mut self, bytes: &[u8]) -> Decoded {
-        let len = 1usize.min(bytes.len());
+        self.raw_bytes(bytes, 1)
+    }
+
+    /// Everything read so far, reported as uninterpreted bytes.
+    ///
+    /// `upto` is how far the decoder got before it gave up, and it is the
+    /// length the listing prints: an unknown opcode after a `rep` prefix is
+    /// two bytes there, not one, and a decoder that answers one byte moves
+    /// every following instruction by one. The prefixes are part of the
+    /// instruction that could not be decoded, so they are part of its length.
+    fn raw_bytes(&mut self, bytes: &[u8], upto: usize) -> Decoded {
+        let len = upto.clamp(1, bytes.len()).min(MAX_INSN_LEN);
         let mut raw = [0u8; MAX_INSN_LEN];
         raw[..len].copy_from_slice(&bytes[..len]);
+        let text = if len == 1 {
+            format!(".byte {:#04x}", bytes[0])
+        } else {
+            let parts: Vec<String> = bytes[..len].iter().map(|b| format!("{b:#04x}")).collect();
+            format!(".byte {}", parts.join(", "))
+        };
         Decoded {
             insn: Instruction {
                 addr: self.origin(),
                 len: len as u32,
                 bytes: raw,
-                text: format!(".byte {:#04x}", bytes[0]),
+                text,
                 mnemonic: ".byte".into(),
                 flow: FlowKind::Exception,
                 target: None,
@@ -722,11 +739,17 @@ impl Decoder {
             }
             0x80..=0x83 => {
                 // 0x80 is the byte form; 0x81 and 0x83 both use the operand
-                // size, differing only in immediate width.
-                let size = if op == 0x80 { Size::B } else { os };
+                // size, differing only in immediate width. 0x82 is a second
+                // spelling of the byte form that 64-bit mode dropped, and
+                // 32-bit code written before that still contains it.
+                if op == 0x82 && self.bits != 32 {
+                    return None;
+                }
+                let byte_form = op == 0x80 || op == 0x82;
+                let size = if byte_form { Size::B } else { os };
                 let m = self.modrm(p, size, asz, b, i)?;
                 let name = GROUP1[(m.reg & 7) as usize];
-                let w = if op == 0x80 || op == 0x83 {
+                let w = if byte_form || op == 0x83 {
                     1
                 } else {
                     imm_width(size)
@@ -789,9 +812,16 @@ impl Decoder {
                 // The register form prints at the operand size, which is
                 // why `8c c0` is `mov eax, es` and `48 8c c0` is
                 // `mov rax, es`.
+                let after_opcode = *i;
                 let m = self.modrm(p, Size::W, asz, b, i)?;
-                // A `reg` field of six or seven names no segment; the
-                // listing says so with a question mark and reads on.
+                // A `reg` field of six or seven names no segment: there are
+                // only six, and the encoding spends the remaining two values
+                // on nothing. The listing gives the opcode byte back as an
+                // undecodable one, so the ModRM is not part of the length.
+                if m.reg & 7 >= 6 {
+                    *i = after_opcode;
+                    return None;
+                }
                 let seg = SEG_NAMES[usize::from(m.reg & 7)];
                 let rm = if m.mem.is_some() {
                     mem_operand(&m, Size::W, p)
@@ -816,7 +846,15 @@ impl Decoder {
                 ))
             }
             0x8f => {
+                let after_opcode = *i;
                 let m = self.modrm(p, os, asz, b, i)?;
+                // The group has one defined entry: `/0` is `pop r/m`. The
+                // other seven are not instructions, and the listing gives the
+                // opcode byte back instead of naming one.
+                if m.reg & 7 != 0 {
+                    *i = after_opcode;
+                    return None;
+                }
                 Some(("pop", FlowKind::Next, None, vec![mem_operand(&m, os, p)]))
             }
             // `f3 90` is the pause, which tells the processor that the
@@ -884,6 +922,132 @@ impl Decoder {
                     _ => Some(("fwait", FlowKind::Next, None, vec![])),
                 }
             }
+            // The instructions 64-bit mode dropped. They are not decoration:
+            // a 32-bit library full of hand-written assembly still contains
+            // them, and a decoder that answers `.byte` for `0x07` emits one
+            // byte where the listing has two, which shifts every instruction
+            // after it. Each one is guarded on the mode rather than on a
+            // table entry, because the encoding means nothing outside 32-bit
+            // code.
+            0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f if self.bits == 32 => {
+                // Segment-register push and pop. The four legacy segments
+                // are the only ones that have an encoding: `fs` and `gs`
+                // were added after this group was full and need `0f a0`
+                // and `0f a8`.
+                let (name, seg) = match op {
+                    0x06 => ("push", "es"),
+                    0x07 => ("pop", "es"),
+                    0x0e => ("push", "cs"),
+                    0x16 => ("push", "ss"),
+                    0x17 => ("pop", "ss"),
+                    0x1e => ("push", "ds"),
+                    _ => ("pop", "ds"),
+                };
+                Some((name, FlowKind::Next, None, vec![Operand::Reg(seg)]))
+            }
+            0x27 | 0x2f | 0x37 | 0x3f if self.bits == 32 => {
+                // The BCD adjust instructions. Decimal arithmetic stopped
+                // being worth a circuit decades ago, and 32-bit code that
+                // predates that still calls them.
+                let name = match op {
+                    0x27 => "daa",
+                    0x2f => "das",
+                    0x37 => "aaa",
+                    _ => "aas",
+                };
+                Some((name, FlowKind::Next, None, vec![]))
+            }
+            0x60 | 0x61 if self.bits == 32 => {
+                // Push and pop of every general-purpose register at once.
+                // The `66` form moves 16-bit registers and the listing calls
+                // it `pushaw`; the plain form is the 32-bit one.
+                let (name, wide) = if op == 0x60 {
+                    ("pusha", "pushaw")
+                } else {
+                    ("popa", "popaw")
+                };
+                Some((
+                    if p.op66 { wide } else { name },
+                    FlowKind::Next,
+                    None,
+                    vec![],
+                ))
+            }
+            0x62 if self.bits == 32 => {
+                // BOUND: an array-bounds check against a pair of limits in
+                // memory. 64-bit mode reuses this byte as the EVEX prefix,
+                // so the encoding only exists in 32-bit code.
+                let m = self.modrm(p, Size::D, asz, b, i)?;
+                m.mem.as_ref()?;
+                Some((
+                    "bound",
+                    FlowKind::Next,
+                    None,
+                    vec![reg_operand(&m, Size::D, p), mem_operand(&m, Size::D, p)],
+                ))
+            }
+            0xce if self.bits == 32 => Some(("into", FlowKind::Next, None, vec![])),
+            0x9a | 0xea if self.bits == 32 => {
+                // A far call or jump: an offset at the operand size, then a
+                // sixteen-bit selector. Both halves are part of the
+                // instruction, so both are read even though the listing
+                // prints them as a single target.
+                let offset = self.imm(b, i, if p.op66 { 2 } else { 4 })?;
+                let selector = self.imm(b, i, 2)?;
+                let name = if op == 0x9a { "lcall" } else { "ljmp" };
+                Some((
+                    name,
+                    if op == 0x9a {
+                        FlowKind::Call
+                    } else {
+                        FlowKind::UnconditionalBranch
+                    },
+                    None,
+                    vec![
+                        Operand::Imm(offset, if p.op66 { Size::W } else { Size::D }),
+                        Operand::Imm(selector, Size::W),
+                    ],
+                ))
+            }
+            0xd4 | 0xd5 if self.bits == 32 => {
+                // ASCII adjust after multiply and after divide: both read one
+                // immediate byte, the base.
+                let base = self.imm(b, i, 1)?;
+                let name = if op == 0xd4 { "aam" } else { "aad" };
+                Some((name, FlowKind::Next, None, vec![Operand::Imm(base, Size::B)]))
+            }
+            0x6c..=0x6f => {
+                // The string forms of `in` and `out`. The port is always `dx`
+                // and the buffer is always `esi` or `edi`, so the encoding
+                // carries no operand and only the width changes with `66`.
+                let name = match (op, p.op66) {
+                    (0x6c, true) => "insw",
+                    (0x6c, false) => "insb",
+                    (0x6d, true) => "insw",
+                    (0x6d, false) => "insd",
+                    (0x6e, true) => "outsw",
+                    (0x6e, false) => "outsb",
+                    (0x6f, true) => "outsw",
+                    _ => "outsd",
+                };
+                Some((name, FlowKind::Next, None, vec![]))
+            }
+            0xc4 | 0xc5 if self.bits == 32 => {
+                // Load far pointer: a general-purpose register and a memory
+                // operand holding an offset with a selector after it. In
+                // 64-bit mode these two bytes are the VEX prefix instead,
+                // which is why the arm is guarded on the mode rather than on
+                // the opcode.
+                let m = self.modrm(p, Size::D, asz, b, i)?;
+                let name = if op == 0xc4 { "les" } else { "lds" };
+                m.mem.as_ref()?;
+                Some((
+                    name,
+                    FlowKind::Next,
+                    None,
+                    vec![reg_operand(&m, Size::D, p), mem_operand(&m, Size::D, p)],
+                ))
+            }
             0x9c => Some(("pushfq", FlowKind::Next, None, vec![])),
             0x9d => Some(("popfq", FlowKind::Next, None, vec![])),
             0x9e => Some(("sahf", FlowKind::Next, None, vec![])),
@@ -891,12 +1055,19 @@ impl Decoder {
             0xa0..=0xa3 => {
                 // The moves to and from an absolute address. The address
                 // is the whole of the rest of the instruction, and its
-                // width is the address size, not the operand size: a
-                // `67` prefix halves it and nothing else changes.
+                // width is the address size, not the operand size: `67`
+                // switches it to the other width, and which pair that is
+                // depends on the mode. 64-bit code reads eight bytes or four,
+                // 32-bit code four or two.
                 //
                 // The accumulator is the other operand, which is what
                 // makes these four opcodes enough for every width.
-                let addr_width = if p.op67 { 4 } else { 8 };
+                let addr_width = match (self.bits, p.op67) {
+                    (64, false) => 8,
+                    (64, true) => 4,
+                    (_, true) => 2,
+                    (_, false) => 4,
+                };
                 let raw = self.imm(b, i, addr_width)?;
                 let size = if op & 1 == 0 {
                     Size::B
@@ -1095,6 +1266,21 @@ impl Decoder {
                     vec![mem_operand(&m, size, p), Operand::Imm(v, size)],
                 ))
             }
+            0xc8 => {
+                // `enter frame, level`: a sixteen-bit frame size and an
+                // eight-bit nesting level, both part of the instruction.
+                let frame = self.imm(b, i, 2)?;
+                let level = self.imm(b, i, 1)?;
+                Some((
+                    "enter",
+                    FlowKind::Next,
+                    None,
+                    vec![
+                        Operand::Imm(frame, Size::W),
+                        Operand::Imm(level, Size::B),
+                    ],
+                ))
+            }
             0xc9 => Some(("leave", FlowKind::Next, None, vec![])),
             0xcc => Some(("int3", FlowKind::Interrupt, None, vec![])),
             0xcd => {
@@ -1174,8 +1360,17 @@ impl Decoder {
                 ))
             }
             0xff => {
+                let after_opcode = *i;
                 let m = self.modrm(p, os, asz, b, i)?;
                 let idx = (m.reg & 7) as usize;
+                // Seven of the eight entries in this group are defined: inc,
+                // dec, call near, call far, jmp near, jmp far, push. The
+                // eighth is not, and the listing gives the opcode byte back
+                // rather than naming an instruction that does not exist.
+                if idx == 7 {
+                    *i = after_opcode;
+                    return None;
+                }
                 let name = GROUP5[idx];
                 // `mode == 3` means the operand is a register, so the target is
                 // not in the instruction at all — that is an indirect call even
@@ -1482,6 +1677,9 @@ impl Decoder {
             }
             0x05 => Some(("syscall", FlowKind::Interrupt, None, vec![])),
             0x0b => Some(("ud2", FlowKind::Exception, None, vec![])),
+            // `0f 0e` is the AMD 3DNow! state reset. It takes no operand and
+            // survives in both modes, unlike the rest of the 3DNow! set.
+            0x0e => Some(("femms", FlowKind::Next, None, vec![])),
             // `0f 1e` takes a ModRM byte. `fa` makes it endbr64 and `fb`
             // endbr32; anything else is the reserved `nop r/m` form. Not
             // consuming the byte left endbr64 three bytes long and shifted
@@ -1677,17 +1875,59 @@ impl Decoder {
                             "cmpxchg8b"
                         }
                     }
+                    // XRSTORS, XSAVEC and XSAVES share this group. None of
+                    // them takes a mandatory prefix: `0F C7 /3`, `/4` and
+                    // `/5` are the whole encoding, and `66` or `F3` in front
+                    // of them is noise the listing prints as `data16` or
+                    // `repz` rather than as part of the name.
+                    (3, _) => {
+                        if p.rex & 0x08 != 0 {
+                            "xrstors64"
+                        } else {
+                            "xrstors"
+                        }
+                    }
+                    (4, _) => {
+                        if p.rex & 0x08 != 0 {
+                            "xsavec64"
+                        } else {
+                            "xsavec"
+                        }
+                    }
+                    (5, _) => {
+                        if p.rex & 0x08 != 0 {
+                            "xsaves64"
+                        } else {
+                            "xsaves"
+                        }
+                    }
                     (6, Some(0xf3)) => "rdpid",
                     (6, _) => "rdrand",
                     (7, _) => "rdseed",
                     _ => return None,
                 };
-                Some((
+                // The state-save pair and the compare-exchange pair take an
+                // operand whose size the encoding does not state: the
+                // CMPXCHG names already carry the width, and the XSAVE family
+                // works on a state area whose extent is not a memory operand
+                // size, so the listing prints the address alone.
+                let mut mem = mem_operand(&m, os, p);
+                if matches!(
                     name,
-                    FlowKind::Next,
-                    None,
-                    vec![mem_operand(&m, os, p)],
-                ))
+                    "xsavec"
+                        | "xsavec64"
+                        | "xsaves"
+                        | "xsaves64"
+                        | "xrstors"
+                        | "xrstors64"
+                        | "cmpxchg8b"
+                        | "cmpxchg16b"
+                ) {
+                    if let Operand::Mem { size, .. } = &mut mem {
+                        *size = None;
+                    }
+                }
+                Some((name, FlowKind::Next, None, vec![mem]))
             }
             0xaf => {
                 let m = self.modrm(p, os, asz, b, i)?;
@@ -2017,11 +2257,16 @@ impl Decoder {
         // into the low half of the source, and the register form of `movhps`
         // does the opposite. The memory forms of the same opcodes are
         // loads and stores of a single 64-bit half.
+        //
+        // Only the prefix-free encodings are renamed. Under `F2` and `F3`
+        // the same opcodes are `movddup`, `movsldup` and `movshdup`, which
+        // keep their names in both forms: the register form of `movddup` is
+        // still `movddup`.
         if m.mode == 3 {
-            match op {
-                0x12 => name = "movhlps",
-                0x16 => name = "movlhps",
-                0x13 | 0x17 => return None,
+            match (op, idx) {
+                (0x12, 0) => name = "movhlps",
+                (0x16, 0) => name = "movlhps",
+                (0x13 | 0x17, _) => return None,
                 _ => {}
             }
         }
@@ -3220,6 +3465,13 @@ fn x87_register_form(op: u8, modrm: u8) -> Option<(&'static str, Vec<Operand>)> 
 
 /// Width of the memory operand, from the mnemonic's suffix.
 fn sse_mem_size(name: &str) -> Size {
+    // MOVDDUP reads one 64-bit element and writes it twice. Its name ends in
+    // neither `ss` nor `sd`, so the suffix rules below would call it a full
+    // vector and overstate what it reads. MOVSLDUP and MOVSHDUP do read a full
+    // vector, and the default is right for them.
+    if name == "movddup" {
+        return Size::Q;
+    }
     if name.ends_with("ss") || name.ends_with("d") && name.len() > 3 {
         Size::D
     } else if name.ends_with("sd") || name.ends_with('q') {
@@ -3679,21 +3931,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_opcode_is_one_byte_and_does_not_desync() {
+    fn an_unknown_opcode_consumes_its_prefix() {
+        // `0f ff` names nothing this decoder knows, and the listing prints
+        // both bytes as the undecodable instruction. Answering one byte would
+        // leave the `0f` behind and shift every instruction after it by one,
+        // which is exactly the failure this test exists to prevent.
         let d = d64(&[0x0f, 0xff, 0x90]);
-        assert_eq!(d.insn.len, 1);
+        assert_eq!(d.insn.len, 2);
         assert_eq!(d.insn.mnemonic.as_ref(), ".byte");
-        // The next byte must decode on its own, which is what keeps a caller's
-        // scan aligned after a gap.
+        // The byte after it must decode on its own, which is what keeps a
+        // caller's scan aligned after a gap.
         let next = d64(&[0x90]);
         assert_eq!(next.insn.mnemonic.as_ref(), "nop");
     }
 
     #[test]
     fn truncated_input_returns_a_partial_decode_not_a_panic() {
-        // A 7-byte instruction cut to 3 bytes cannot be decoded whole.
+        // A 7-byte instruction cut to 3 bytes cannot be decoded whole, and the
+        // three bytes it does have are reported as one uninterpreted group
+        // rather than as a prefix and a hole.
         let d = d64(&[0x48, 0x8b, 0x05]);
-        assert_eq!(d.insn.len, 1);
+        assert_eq!(d.insn.len, 3);
     }
 
     /// EVEX: a write mask, a zeroing bit and a broadcast, each of which
@@ -3855,6 +4113,88 @@ mod tests {
             text(&[0xa1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
             "movabs eax, ds:0x8877665544332211"
         );
+    }
+
+    #[test]
+    fn absolute_moves_take_the_address_width_of_the_mode() {
+        // `A1` is a move from an absolute address, and the address is as wide
+        // as the mode says, not as wide as the operand. Reading eight bytes in
+        // 32-bit code over-reads by four and every following instruction is
+        // decoded from the middle of this one.
+        assert_eq!(
+            text(&[0x48, 0xa1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]),
+            "movabs rax, ds:0x8877665544332211"
+        );
+        assert_eq!(
+            text(&[0x67, 0xa1, 0x11, 0x22, 0x33, 0x44]),
+            "mov eax, ds:0x44332211"
+        );
+
+        let d32 = Decoder::new(32).unwrap();
+        let d = d32
+            .decode(Addr(0x1000), &[0xa1, 0x11, 0x22, 0x33, 0x44])
+            .unwrap();
+        assert_eq!(d.insn.text, "mov eax, ds:0x44332211");
+        assert_eq!(d.insn.len, 5);
+        // The `67` prefix halves the address again, to two bytes.
+        let d = d32.decode(Addr(0x1000), &[0x67, 0xa1, 0x11, 0x22]).unwrap();
+        assert_eq!(d.insn.text, "mov eax, ds:0x2211");
+        assert_eq!(d.insn.len, 4);
+        // The byte moves take the accumulator, not a register number.
+        let d = d32
+            .decode(Addr(0x1000), &[0xa0, 0x11, 0x22, 0x33, 0x44])
+            .unwrap();
+        assert_eq!(d.insn.text, "mov al, ds:0x44332211");
+    }
+
+    #[test]
+    fn the_state_save_group_is_selected_by_the_reg_field() {
+        // Group 9 is selected by the ModRM reg field, and its upper half is
+        // the state-area family: `/3`, `/4` and `/5` are XRSTORS, XSAVEC and
+        // XSAVES. A decoder that leaves them out emits one byte where the
+        // listing has five and loses the instruction stream for the rest of
+        // the function, which is how a missing entry in one group turns into
+        // hundreds of `not decoded` lines.
+        assert_eq!(text(&[0x0f, 0xc7, 0x5c, 0x24, 0x40]), "xrstors [rsp + 0x40]");
+        assert_eq!(
+            text(&[0x48, 0x0f, 0xc7, 0x5c, 0x24, 0x40]),
+            "xrstors64 [rsp + 0x40]"
+        );
+        assert_eq!(text(&[0x0f, 0xc7, 0x64, 0x24, 0x40]), "xsavec [rsp + 0x40]");
+        assert_eq!(
+            text(&[0x48, 0x0f, 0xc7, 0x64, 0x24, 0x40]),
+            "xsavec64 [rsp + 0x40]"
+        );
+        assert_eq!(text(&[0x0f, 0xc7, 0x6c, 0x24, 0x40]), "xsaves [rsp + 0x40]");
+        assert_eq!(
+            text(&[0x48, 0x0f, 0xc7, 0x6c, 0x24, 0x40]),
+            "xsaves64 [rsp + 0x40]"
+        );
+        // The prefix in front of one of them is not part of the encoding: the
+        // same three bytes are the instruction with or without it.
+        assert_eq!(text(&[0x66, 0x0f, 0xc7, 0x27]), "xsavec [rdi]");
+        assert_eq!(text(&[0xf3, 0x0f, 0xc7, 0x2f]), "xsaves [rdi]");
+        // The compare-and-exchange pair share the group, and their names
+        // already carry the width, so the operand prints without one.
+        assert_eq!(text(&[0x0f, 0xc7, 0x08]), "cmpxchg8b [rax]");
+        assert_eq!(text(&[0x48, 0x0f, 0xc7, 0x08]), "cmpxchg16b [rax]");
+        // The register forms in the same group are rdrand and rdseed, not
+        // loads, and they name a general-purpose register.
+        assert_eq!(text(&[0x0f, 0xc7, 0xf0]), "rdrand eax");
+    }
+
+    #[test]
+    fn the_prefix_decides_the_name_of_a_shared_opcode() {
+        // `0F 12` is `movhlps` in its register form, but under `F2` and `F3`
+        // the same opcode is `movddup` and `movsldup`, which keep their names
+        // in both forms. Renaming every register form gives the wrong
+        // instruction a right-looking length.
+        assert_eq!(text(&[0x0f, 0x12, 0xc1]), "movhlps xmm0, xmm1");
+        assert_eq!(text(&[0xf2, 0x0f, 0x12, 0xc1]), "movddup xmm0, xmm1");
+        assert_eq!(text(&[0xf3, 0x0f, 0x12, 0xc1]), "movsldup xmm0, xmm1");
+        assert_eq!(text(&[0x0f, 0x16, 0xc1]), "movlhps xmm0, xmm1");
+        assert_eq!(text(&[0xf3, 0x0f, 0x16, 0xc1]), "movshdup xmm0, xmm1");
+        assert_eq!(text(&[0xf2, 0x0f, 0x12, 0x01]), "movddup xmm0, qword ptr [rcx]");
     }
 
     #[test]

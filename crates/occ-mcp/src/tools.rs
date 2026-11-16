@@ -442,7 +442,8 @@ fn session_restore(session: &Session, args: &Args) -> Result<Value, String> {
 
 fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
     let path = args.req_str("path")?;
-    let id = session.open_path(path).map_err(|e| e.to_string())?;
+    let ids = session.open_path(path).map_err(|e| e.to_string())?;
+    let id = *ids.first().ok_or("the open produced no image")?;
     let file = session.image(id).ok_or("image vanished after open")?;
     let fp = fingerprint_json(&file.analysis.fingerprint);
     let e = Envelope::ok(summary_of(&file))
@@ -481,7 +482,41 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
             format!("binary.strings with image={id} and a pattern"),
             format!("binary.fingerprint with image={id}"),
         ]);
+    // An archive opens as one image per member. The first member answers the
+    // summary, and the rest are named here so a caller can address them
+    // without knowing the archive was one file.
+    let mut e = e;
+    if ids.len() > 1 {
+        let members = ids
+            .iter()
+            .map(|mid| match session.image(*mid) {
+                Some(f) => obj!(
+                    "image" => Value::from(*mid),
+                    "name" => Value::String(member_name(&f.image.path, path)),
+                    "format" => Value::String(f.image.format.label().to_string()),
+                    "functions" => Value::from(f.analysis.coverage.functions),
+                ),
+                None => obj!("image" => Value::from(*mid)),
+            })
+            .collect::<Vec<_>>();
+        e = e.field("member_count", Value::from(ids.len())).field(
+            "members",
+            Value::Array(members),
+        );
+    }
     Ok(e.build())
+}
+
+/// The member name inside an archive's synthetic path.
+///
+/// The session names a member `libfoo.a(member.o)` so that a handle is
+/// readable; the listing wants the part inside the parentheses.
+fn member_name(path: &str, archive: &str) -> String {
+    path.strip_prefix(archive)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn binary_info(session: &Session, args: &Args) -> Result<Value, String> {
