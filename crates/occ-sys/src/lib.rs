@@ -17,6 +17,7 @@
 
 #![deny(missing_docs)]
 
+pub mod cleanup;
 pub mod errno;
 pub mod mem;
 pub mod proc;
