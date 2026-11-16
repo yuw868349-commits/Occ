@@ -459,19 +459,28 @@ dropped that way, and the table says nothing about them rather than something
 wrong.
 
 The check that matters is the one over real code. `scripts/diff_all.py` runs
-`objdump -d` and the decoder over every executable on the machine and compares
-instruction boundaries, not text:
-
-```
-$ python3 scripts/diff_all.py
-checked 2793 binaries, 0 with differences
-```
+`objdump -d` and the decoder over every executable and every archive member on
+the machine and compares instruction boundaries, not text.
 
 An instruction boundary is the load-bearing claim: get one length wrong and
 every following instruction is compared at the wrong address. Text is compared
 too, and the differences that remain are aliases — the same instruction under
 another name, `vcmpeqps` for `vcmpps` — which the report counts separately
 rather than hiding.
+
+Two comparisons need a different rule than the rest, and the rule is stated
+rather than worked around. A relocatable object has no load address: `objdump`
+restarts its address column at zero for every section, while the decoder keeps
+addresses unique by using the section's file offset, so those two listings are
+compared by position. An `ar` archive is not one image at all: each member is
+written out and checked as the object it is.
+
+The sweep is not a clean sheet, and saying so is part of the method. Of the
+forty files it flagged on this machine, thirty-four now compare instruction for
+instruction. The six that remain have two causes, both recorded under Limits: an
+AVX-512 shift form the table does not carry, and 32-bit libraries whose `.text`
+holds data that `objdump` reads one byte at a time where the decoder follows the
+encoding.
 
 Bugs this discipline caught, each of which had passing unit tests at the time:
 
@@ -561,11 +570,19 @@ Stated because the tool is supposed to state them, not because they are temporar
 - **AVX-512 coverage is uneven by construction.** The EVEX table holds the
   encodings both disassemblers agreed on, which is most of the set but not all of
   it: `vpshldw`, `vdbpsadbw`, `vrsqrt14ps` and a few dozen others are missing,
-  and the sweep over the family reports them as gaps rather than as guesses. On
-  the binaries that ship with a Linux system the gap never fires — the sweep over
-  all 2793 of them finds no length mismatch — because compilers do not emit those
-  forms below 512-bit vectors, and the code that does use them is hand-written
-  intrinsics.
+  and the sweep over the family reports them as gaps rather than as guesses. The
+  immediate-shift forms at `0F 73` are among them, and on this machine the gap
+  fires in one library — `libgfortran` — where the instruction decodes as bytes
+  and the listing drifts until the next boundary. Compilers do not emit the rest
+  of the missing set below 512-bit vectors, so code written with intrinsics is
+  where to expect them.
+- **Data inside `.text` is read as code, by both sides, to different depths.**
+  A jump table or a literal that sits in an executable section is decoded as
+  instructions. `objdump` answers one byte and gives up on an encoding it does
+  not recognise; this decoder follows the encoding as far as the bytes go. Both
+  are guessing, the guesses differ in length, and the comparison reports the
+  difference instead of hiding it. Two 32-bit libraries on this machine are the
+  only places it fires.
 - **Tracing is x86-64 Linux only.** It requires a Linux host and an x86 or x86-64
   image; PE and Mach-O can be loaded and analysed, not executed here.
 - **Static analysis cannot see** runtime-resolved function pointers, `dlopen`'d
