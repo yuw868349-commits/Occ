@@ -53,7 +53,9 @@ pub fn resolve(view: &View, window: &[&Instruction], jmp: &Instruction) -> Optio
         return None;
     }
     let (base, entry_bytes, relative, index_reg) = shape(window, jmp)?;
-    let targets = read_targets(view, base, entry_bytes, relative);
+    let limit = case_count(window, index_reg.as_deref());
+    let first = first_case(window, index_reg.as_deref());
+    let targets = read_targets(view, base, entry_bytes, relative, limit);
     if targets.len() < MIN_ENTRIES {
         return None;
     }
@@ -64,8 +66,168 @@ pub fn resolve(view: &View, window: &[&Instruction], jmp: &Instruction) -> Optio
         relative,
         count: targets.len() as u32,
         index_reg,
+        first_case: first,
         targets,
     })
+}
+
+/// The case value of the first entry, as the code states it.
+///
+/// A compiler that sees `case 100..106` subtracts 100 from the index
+/// before the lookup:
+///
+/// ```text
+/// sub     $0x64, %edi
+/// cmp     $0x6, %edi
+/// ja      .Ldefault
+/// ```
+///
+/// The table then holds positions, and the position is the case value less
+/// 100. The subtraction is the only statement that says so.
+///
+/// The instruction has to write the register the table was indexed by, and
+/// it has to be the last one that does: a later write would mean the
+/// subtraction was not what reached the table.
+fn first_case(window: &[&Instruction], index_reg: Option<&str>) -> Option<i64> {
+    let index_reg = index_reg?;
+    let mut found = None;
+    for insn in window {
+        let Some((dst, amount)) = offset_of_index(&insn.text) else {
+            continue;
+        };
+        if family(dst) != family(index_reg) {
+            continue;
+        }
+        // `sub $0x64, %edi` lowers the index by 64, so the first case is 64.
+        // `add $-0x64, %edi` says the same thing the other way round.
+        found = Some(match amount {
+            Some(amount) => amount,
+            None => continue,
+        });
+    }
+    found
+}
+
+/// `sub edi, 0x64` → ("edi", 64), and `add edi, -0x64` → ("edi", 64).
+///
+/// The spelling is the one this decoder prints: the source operand comes
+/// first, so the immediate is the second half.
+fn offset_of_index(text: &str) -> Option<(&str, Option<i64>)> {
+    let (op, rest) = match text.split_once(' ') {
+        Some((op, rest)) => (op, rest),
+        None => return None,
+    };
+    let sign = match op {
+        "sub" => 1i64,
+        "add" => -1i64,
+        _ => return None,
+    };
+    let (reg, amount) = match rest.split_once(", ") {
+        Some((reg, amount)) => (reg.trim(), amount.trim()),
+        None => return None,
+    };
+    let reg = reg.split_whitespace().next().unwrap_or(reg);
+    if reg.is_empty() || !reg.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let value = immediate(amount)?;
+    Some((reg, Some(value.wrapping_mul(sign))))
+}
+
+/// How many cases the switch has, as the bound check states it.
+///
+/// A compiler that builds a jump table checks the index against the last
+/// case before the lookup:
+///
+/// ```text
+/// cmp     $0x9, %edi
+/// ja      .Ldefault
+/// ```
+///
+/// The constant is the number of cases minus one, and it is the only
+/// statement in the code that says how long the table is. Without it the
+/// table is read until an entry stops naming code, which runs into the
+/// next table in the same section and invents cases that the switch never
+/// had — which is not a rare accident: two switches in one file put their
+/// tables next to each other.
+///
+/// The check is only trusted when it is on the register the table was
+/// indexed by. A comparison on some other register says nothing about
+/// how long this table is.
+fn case_count(window: &[&Instruction], index_reg: Option<&str>) -> Option<usize> {
+    let index_reg = index_reg?;
+    let mut found = None;
+    for pair in window.windows(2) {
+        let (cmp, br) = (pair[0], pair[1]);
+        if !is_above_branch(&br.text) {
+            continue;
+        }
+        let Some((reg, imm)) = cmp_against_immediate(&cmp.text) else {
+            continue;
+        };
+        if family(reg) != family(index_reg) {
+            continue;
+        }
+        if imm < 0 || imm as usize >= MAX_ENTRIES {
+            continue;
+        }
+        // The last such check before the jump is the one that bounds the
+        // table; an earlier one is some other comparison.
+        found = Some(imm as usize + 1);
+    }
+    found
+}
+
+/// `ja` and `jg`: the branches that mean "above the bound, leave the switch".
+fn is_above_branch(text: &str) -> bool {
+    text.starts_with("ja ") || text.starts_with("jg ")
+}
+
+/// `cmp edi, 0x9` → ("edi", 9).
+fn cmp_against_immediate(text: &str) -> Option<(&str, i64)> {
+    let rest = text.strip_prefix("cmp ")?;
+    let (lhs, rhs) = rest.split_once(", ")?;
+    let reg = lhs.trim();
+    if reg.is_empty() || !reg.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some((reg, immediate(rhs.trim())?))
+}
+
+/// An immediate as this decoder prints it: `0x9`, `-0x64`.
+fn immediate(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let digits = digits.strip_prefix("0x").unwrap_or(digits);
+    let value = i64::from_str_radix(digits, 16).ok()?;
+    Some(if negative { -value } else { value })
+}
+
+/// The 64-bit name of a register, whatever width it was written at.
+///
+/// `edi` and `rdi` are one register, and a bound check written at 32 bits
+/// names the same index the table read named at 64.
+fn family(reg: &str) -> &str {
+    match reg {
+        "al" | "ah" | "ax" | "eax" | "rax" => "rax",
+        "cl" | "ch" | "cx" | "ecx" | "rcx" => "rcx",
+        "dl" | "dh" | "dx" | "edx" | "rdx" => "rdx",
+        "sil" | "si" | "esi" | "rsi" => "rsi",
+        "dil" | "di" | "edi" | "rdi" => "rdi",
+        "bpl" | "bl" | "bh" | "bx" | "ebx" | "rbx" => "rbx",
+        "spl" | "sp" | "esp" | "rsp" => "rsp",
+        "r8b" | "r8w" | "r8d" | "r8" => "r8",
+        "r9b" | "r9w" | "r9d" | "r9" => "r9",
+        "r10b" | "r10w" | "r10d" | "r10" => "r10",
+        "r11b" | "r11w" | "r11d" | "r11" => "r11",
+        "r12b" | "r12w" | "r12d" | "r12" => "r12",
+        "r13b" | "r13w" | "r13d" | "r13" => "r13",
+        "r14b" | "r14w" | "r14d" | "r14" => "r14",
+        "r15b" | "r15w" | "r15d" | "r15" => "r15",
+        other => other,
+    }
 }
 
 /// Where the table lives and how an entry is read.
@@ -134,10 +296,23 @@ fn shape(
     Some((base, entry_bytes, true, index))
 }
 
-fn read_targets(view: &View, base: Addr, width: u8, relative: bool) -> Vec<Addr> {
+fn read_targets(
+    view: &View,
+    base: Addr,
+    width: u8,
+    relative: bool,
+    limit: Option<usize>,
+) -> Vec<Addr> {
     let mut out: Vec<Addr> = Vec::new();
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     for i in 0..MAX_ENTRIES {
+        // The bound check said how many cases there are, and the table is
+        // exactly that long. Reading past it reads the next table.
+        if let Some(limit) = limit
+            && i >= limit
+        {
+            break;
+        }
         let slot = base.add((i * usize::from(width)) as u64);
         let Some(raw) = view.read_uint(slot, usize::from(width)) else {
             break;
@@ -274,5 +449,96 @@ mod tests {
     fn register_add_is_not_confused_with_memory_add() {
         assert_eq!(add_pair("add rax, rdx"), Some(("rax", "rdx")));
         assert_eq!(add_pair("add rax, qword ptr [rbx]"), None);
+    }
+
+    #[test]
+    fn a_bound_check_says_how_many_cases_there_are() {
+        let owned = [
+            insn("cmp edi, 0x9"),
+            insn("ja 0x1040 (rel -0x1ed)"),
+            insn("jmp rax"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(case_count(&window, Some("rdi")), Some(10));
+    }
+
+    #[test]
+    fn a_subtraction_before_the_lookup_names_the_first_case() {
+        let owned = [
+            insn("sub edi, 0x64"),
+            insn("cmp edi, 0x6"),
+            insn("ja 0x1044"),
+            insn("jmp rax"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(first_case(&window, Some("rdi")), Some(100));
+    }
+
+    #[test]
+    fn an_addition_names_the_first_case_the_other_way_round() {
+        let owned = [insn("add edi, -0x64"), insn("jmp rax")];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(first_case(&window, Some("rdi")), Some(100));
+    }
+
+    #[test]
+    fn a_subtraction_on_another_register_names_nothing() {
+        let owned = [insn("sub esi, 0x64"), insn("jmp rax")];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(first_case(&window, Some("rdi")), None);
+    }
+
+    #[test]
+    fn a_bound_check_on_another_register_bounds_nothing() {
+        let owned = [insn("cmp esi, 0x9"), insn("ja 0x1040")];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(case_count(&window, Some("rdi")), None);
+    }
+
+    #[test]
+    fn a_comparison_without_a_branch_bounds_nothing() {
+        let owned = [insn("cmp edi, 0x9"), insn("mov eax, 1")];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(case_count(&window, Some("rdi")), None);
+    }
+
+    #[test]
+    fn the_last_bound_check_is_the_one_that_counts() {
+        let owned = [
+            insn("cmp edi, 0x3"),
+            insn("ja 0x1040"),
+            insn("cmp edi, 0x9"),
+            insn("ja 0x1044"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(case_count(&window, Some("rdi")), Some(10));
+    }
+
+    #[test]
+    fn register_widths_do_not_change_the_register() {
+        assert_eq!(family("edi"), family("rdi"));
+        assert_eq!(family("ax"), family("rax"));
+        assert_ne!(family("esi"), family("rdi"));
+    }
+
+    #[test]
+    fn a_comparison_against_an_immediate_is_read() {
+        assert_eq!(cmp_against_immediate("cmp edi, 0x9"), Some(("edi", 9)));
+        assert_eq!(cmp_against_immediate("cmp edi, 0x0"), Some(("edi", 0)));
+        assert_eq!(cmp_against_immediate("cmp eax, esi"), None);
+    }
+
+    fn insn(text: &str) -> Instruction {
+        Instruction {
+            addr: Addr(0x1000),
+            len: 2,
+            bytes: [0; occ_core::MAX_INSN_LEN],
+            text: text.into(),
+            mnemonic: text.split(' ').next().unwrap_or("t").into(),
+            flow: FlowKind::Next,
+            target: None,
+            mem_reads: Vec::new(),
+            mem_writes: Vec::new(),
+        }
     }
 }

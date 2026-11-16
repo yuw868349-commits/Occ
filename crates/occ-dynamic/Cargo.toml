@@ -15,3 +15,4 @@ occ-analyze.workspace = true
 
 [dev-dependencies]
 occ-bin.workspace = true
+occ-decompile.workspace = true

@@ -14,6 +14,7 @@
 use occ_core::{Addr, FlowKind, Instruction};
 
 use super::{
+    merge_write,
     Core, Lifted, Operand, Parsed, Reg, Target, VecClass, parse_int, split_operands,
 };
 use crate::ir::{
@@ -264,11 +265,43 @@ fn zero_flag(result: &Expr, bits: u8) -> Expr {
     }
 }
 
+/// Mask a shift or rotate count the way the processor does: five bits of it,
+/// six when the operand is 64 bits wide. A count of 33 shifts by one, and a
+/// count of 32 shifts by nothing.
+fn mask_count(raw: Expr, bits: u64, width: u8) -> Expr {
+    let limit = if bits >= 64 { 63 } else { 31 };
+    match raw {
+        Expr::Const(v) => Expr::Const(v & limit),
+        raw => Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(raw),
+            rhs: Box::new(Expr::Const(limit)),
+            bits: width,
+        },
+    }
+}
+
+/// Take a count modulo the number of positions the field has.
+///
+/// A rotation by a whole turn is a rotation by nothing, and the processor
+/// changes no flag for it, so the modulo is what decides whether the flags
+/// are set at all.
+fn turn_mod(count: Expr, positions: u64, width: u8) -> Expr {
+    match count {
+        Expr::Const(v) => Expr::Const(v % positions),
+        count => Expr::Bin {
+            op: BinOp::UMod,
+            lhs: Box::new(count),
+            rhs: Box::new(Expr::Const(positions)),
+            bits: width,
+        },
+    }
+}
+
 /// The sign flag of a result.
 ///
 /// The flag is set when the result is negative, which is its top bit.
-fn sign_flag(result: &Expr, bits: u8) -> Expr {
-    Expr::Cond {
+fn sign_flag(result: &Expr, bits: u8) -> Expr {    Expr::Cond {
         op: CondOp::Slt,
         lhs: Box::new(result.clone()),
         rhs: Box::new(Expr::Const(0)),
@@ -591,18 +624,8 @@ impl<'a> Lifter<'a> {
             "and" => self.lift_alu(BinOp::And, &p.ops, &mut out.stmts),
             "or" => self.lift_alu(BinOp::Or, &p.ops, &mut out.stmts),
             "xor" => self.lift_alu(BinOp::Xor, &p.ops, &mut out.stmts),
-            "adc" => {
-                self.lift_alu(BinOp::Add, &p.ops, &mut out.stmts);
-                self.core
-                    .notes
-                    .push((insn.addr, "carry-in ignored".into()));
-            }
-            "sbb" => {
-                self.lift_alu(BinOp::Sub, &p.ops, &mut out.stmts);
-                self.core
-                    .notes
-                    .push((insn.addr, "borrow-in ignored".into()));
-            }
+            "adc" => self.lift_carry_arith(true, &p.ops, &mut out.stmts),
+            "sbb" => self.lift_carry_arith(false, &p.ops, &mut out.stmts),
             "inc" => self.lift_inc_dec(BinOp::Add, &with_imm(&p.ops, 1), &mut out.stmts),
             "dec" => self.lift_inc_dec(BinOp::Sub, &with_imm(&p.ops, 1), &mut out.stmts),
             "neg" => self.lift_unary(UnOp::Neg, &p.ops, &mut out.stmts),
@@ -610,7 +633,7 @@ impl<'a> Lifter<'a> {
             "shl" | "sal" => self.lift_shift(BinOp::Shl, &p.ops, &mut out.stmts),
             "shr" => self.lift_shift(BinOp::Shr, &p.ops, &mut out.stmts),
             "sar" => self.lift_shift(BinOp::Sar, &p.ops, &mut out.stmts),
-            "imul" | "mul" => self.lift_imul(&p.ops, &mut out.stmts),
+            "imul" | "mul" => self.lift_imul(m, &p.ops, &mut out.stmts),
             "loop" | "loope" | "loopne" | "jrcxz" | "jecxz" => {
                 self.lift_loop(m, &mut out.stmts)
             }
@@ -638,6 +661,7 @@ impl<'a> Lifter<'a> {
             }
             "xchg" => self.lift_xchg(&p.ops, &mut out.stmts),
             "rol" | "ror" => self.lift_rotate(m, &p.ops, &mut out.stmts),
+            "rcl" | "rcr" => self.lift_rotate_carry(m, &p.ops, &mut out.stmts),
             "bswap" => self.lift_bswap(&p.ops, &mut out.stmts),
             "bsr" | "bsf" | "tzcnt" | "lzcnt" => self.lift_bit_scan(m, &p.ops, &mut out.stmts),
             "bt" | "bts" | "btr" | "btc" => self.lift_bit_test(m, &p.ops, &mut out.stmts),
@@ -675,7 +699,7 @@ impl<'a> Lifter<'a> {
             self.prologue_seen = true;
             return;
         }
-        let value = self.core.read(&ops[1], stmts);
+        let value = self.snapshot(&ops[1], stmts);
         self.core.write(&ops[0], value, stmts);
     }
 
@@ -684,7 +708,7 @@ impl<'a> Lifter<'a> {
         if ops.len() != 2 {
             return;
         }
-        let src = self.core.read(&ops[1], stmts);
+        let src = self.snapshot(&ops[1], stmts);
         let from = ops[1].size();
         let to = ops[0].size().max(from);
         let value = Expr::Cast {
@@ -736,7 +760,21 @@ impl<'a> Lifter<'a> {
             return;
         }
         let bits = ops[0].size();
-        let operand = self.core.read(&ops[1], stmts);
+        // `xor eax, eax` and `sub eax, eax` clear a register without reading
+        // it, and they are how a compiler writes a zero. Naming both operands
+        // first turned the cancellation into a comparison between a value and
+        // a copy of itself, which the simplifier cannot see, and a symbolic
+        // executor then asks what the register held before a write that does
+        // not depend on it.
+        if matches!(op, BinOp::Xor | BinOp::Sub) && ops[0] == ops[1] {
+            let zero = Expr::Const(0);
+            let result = self.core.dest_value(&ops[0]);
+            let flags = self.alu_flags(op, &zero, &zero, &result, bits);
+            self.core.write(&ops[0], zero, stmts);
+            self.core.set_flags(flags, None);
+            return;
+        }
+        let operand = self.snapshot(&ops[1], stmts);
         // The carry and the overflow say things about the value that was
         // there before the operation, so it is given a name of its own.
         // The logical operations say nothing about the old value, and they
@@ -756,6 +794,73 @@ impl<'a> Lifter<'a> {
         let flags = self.alu_flags(op, &previous, &operand, &result, bits);
         self.core.write(&ops[0], value, stmts);
         self.core.set_flags(flags, None);
+    }
+
+    /// `adc` and `sbb`: the arithmetic that arrives with a carry.
+    ///
+    /// The carry is a value, not a mode. Modelling it as `add` with a note
+    /// that the carry was ignored makes a loop that adds two multi-word
+    /// numbers produce the wrong answer at every word after the first, and the
+    /// note does not travel with the value it corrupts.
+    fn lift_carry_arith(&mut self, is_adc: bool, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let bits = ops[0].size();
+        let previous = self.snapshot(&ops[0], stmts);
+        let operand = self.snapshot(&ops[1], stmts);
+        let carry = self.carry_in();
+        let value = Expr::Intrinsic {
+            op: if is_adc {
+                Intrinsic::AdcSum
+            } else {
+                Intrinsic::SbbDiff
+            },
+            args: vec![previous.clone(), operand.clone(), carry.clone()],
+            bits,
+        };
+        self.core.write(&ops[0], value, stmts);
+        let result = self.core.dest_value(&ops[0]);
+        let cf = Expr::Intrinsic {
+            op: if is_adc {
+                Intrinsic::AdcCarry
+            } else {
+                Intrinsic::SbbBorrow
+            },
+            args: vec![previous.clone(), operand.clone(), carry],
+            bits,
+        };
+        let of = Expr::Intrinsic {
+            op: if is_adc {
+                Intrinsic::OverflowAdd
+            } else {
+                Intrinsic::OverflowSub
+            },
+            args: vec![previous, operand, result.clone()],
+            bits,
+        };
+        self.core.set_flags(
+            FlagState {
+                cf: Some(cf),
+                zf: Some(zero_flag(&result, bits)),
+                sf: Some(sign_flag(&result, bits)),
+                of: Some(of),
+                pf: Some(parity_flag(&result, bits)),
+            },
+            None,
+        );
+    }
+
+    /// The carry flag as a value, for the instructions that add it in.
+    ///
+    /// An instruction that arrives before any operation set the carry has no
+    /// value to add. Saying so is better than adding zero: a caller reading
+    /// the output can see the gap, and the interpreter refuses to invent one.
+    fn carry_in(&self) -> Expr {
+        match &self.core.flags.cf {
+            Some(e) => e.clone(),
+            None => Expr::Unknown("carry-in flag is not defined on this path".into()),
+        }
     }
 
     /// The flags a binary arithmetic operation leaves behind.
@@ -825,14 +930,19 @@ impl<'a> Lifter<'a> {
     /// and both are about the value that was there before.
     fn snapshot(&mut self, op: &Operand, stmts: &mut Vec<Stmt>) -> Expr {
         let value = self.core.read(op, stmts);
-        match op {
-            Operand::Reg(_) => {
-                let name = self.new_temp_named("old_");
-                self.core.assign(&name, value, stmts);
-                Expr::var(name)
-            }
-            _ => value,
-        }
+        // Every operand is materialised, not just a register. `xchg [rax], cl`
+        // writes memory and then reads the old value back out of the same
+        // location; without a name for the first read, the second one sees the
+        // store and the exchange turns into a copy.
+        self.name(value, stmts)
+    }
+
+    /// Give a value a name, so a store that follows cannot change what it
+    /// reads.
+    fn name(&mut self, value: Expr, stmts: &mut Vec<Stmt>) -> Expr {
+        let name = self.new_temp_named("old_");
+        self.core.assign(&name, value, stmts);
+        Expr::var(name)
     }
 
     /// `inc` and `dec`: the same arithmetic, with the carry left alone.
@@ -848,7 +958,7 @@ impl<'a> Lifter<'a> {
             return;
         }
         let bits = ops[0].size();
-        let operand = self.core.read(&ops[1], stmts);
+        let operand = self.snapshot(&ops[1], stmts);
         let previous = self.core.read(&ops[0], stmts);
         let value = Expr::Bin {
             op,
@@ -930,7 +1040,28 @@ impl<'a> Lifter<'a> {
         // The carry is the bit that was shifted out, so the value before the
         // shift has to survive it.
         let previous = self.snapshot(&ops[0], stmts);
-        let count = self.core.read(&ops[1], stmts);
+        // An immediate count is a number, and a number needs no protection
+        // from the write this instruction is about to make. Copying it into a
+        // temporary hid the value from the flag rules, which then took the
+        // path for an unknown count and worked the carry out from the shifted
+        // result instead of the value that was shifted.
+        //
+        // The count itself is masked before it is used: the processor reads
+        // five bits of it, six for a 64-bit operand, so a count of 33 shifts
+        // by one and a count of 32 does nothing.
+        let limit = if bits >= 8 { 63 } else { 31 };
+        let count = match &ops[1] {
+            Operand::Imm(v) => Expr::Const(v & limit),
+            _ => {
+                let raw = self.snapshot(&ops[1], stmts);
+                Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(raw),
+                    rhs: Box::new(Expr::Const(limit)),
+                    bits,
+                }
+            }
+        };
         let value = Expr::Bin {
             op,
             lhs: Box::new(previous.clone()),
@@ -947,14 +1078,28 @@ impl<'a> Lifter<'a> {
 
     /// The flags a shift leaves behind.
     ///
-    /// The carry is the bit that was shifted out. The overflow depends on
-    /// the direction: a left shift sets it when the sign of the result
-    /// differs from the carry, a right shift sets it when the value was
-    /// negative to begin with, and an arithmetic right shift always clears
-    /// it.
+    /// The carry is the last bit the shift pushed out: bit `width - count` of
+    /// the value before a left shift, bit `count - 1` of it before a right one.
+    /// Both amounts are subtracted, so a count larger than the width wraps to a
+    /// huge amount, and the interpreter reads a shift that large as "every bit
+    /// is gone". A count past the width therefore carries out a zero without a
+    /// case of its own, which is what the processor does.
     ///
-    /// A count of zero leaves every flag alone, and the count the machine
-    /// uses is the count masked to the width of the operand.
+    /// An arithmetic right shift is the exception: once the count passes the
+    /// width it keeps producing the sign bit, so the carry is taken from an
+    /// arithmetic shift rather than a logical one and lands on the sign by
+    /// itself.
+    ///
+    /// The overflow of a left shift is the sign of the result against the
+    /// carry, and measuring it on the processor showed the rule holds for every
+    /// count, not only the documented one. A logical right shift defines the
+    /// overflow for a count of one, where it is the sign of the value that was
+    /// shifted, and clears it otherwise. An arithmetic right shift clears it
+    /// always.
+    ///
+    /// A count of zero leaves every flag alone: the known-count path returns
+    /// nothing, and the unknown-count path guards each flag so that a zero
+    /// count stays unbound rather than inventing a value.
     fn shift_flags(
         &self,
         op: BinOp,
@@ -963,143 +1108,153 @@ impl<'a> Lifter<'a> {
         result: &Expr,
         bits: u8,
     ) -> Option<FlagState> {
-        let width = u32::from(bits) * 8;
-        // A count that is known makes every flag exact, and the common
-        // shifts name their count.
-        if let Expr::Const(c) = count {
-            let n = c & u64::from(width - 1);
-            if n == 0 {
-                // The machine leaves every flag alone.
-                return None;
-            }
-            let carried = match op {
-                // A left shift moves the top bit out.
-                BinOp::Shl => Expr::Bin {
-                    op: BinOp::Shr,
-                    lhs: Box::new(previous.clone()),
-                    rhs: Box::new(Expr::Const(u64::from(width) - n)),
-                    bits,
-                },
-                // A right shift moves the bottom bit out.
-                _ => Expr::Bin {
-                    op: BinOp::Shr,
-                    lhs: Box::new(previous.clone()),
-                    rhs: Box::new(Expr::Const(n - 1)),
-                    bits,
-                },
+        let binary = |op: BinOp, lhs: Expr, rhs: Expr| Expr::Bin {
+            op,
+            lhs: Box::new(lhs),
+            rhs: Box::new(rhs),
+            bits,
+        };
+        let carry = |count: &Expr| {
+            let amount = match op {
+                BinOp::Shl => binary(BinOp::Sub, Expr::Const(u64::from(bits) * 8), count.clone()),
+                _ => binary(BinOp::Sub, count.clone(), Expr::Const(1)),
             };
-            let carried = Expr::Bin {
-                op: BinOp::And,
-                lhs: Box::new(carried),
-                rhs: Box::new(Expr::Const(1)),
+            let shifted = match op {
+                BinOp::Sar => binary(BinOp::Sar, previous.clone(), amount),
+                _ => binary(BinOp::Shr, previous.clone(), amount),
+            };
+            binary(BinOp::And, shifted, Expr::Const(1))
+        };
+        let overflow = |known: Option<u64>, count: &Expr, carry: &Expr| match op {
+            BinOp::Shl => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(sign_flag(result, bits)),
+                rhs: Box::new(carry.clone()),
                 bits,
-            };
-            let of = match op {
-                BinOp::Shl => Expr::Cond {
-                    op: CondOp::Ne,
-                    lhs: Box::new(sign_flag(result, bits)),
-                    rhs: Box::new(carried.clone()),
-                    bits,
+            },
+            BinOp::Shr => match known {
+                Some(1) => sign_flag(previous, bits),
+                Some(_) => Expr::Const(0),
+                None => Expr::Select {
+                    cond: Box::new(Expr::Cond {
+                        op: CondOp::Eq,
+                        lhs: Box::new(count.clone()),
+                        rhs: Box::new(Expr::Const(1)),
+                        bits,
+                    }),
+                    yes: Box::new(sign_flag(previous, bits)),
+                    no: Box::new(Expr::Const(0)),
                 },
-                BinOp::Shr => sign_flag(previous, bits),
-                _ => Expr::Const(0),
-            };
-            return Some(FlagState {
-                cf: Some(carried),
+            },
+            _ => Expr::Const(0),
+        };
+        let state = |known: Option<u64>| {
+            let carry = carry(count);
+            let of = overflow(known, count, &carry);
+            FlagState {
+                cf: Some(carry),
                 zf: Some(zero_flag(result, bits)),
                 sf: Some(sign_flag(result, bits)),
                 of: Some(of),
                 pf: Some(parity_flag(result, bits)),
-            });
+            }
+        };
+        // A count that is known makes every flag exact, and the common shifts
+        // name their count.
+        if let Expr::Const(c) = count {
+            // The machine leaves every flag alone.
+            if *c == 0 {
+                return None;
+            }
+            return Some(state(Some(*c)));
         }
         // A count that is not known can be zero, and a shift of zero leaves
         // every flag alone, so the flags that would change are guarded.
-        let masked = Expr::Bin {
-            op: BinOp::And,
-            lhs: Box::new(count.clone()),
-            rhs: Box::new(Expr::Const(u64::from(width - 1))),
-            bits,
-        };
         let is_zero = Expr::Cond {
             op: CondOp::Eq,
-            lhs: Box::new(masked.clone()),
+            lhs: Box::new(binary(
+                BinOp::And,
+                count.clone(),
+                Expr::Const(u64::from(u32::from(bits) * 8 - 1)),
+            )),
             rhs: Box::new(Expr::Const(0)),
             bits,
-        };
-        let carried = match op {
-            // A left shift moves the top bit into the bottom one.
-            BinOp::Shl => Expr::Bin {
-                op: BinOp::Shr,
-                lhs: Box::new(Expr::Bin {
-                    op: BinOp::Shl,
-                    lhs: Box::new(previous.clone()),
-                    rhs: Box::new(masked.clone()),
-                    bits,
-                }),
-                rhs: Box::new(Expr::Const(u64::from(width - 1))),
-                bits,
-            },
-            // A right shift moves the bottom bit into the top one.
-            _ => Expr::Bin {
-                op: BinOp::Shr,
-                lhs: Box::new(previous.clone()),
-                rhs: Box::new(Expr::Bin {
-                    op: BinOp::Sub,
-                    lhs: Box::new(masked.clone()),
-                    rhs: Box::new(Expr::Const(1)),
-                    bits,
-                }),
-                bits,
-            },
-        };
-        let carried = Expr::Bin {
-            op: BinOp::And,
-            lhs: Box::new(carried),
-            rhs: Box::new(Expr::Const(1)),
-            bits,
-        };
-        let of = match op {
-            BinOp::Shl => Expr::Cond {
-                op: CondOp::Ne,
-                lhs: Box::new(sign_flag(result, bits)),
-                rhs: Box::new(carried.clone()),
-                bits,
-            },
-            BinOp::Shr => sign_flag(previous, bits),
-            _ => Expr::Const(0),
         };
         let guarded = |value: Expr| Expr::Select {
             cond: Box::new(is_zero.clone()),
             yes: Box::new(Expr::Unknown("flags".into())),
             no: Box::new(value),
         };
+        let state = state(None);
         Some(FlagState {
-            cf: Some(guarded(carried)),
-            zf: Some(guarded(zero_flag(result, bits))),
-            sf: Some(guarded(sign_flag(result, bits))),
-            of: Some(guarded(of)),
-            pf: Some(guarded(parity_flag(result, bits))),
+            cf: state.cf.map(guarded),
+            zf: state.zf.map(guarded),
+            sf: state.sf.map(guarded),
+            of: state.of.map(guarded),
+            pf: state.pf.map(guarded),
         })
     }
 
-    fn lift_imul(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+    fn lift_imul(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        // `mul` and `imul` share an encoding, and the difference is entirely in
+        // the top half of the product and in the flags: a signed product of two
+        // negatives is positive, so the upper half is not the upper half of the
+        // unsigned product.
+        let signed = m == "imul";
         match ops.len() {
             1 => {
-                // One-operand form writes rdx:rax; only the low half is kept,
-                // which is exact for the low half.
-                let operand = self.core.read(&ops[0], stmts);
+                // The one-operand form produces twice the operand width: `ax`
+                // for a byte, `dx:ax` for a word, `edx:eax` for a dword and
+                // `rdx:rax` for a qword. Keeping only the low half is exact
+                // for the low half and wrong above it, which is where the
+                // answer to "did the product fit" lives.
                 let size = ops[0].size();
-                // The product is the accumulator times the operand, and the
-                // flags say whether it fitted.
                 let accumulator = self.snapshot(&Operand::Reg(Reg::view(0, size, 0)), stmts);
-                let product = Expr::Bin {
-                    op: BinOp::Mul,
-                    lhs: Box::new(accumulator.clone()),
-                    rhs: Box::new(operand.clone()),
-                    bits: size,
-                };
-                let (cf, of) = self.mul_flags(&accumulator, &operand, size);
-                self.core.assign("rax", product, stmts);
+                let operand = self.snapshot(&ops[0], stmts);
+                let (lo, hi) = self.product(&accumulator, &operand, size, signed);
+                let (cf, of) = self.mul_flags(&lo, &hi, size, signed);
+                if size == 1 {
+                    // `al * r/m8` lands in `ax`, both halves in one register.
+                    let high = Expr::Bin {
+                        op: BinOp::Shl,
+                        lhs: Box::new(hi),
+                        rhs: Box::new(Expr::Const(8)),
+                        bits: 2,
+                    };
+                    let combined = Expr::Bin {
+                        op: BinOp::Or,
+                        lhs: Box::new(lo),
+                        rhs: Box::new(high),
+                        bits: 2,
+                    };
+                    let written = merge_write("rax", combined, 2, 0, 8);
+                    self.core.assign("rax", written, stmts);
+                } else if size == 4 {
+                    // Writing `eax` clears the upper half of `rax`; a merged
+                    // write would keep the old bits and report a product the
+                    // instruction never produced.
+                    let low = Expr::Cast {
+                        kind: CastKind::Zext,
+                        arg: Box::new(lo),
+                        from: 4,
+                        to: 8,
+                    };
+                    self.core.assign("rax", low, stmts);
+                    let high = Expr::Cast {
+                        kind: CastKind::Zext,
+                        arg: Box::new(hi),
+                        from: 4,
+                        to: 8,
+                    };
+                    self.core.assign("rdx", high, stmts);
+                } else {
+                    // A 16-bit product lands in `ax` and `dx`, which are views
+                    // of two registers that keep their upper bits.
+                    let low = merge_write("rax", lo, size, 0, 8);
+                    self.core.assign("rax", low, stmts);
+                    let high = merge_write("rdx", hi, size, 0, 8);
+                    self.core.assign("rdx", high, stmts);
+                }
                 self.core.update_flags(FlagState {
                     cf,
                     zf: None,
@@ -1110,7 +1265,7 @@ impl<'a> Lifter<'a> {
             }
             2 => {
                 let previous = self.snapshot(&ops[0], stmts);
-                let operand = self.core.read(&ops[1], stmts);
+                let operand = self.snapshot(&ops[1], stmts);
                 let size = ops[0].size();
                 let product = Expr::Bin {
                     op: BinOp::Mul,
@@ -1118,7 +1273,8 @@ impl<'a> Lifter<'a> {
                     rhs: Box::new(operand.clone()),
                     bits: size,
                 };
-                let (cf, of) = self.mul_flags(&previous, &operand, size);
+                let (lo, hi) = self.product(&previous, &operand, size, signed);
+                let (cf, of) = self.mul_flags(&lo, &hi, size, signed);
                 self.core.write(&ops[0], product, stmts);
                 self.core.update_flags(FlagState {
                     cf,
@@ -1129,8 +1285,8 @@ impl<'a> Lifter<'a> {
                 });
             }
             3 => {
-                let operand = self.core.read(&ops[1], stmts);
-                let rhs = self.core.read(&ops[2], stmts);
+                let rhs = self.snapshot(&ops[2], stmts);
+                let operand = self.snapshot(&ops[1], stmts);
                 let size = ops[0].size();
                 let product = Expr::Bin {
                     op: BinOp::Mul,
@@ -1138,7 +1294,8 @@ impl<'a> Lifter<'a> {
                     rhs: Box::new(rhs.clone()),
                     bits: size,
                 };
-                let (cf, of) = self.mul_flags(&operand, &rhs, size);
+                let (lo, hi) = self.product(&operand, &rhs, size, signed);
+                let (cf, of) = self.mul_flags(&lo, &hi, size, signed);
                 self.core.write(&ops[0], product, stmts);
                 self.core.update_flags(FlagState {
                     cf,
@@ -1152,47 +1309,57 @@ impl<'a> Lifter<'a> {
         }
     }
 
+    /// The two halves of the product of two values at a given width.
+    fn product(&self, a: &Expr, b: &Expr, size: u8, signed: bool) -> (Expr, Expr) {
+        let (lo_op, hi_op) = if signed {
+            (Intrinsic::IMulLo, Intrinsic::IMulHi)
+        } else {
+            (Intrinsic::MulLo, Intrinsic::MulHi)
+        };
+        let half = |op: Intrinsic| Expr::Intrinsic {
+            op,
+            args: vec![a.clone(), b.clone()],
+            bits: size,
+        };
+        (half(lo_op), half(hi_op))
+    }
+
     /// The carry and the overflow of a multiplication.
     ///
-    /// Both are set when the product did not fit in the width of the
-    /// operation, which is the only way the machine can tell. The product
-    /// has to be the full one, and the full product of two 64-bit values
-    /// does not fit in a word, so there the flags are not known.
-    fn mul_flags(&self, a: &Expr, b: &Expr, bits: u8) -> (Option<Expr>, Option<Expr>) {
-        if bits >= 8 {
-            return (None, None);
-        }
-        let wide = 8u8;
-        let x = Expr::Cast {
-            kind: CastKind::Sext,
-            arg: Box::new(a.clone()),
-            from: bits,
-            to: wide,
-        };
-        let y = Expr::Cast {
-            kind: CastKind::Sext,
-            arg: Box::new(b.clone()),
-            from: bits,
-            to: wide,
-        };
-        let product = Expr::Bin {
-            op: BinOp::Mul,
-            lhs: Box::new(x),
-            rhs: Box::new(y),
-            bits: wide,
-        };
-        // The high half of the product is zero when the product fitted.
-        let high = Expr::Bin {
-            op: BinOp::Shr,
-            lhs: Box::new(product),
-            rhs: Box::new(Expr::Const(u64::from(bits) * 8)),
-            bits: wide,
+    /// Both flags say the same thing: the product did not fit in the width of
+    /// the destination. For an unsigned multiply that is an upper half that is
+    /// not zero. For a signed one it is an upper half that is not the sign of
+    /// the lower half, which is why a negative product that fitted still has an
+    /// upper half full of ones and must not be called an overflow.
+    fn mul_flags(
+        &self,
+        lo: &Expr,
+        hi: &Expr,
+        bits: u8,
+        signed: bool,
+    ) -> (Option<Expr>, Option<Expr>) {
+        let expected = if signed {
+            // One when the low half is negative, zero when it is not: the
+            // sign, spread over the whole width without a branch.
+            Expr::Bin {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Const(0)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(lo.clone()),
+                    rhs: Box::new(Expr::Const(u64::from(bits) * 8 - 1)),
+                    bits,
+                }),
+                bits,
+            }
+        } else {
+            Expr::Const(0)
         };
         let overflow = Expr::Cond {
             op: CondOp::Ne,
-            lhs: Box::new(high),
-            rhs: Box::new(Expr::Const(0)),
-            bits: wide,
+            lhs: Box::new(hi.clone()),
+            rhs: Box::new(expected),
+            bits,
         };
         (Some(overflow.clone()), Some(overflow))
     }
@@ -1398,7 +1565,7 @@ impl<'a> Lifter<'a> {
         let Some(cond) = self.core.target.cmov_cond(&mnem[4..]) else {
             return;
         };
-        let other = self.core.read(&ops[1], stmts);
+        let other = self.snapshot(&ops[1], stmts);
         let current = self.core.read(&ops[0], stmts);
         let jcc = format!("j{}", &mnem[4..]);
         let cond = self.core.condition_of(&jcc, cond);
@@ -1462,8 +1629,8 @@ impl<'a> Lifter<'a> {
         if ops.len() != 2 {
             return;
         }
-        let a = self.core.read(&ops[0], stmts);
-        let b = self.core.read(&ops[1], stmts);
+        let a = self.snapshot(&ops[0], stmts);
+        let b = self.snapshot(&ops[1], stmts);
         self.core.write(&ops[0], b, stmts);
         self.core.write(&ops[1], a, stmts);
     }
@@ -1472,74 +1639,230 @@ impl<'a> Lifter<'a> {
     ///
     /// The count is masked to the width of the operand before the
     /// rotation, so a count of 64 on a 32-bit operand leaves it alone.
+    /// The flags a rotation leaves behind, with the rule that a rotation by
+    /// nothing leaves every flag alone.
+    fn install_rotate_flags(&mut self, count: &Expr, width: u8, state: FlagState) {
+        let guard = match count {
+            // Nothing turned, nothing changed.
+            Expr::Const(0) => return,
+            Expr::Const(_) => None,
+            _ => Some(Expr::Cond {
+                op: CondOp::Eq,
+                lhs: Box::new(count.clone()),
+                rhs: Box::new(Expr::Const(0)),
+                bits: width,
+            }),
+        };
+        let state = match guard {
+            None => state,
+            Some(cond) => {
+                let wrap = |value: Option<Expr>| {
+                    value.map(|value| Expr::Select {
+                        cond: Box::new(cond.clone()),
+                        yes: Box::new(Expr::Unknown("flags".into())),
+                        no: Box::new(value),
+                    })
+                };
+                FlagState {
+                    cf: wrap(state.cf),
+                    zf: wrap(state.zf),
+                    sf: wrap(state.sf),
+                    of: wrap(state.of),
+                    pf: wrap(state.pf),
+                }
+            }
+        };
+        self.core.update_flags(state);
+    }
+
     fn lift_rotate(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let (Some(dst), Some(count)) = (ops.first(), ops.get(1)) else {
             return;
         };
         let width = dst.size();
-        let value = self.core.read(dst, stmts);
-        let raw_count = self.core.read(count, stmts);
-        let count = Expr::Bin {
-            op: BinOp::And,
-            lhs: Box::new(raw_count.clone()),
-            rhs: Box::new(Expr::Const(u64::from(width * 8 - 1))),
-            bits: width,
+        let bits = u64::from(width) * 8;
+        let previous = self.snapshot(dst, stmts);
+        // The count is named before the write for the same reason the value
+        // is: `rol cl, cl` counts with the register it is about to overwrite.
+        let raw = match count {
+            Operand::Imm(v) => Expr::Const(*v),
+            _ => self.snapshot(count, stmts),
         };
-        let value = Expr::Intrinsic {
+        // The count is masked to five bits (six for a 64-bit operand) and then
+        // taken modulo the width, which the intrinsic does.
+        let count = mask_count(raw, bits, width);
+        let turn = turn_mod(count, bits, width);
+        let turned = Expr::Intrinsic {
             op: if m == "rol" {
                 Intrinsic::Rol
             } else {
                 Intrinsic::Ror
             },
-            args: vec![value, count],
+            args: vec![previous, turn.clone()],
             bits: width,
         };
-        self.core.write(dst, value, stmts);
-        // A rotate sets the carry to the bit it rotated out, and the
-        // overflow when the count was one. The zero, sign and parity flags
-        // are left alone.
-        let result = self.core.dest_value(dst);
+        self.core.write(dst, turned.clone(), stmts);
+        // A rotation carries the bit that came round: for a left rotation the
+        // one that arrived at the bottom, for a right one the one that arrived
+        // at the top.
         let carried = match m {
-            // A left rotation moves the top bit into the bottom one.
             "rol" => Expr::Bin {
                 op: BinOp::And,
-                lhs: Box::new(result.clone()),
+                lhs: Box::new(turned.clone()),
                 rhs: Box::new(Expr::Const(1)),
                 bits: width,
             },
-            // A right rotation moves the bottom bit into the top one.
-            _ => Expr::Bin {
-                op: BinOp::Shr,
-                lhs: Box::new(result.clone()),
-                rhs: Box::new(Expr::Const(u64::from(width) * 8 - 1)),
+            _ => sign_flag(&turned, width),
+        };
+        // The overflow compares the two bits that swapped places: the bottom
+        // against the top for a left rotation, the top against the one below
+        // it for a right one. Measuring the processor showed both rules hold
+        // for every count, not only for the count of one the manual defines.
+        let of = match m {
+            "rol" => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(carried.clone()),
+                rhs: Box::new(sign_flag(&turned, width)),
+                bits: width,
+            },
+            _ => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(sign_flag(&turned, width)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(Expr::Bin {
+                        op: BinOp::Shr,
+                        lhs: Box::new(turned),
+                        rhs: Box::new(Expr::Const(bits - 2)),
+                        bits: width,
+                    }),
+                    rhs: Box::new(Expr::Const(1)),
+                    bits: width,
+                }),
                 bits: width,
             },
         };
-        let carried = Expr::Bin {
-            op: BinOp::And,
-            lhs: Box::new(carried),
-            rhs: Box::new(Expr::Const(1)),
+        // Nothing else changes: a rotation leaves the zero, sign and parity
+        // flags as they were.
+        self.install_rotate_flags(
+            &turn,
+            width,
+            FlagState {
+                cf: Some(carried),
+                zf: None,
+                sf: None,
+                of: Some(of),
+                pf: None,
+            },
+        );
+    }
+
+    /// `rcl`/`rcr`: rotate through the carry.
+    ///
+    /// The carry joins the value as a bit above the top, the field turns, and
+    /// what comes back below the top is the carry again. The field is one bit
+    /// wider than the operand, so a byte turns through nine positions and not
+    /// eight, and a count of nine is a count of nothing.
+    fn lift_rotate_carry(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(count)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let width = dst.size();
+        let bits = u64::from(width) * 8;
+        // The value before the rotation holds the bit that becomes the carry,
+        // and the write is about to overwrite it.
+        let previous = self.snapshot(dst, stmts);
+        // The count is named before the write: `rcl cl, cl` counts with the
+        // register it is about to overwrite.
+        let raw = match count {
+            Operand::Imm(v) => Expr::Const(*v),
+            _ => self.snapshot(count, stmts),
+        };
+        let count = mask_count(raw, bits, width);
+        // The count is taken modulo the width plus the carry.
+        let turned_by = turn_mod(count.clone(), bits + 1, width);
+        let carry_in = self.carry_in();
+        let turned = Expr::Intrinsic {
+            op: if m == "rcl" {
+                Intrinsic::Rcl
+            } else {
+                Intrinsic::Rcr
+            },
+            args: vec![previous.clone(), turned_by.clone(), carry_in],
             bits: width,
         };
-        // The overflow is only defined for a rotation of one bit.
-        let of = match &raw_count {
-            Expr::Const(c) if *c & u64::from(width * 8 - 1) == 1 => {
-                Some(Expr::Cond {
-                    op: CondOp::Ne,
-                    lhs: Box::new(sign_flag(&result, width)),
-                    rhs: Box::new(carried.clone()),
+        self.core.write(dst, turned.clone(), stmts);
+        // The carry comes back out of the top: a left rotation moved the bit
+        // at `width - count` up to it, a right one the bit at `count - 1`.
+        let carried = match m {
+            "rcl" => Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(previous),
+                    rhs: Box::new(Expr::Bin {
+                        op: BinOp::Sub,
+                        lhs: Box::new(Expr::Const(bits)),
+                        rhs: Box::new(turned_by.clone()),
+                        bits: width,
+                    }),
                     bits: width,
-                })
-            }
-            _ => None,
+                }),
+                rhs: Box::new(Expr::Const(1)),
+                bits: width,
+            },
+            _ => Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(previous),
+                    rhs: Box::new(Expr::Bin {
+                        op: BinOp::Sub,
+                        lhs: Box::new(turned_by.clone()),
+                        rhs: Box::new(Expr::Const(1)),
+                        bits: width,
+                    }),
+                    bits: width,
+                }),
+                rhs: Box::new(Expr::Const(1)),
+                bits: width,
+            },
         };
-        self.core.update_flags(FlagState {
-            cf: Some(carried),
-            zf: None,
-            sf: None,
-            of,
-            pf: None,
-        });
+        let of = match m {
+            "rcl" => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(carried.clone()),
+                rhs: Box::new(sign_flag(&turned, width)),
+                bits: width,
+            },
+            _ => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(sign_flag(&turned, width)),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(Expr::Bin {
+                        op: BinOp::Shr,
+                        lhs: Box::new(turned),
+                        rhs: Box::new(Expr::Const(bits - 2)),
+                        bits: width,
+                    }),
+                    rhs: Box::new(Expr::Const(1)),
+                    bits: width,
+                }),
+                bits: width,
+            },
+        };
+        self.install_rotate_flags(
+            &turned_by,
+            width,
+            FlagState {
+                cf: Some(carried),
+                zf: None,
+                sf: None,
+                of: Some(of),
+                pf: None,
+            },
+        );
     }
 
     /// `bswap`: reverse the bytes of the destination.
@@ -1558,43 +1881,57 @@ impl<'a> Lifter<'a> {
 
     /// `bsr`/`bsf`/`tzcnt`/`lzcnt`: find a bit.
     ///
-    /// `bsf` and `bsr` leave the destination alone when there is no such
-    /// bit, and `tzcnt` and `lzcnt` count the zeros. All of them set the
-    /// zero flag to whether the source was zero.
+    /// `tzcnt` and `lzcnt` count the zeros and answer the width when the
+    /// source is all zeros. `bsf` and `bsr` have no such answer: the result is
+    /// undefined for a zero source, and the processor leaves the destination
+    /// exactly as it was, which is what this says.
+    ///
+    /// Only the counting operations define flags, the zero flag to whether the
+    /// source was zero and the carry to the same thing. The scans define
+    /// neither, and claiming a zero flag for them made `bsf rax, rax` disagree
+    /// with the processor on every zero it met.
     fn lift_bit_scan(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
             return;
         };
         let width = dst.size();
-        let value = self.core.read(src, stmts);
+        let value = self.snapshot(src, stmts);
         let op = match m {
             "bsr" => Intrinsic::Bsr,
             "bsf" => Intrinsic::Bsf,
             "tzcnt" => Intrinsic::Tzcnt,
             _ => Intrinsic::Lzcnt,
         };
-        let result = Expr::Intrinsic {
-            op,
-            args: vec![value.clone()],
-            bits: width,
-        };
-        self.core.write(dst, result, stmts);
-        // The zero flag says whether the source was zero. The count
-        // operations also set the carry to the same thing; the bit scans
-        // leave the carry undefined.
         let zero = Expr::Cond {
             op: CondOp::Eq,
             lhs: Box::new(value.clone()),
             rhs: Box::new(Expr::Const(0)),
             bits: width,
         };
-        let cf = match m {
-            "tzcnt" | "lzcnt" => Some(zero.clone()),
-            _ => None,
+        let scan = Expr::Intrinsic {
+            op,
+            args: vec![value],
+            bits: width,
+        };
+        let result = match m {
+            "bsf" | "bsr" => {
+                let previous = self.snapshot(dst, stmts);
+                Expr::Select {
+                    cond: Box::new(zero.clone()),
+                    yes: Box::new(previous),
+                    no: Box::new(scan),
+                }
+            }
+            _ => scan,
+        };
+        self.core.write(dst, result, stmts);
+        let (cf, zf) = match m {
+            "tzcnt" | "lzcnt" => (Some(zero.clone()), Some(zero)),
+            _ => (None, None),
         };
         self.core.update_flags(FlagState {
             cf,
-            zf: Some(zero),
+            zf,
             sf: None,
             of: None,
             pf: None,
@@ -1612,29 +1949,76 @@ impl<'a> Lifter<'a> {
             return;
         };
         let width = dst.size();
-        let value = self.core.read(dst, stmts);
-        let index = self.core.read(index, stmts);
-        // The bit is the one the index names, counted from the low end.
-        let shifted = Expr::Bin {
-            op: BinOp::Shr,
-            lhs: Box::new(value.clone()),
-            rhs: Box::new(index.clone()),
-            bits: width,
+        // The two forms count bits differently. A register is a bit field and
+        // the index is taken modulo the width of the field, so bit 64 of a
+        // 64-bit register is bit zero again. Memory is a bit string: the index
+        // is a signed offset added to the address in bytes, and its low three
+        // bits pick the bit inside the byte that lands there.
+        //
+        // `btc rax, rax` also reads the same register twice and then writes it,
+        // so both reads are named before the write. Without that the carry
+        // reports the bit of the value the instruction just produced.
+        let (value, position, target) = if let Operand::Mem { .. } = dst {
+            let base = self.core.addr_of(dst, stmts);
+            let index = self.snapshot(index, stmts);
+            let target = Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(base),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Sar,
+                    lhs: Box::new(index.clone()),
+                    rhs: Box::new(Expr::Const(3)),
+                    bits: 8,
+                }),
+                bits: 8,
+            };
+            let value = self.name(
+                Expr::Load {
+                    addr: Box::new(target.clone()),
+                    size: 1,
+                    signed: false,
+                },
+                stmts,
+            );
+            let position = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(index),
+                rhs: Box::new(Expr::Const(7)),
+                bits: 8,
+            };
+            (value, position, Some(target))
+        } else {
+            let value = self.snapshot(dst, stmts);
+            let index = self.snapshot(index, stmts);
+            let position = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(index),
+                rhs: Box::new(Expr::Const(u64::from(width) * 8 - 1)),
+                bits: width,
+            };
+            (value, position, None)
         };
+        let unit = if target.is_some() { 1 } else { width };
+        // The bit is the one the position names, counted from the low end.
         let bit = Expr::Bin {
             op: BinOp::And,
-            lhs: Box::new(shifted),
+            lhs: Box::new(Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(value.clone()),
+                rhs: Box::new(position.clone()),
+                bits: unit,
+            }),
             rhs: Box::new(Expr::Const(1)),
-            bits: width,
+            bits: unit,
         };
-        // The carry flag holds the bit as it was, so the branch that reads
-        // it asks whether the bit was set. The other flags are left alone.
+        // The carry flag holds the bit as it was, so the branch that reads it
+        // asks whether the bit was set. The other flags are left alone.
         self.core.update_flags(FlagState {
             cf: Some(Expr::Cond {
                 op: CondOp::Ne,
                 lhs: Box::new(bit),
                 rhs: Box::new(Expr::Const(0)),
-                bits: width,
+                bits: unit,
             }),
             zf: None,
             sf: None,
@@ -1647,15 +2031,15 @@ impl<'a> Lifter<'a> {
         let one = Expr::Bin {
             op: BinOp::Shl,
             lhs: Box::new(Expr::Const(1)),
-            rhs: Box::new(index),
-            bits: width,
+            rhs: Box::new(position),
+            bits: unit,
         };
         let updated = match m {
             "bts" => Expr::Bin {
                 op: BinOp::Or,
                 lhs: Box::new(value),
                 rhs: Box::new(one),
-                bits: width,
+                bits: unit,
             },
             "btr" => Expr::Bin {
                 op: BinOp::And,
@@ -1663,18 +2047,26 @@ impl<'a> Lifter<'a> {
                 rhs: Box::new(Expr::Un {
                     op: UnOp::Not,
                     arg: Box::new(one),
-                    bits: width,
+                    bits: unit,
                 }),
-                bits: width,
+                bits: unit,
             },
             _ => Expr::Bin {
                 op: BinOp::Xor,
                 lhs: Box::new(value),
                 rhs: Box::new(one),
-                bits: width,
+                bits: unit,
             },
         };
-        self.core.write(dst, updated, stmts);
+        match target {
+            // The bit string form writes the byte the bit landed in.
+            Some(addr) => stmts.push(Stmt::Store {
+                addr,
+                value: updated,
+                size: 1,
+            }),
+            None => self.core.write(dst, updated, stmts),
+        }
     }
 
     /// `div`/`idiv`: divide the two-word dividend by an operand.
@@ -1685,13 +2077,19 @@ impl<'a> Lifter<'a> {
     fn lift_div(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let Some(src) = ops.first() else { return };
         let width = src.size();
-        // The dividend is the high word followed by the low one, each at
-        // the width the instruction works on.
-        let high = self
-            .core
-            .read(&Operand::Reg(Reg::view(2, width, 0)), stmts);
-        let low = self.core.read(&Operand::Reg(Reg::view(0, width, 0)), stmts);
-        let divisor = self.core.read(src, stmts);
+        // The dividend is the high word followed by the low one, each at the
+        // width the instruction works on. All three reads are named before the
+        // writes: the divisor can be the accumulator the quotient is about to
+        // land in, and then the remainder would divide the quotient by itself.
+        // A byte division takes its dividend from `ax`, so the high half is
+        // `ah`, not `dl`: the pair lives inside the accumulator.
+        let high = if width == 1 {
+            self.snapshot(&Operand::Reg(Reg::view(0, 1, 8)), stmts)
+        } else {
+            self.snapshot(&Operand::Reg(Reg::view(2, width, 0)), stmts)
+        };
+        let low = self.snapshot(&Operand::Reg(Reg::view(0, width, 0)), stmts);
+        let divisor = self.snapshot(src, stmts);
         let signed = m == "idiv";
         let quotient = Expr::Intrinsic {
             op: if signed {
@@ -1713,8 +2111,16 @@ impl<'a> Lifter<'a> {
         };
         self.core
             .write(&Operand::Reg(Reg::view(0, width, 0)), quotient, stmts);
+        // A byte division is the one that does not use the high half of the
+        // accumulator pair: the quotient goes to `al` and the remainder to
+        // `ah`, both inside `rax`, and `rdx` is not involved at all.
+        let rest = if width == 1 {
+            Reg::view(0, 1, 8)
+        } else {
+            Reg::view(2, width, 0)
+        };
         self.core
-            .write(&Operand::Reg(Reg::view(2, width, 0)), remainder, stmts);
+            .write(&Operand::Reg(rest), remainder, stmts);
         // A division leaves every flag undefined.
         self.core.pending_cmp = Some(super::PendingCmp::with_flags(
             Expr::Const(0),
@@ -3085,22 +3491,25 @@ impl<'a> Lifter<'a> {
         match m {
             "xadd" => {
                 let width = dst.size();
-                let old = self.core.read(dst, stmts);
-                let addend = self.core.read(src, stmts);
-                // The old value is needed twice: in the sum that goes back
-                // into memory and in the source register. Reading it twice
-                // would read it after the store, which is the new value.
-                let held = self.new_temp_named("old_");
-                self.core.assign(&held, old, stmts);
+                // Both values are named before either write. The old value is
+                // needed twice -- in the sum and in the source register -- and
+                // the addend is needed once, but `xadd al, cl` writes `cl` with
+                // the old `al` before it computes the sum, so reading the
+                // addend after the first write adds the wrong register.
+                let held = self.snapshot(dst, stmts);
+                let addend = self.snapshot(src, stmts);
                 let sum = Expr::Bin {
                     op: BinOp::Add,
-                    lhs: Box::new(Expr::var(held.clone())),
+                    lhs: Box::new(held.clone()),
                     rhs: Box::new(addend),
                     bits: width,
                 };
+                // The old value goes back to the source register, and that
+                // write comes first: `xadd al, al` names one register twice,
+                // the processor ends with the sum in it, and writing the
+                // source last would leave the value it started with.
+                self.core.write(src, held, stmts);
                 self.core.write(dst, sum, stmts);
-                // The old value goes back to the source register.
-                self.core.write(src, Expr::var(held), stmts);
                 self.core.notes.push((
                     Addr::NULL,
                     "xadd: an atomic read-modify-write; no other thread sees the half state"
@@ -3119,36 +3528,48 @@ impl<'a> Lifter<'a> {
                 // The comparison is against the accumulator, which is the
                 // register the instruction's width selects.
                 let accumulator = Operand::Reg(Reg::view(0, width, 0));
-                let held = self.core.read(&accumulator, stmts);
+                // Named like the destination: the accumulator is written
+                // before the exchange, and a condition that read it live would
+                // compare the destination against the value the exchange just
+                // put there -- equal every time, and the exchange always taken.
+                let held = self.snapshot(&accumulator, stmts);
                 let same = Expr::Cond {
                     op: CondOp::Eq,
                     lhs: Box::new(Expr::var(held_memory.clone())),
                     rhs: Box::new(held.clone()),
                     bits: width,
                 };
+                // The flags are the ones `cmp` would leave, and `cmp`
+                // subtracts the destination from the accumulator.
                 self.core.pending_cmp = Some(super::PendingCmp::int(
-                    Expr::var(held_memory.clone()),
                     held.clone(),
+                    Expr::var(held_memory.clone()),
                     width,
                 ));
-                let wanted = self.core.read(src, stmts);
-                // The exchange happens only when the two are equal; the
-                // accumulator takes the old value when they are not.
+                let wanted = self.snapshot(src, stmts);
+                // Equal: the destination takes the source and the accumulator
+                // keeps what it had. Not equal: the accumulator takes the
+                // destination's old value and the destination is untouched.
+                //
+                // The accumulator is written first. `cmpxchg al, cl` names the
+                // accumulator as the destination too, and writing it last left
+                // the old value there instead of the source the exchange had
+                // just stored.
                 self.core.write(
-                    dst,
+                    &accumulator,
                     Expr::Select {
                         cond: Box::new(same.clone()),
-                        yes: Box::new(wanted),
+                        yes: Box::new(held),
                         no: Box::new(Expr::var(held_memory.clone())),
                     },
                     stmts,
                 );
                 self.core.write(
-                    &accumulator,
+                    dst,
                     Expr::Select {
                         cond: Box::new(same),
-                        yes: Box::new(Expr::var(held_memory)),
-                        no: Box::new(held),
+                        yes: Box::new(wanted),
+                        no: Box::new(Expr::var(held_memory)),
                     },
                     stmts,
                 );
@@ -3358,10 +3779,22 @@ impl super::Lifter for Lifter<'_> {
                     Some(p) => self.core.take_condition(&p),
                     None => Expr::Unknown("condition".into()),
                 });
-            } else if matches!(insn.flow, FlowKind::UnconditionalBranch)
-                && insn.target.is_none()
+            } else if matches!(insn.flow, FlowKind::IndirectBranch)
+                || (matches!(insn.flow, FlowKind::UnconditionalBranch)
+                    && insn.target.is_none())
             {
-                out.indirect = Some(Expr::Unknown("indirect target".into()));
+                // The operand is the whole point: `jmp *rax` and
+                // `jmp *(%rdx,%rax,8)` both leave through a value the block
+                // computed, and reading that value is what shows the table
+                // behind a switch the recovery did not name.
+                let target = match self.core.target.parse(&insn.text) {
+                    Some(parsed) => match parsed.ops.first() {
+                        Some(op) => self.core.read(op, &mut out.stmts),
+                        None => Expr::Unknown("indirect target".into()),
+                    },
+                    None => Expr::Unknown("indirect target".into()),
+                };
+                out.indirect = Some(target);
             }
         }
         out
@@ -3690,9 +4123,11 @@ mod tests {
         // The carry says the sum did not fit, and the sum did not fit
         // when the result is smaller than the value that was there
         // before.
+        // The source is named first, so the destination's old value is the
+        // second temporary: `add al, al` needs both to survive the write.
         assert_eq!(
             branch_of(&["add edi, esi", "jb 0x40"]),
-            "carry((u32)rdi, old_1)"
+            "carry((u32)rdi, old_2)"
         );
     }
 
@@ -3701,7 +4136,7 @@ mod tests {
         // The borrow says the minuend was smaller than the subtrahend.
         assert_eq!(
             branch_of(&["sub edi, esi", "jb 0x40"]),
-            "borrow(old_1, (u32)rsi)"
+            "borrow(old_2, old_1)"
         );
     }
 

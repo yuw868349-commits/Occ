@@ -34,9 +34,11 @@ impl Cfg {
                 Term::Jump(t) => vec![*t],
                 Term::Branch {
                     then_bb, else_bb, ..
-                } => vec![*then_bb, *else_bb],
+                } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
                 Term::Switch { targets, .. } => targets.clone(),
-                Term::Ret(_) | Term::Unreachable => Vec::new(),
+                // A computed jump has no edge the pass can follow, so it has
+                // no successor: its target is a value, not a block.
+                Term::Ret(_) | Term::Unreachable | Term::Indirect { .. } => Vec::new(),
             };
             for &s in &out {
                 if s < n && !succs[i].contains(&s) {
@@ -169,7 +171,9 @@ impl Builder<'_> {
     fn succs(&self, b: BlockId) -> Vec<BlockId> {
         match &self.blocks[b].term {
             crate::ir::Term::Jump(t) => vec![*t],
-            crate::ir::Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+            crate::ir::Term::Branch { then_bb, else_bb, .. } => {
+                then_bb.iter().chain(else_bb.iter()).copied().collect()
+            }
             crate::ir::Term::Switch { targets, .. } => targets.clone(),
             _ => Vec::new(),
         }
@@ -238,9 +242,17 @@ impl Builder<'_> {
             crate::ir::Term::Ret(Some(value)) => {
                 crate::ir::Term::Ret(Some(self.rewrite(&value, b)))
             }
-            crate::ir::Term::Switch { index, targets } => crate::ir::Term::Switch {
+            crate::ir::Term::Switch {
+                index,
+                targets,
+                first_case,
+            } => crate::ir::Term::Switch {
                 index: self.rewrite(&index, b),
                 targets,
+                first_case,
+            },
+            crate::ir::Term::Indirect { target } => crate::ir::Term::Indirect {
+                target: self.rewrite(&target, b),
             },
             other => other,
         };
@@ -545,6 +557,7 @@ fn apply_subst(blocks: &mut [Block], subst: &HashMap<String, Expr>) {
             Term::Branch { cond, .. } => *cond = cond.substitute(subst),
             Term::Switch { index, .. } => *index = index.substitute(subst),
             Term::Ret(Some(v)) => *v = v.substitute(subst),
+            Term::Indirect { target } => *target = target.substitute(subst),
             _ => {}
         }
     }
@@ -633,6 +646,7 @@ fn term_reads(term: &Term, names: &[String]) -> bool {
         Term::Branch { cond, .. } => cond.vars(&mut used),
         Term::Switch { index, .. } => index.vars(&mut used),
         Term::Ret(Some(v)) => v.vars(&mut used),
+        Term::Indirect { target } => target.vars(&mut used),
         _ => return false,
     }
     used.iter().any(|u| names.contains(u))
@@ -673,6 +687,12 @@ fn use_counts(blocks: &[Block]) -> HashMap<String, u32> {
         if let crate::ir::Term::Ret(Some(v)) = &b.term {
             bump(v, &mut counts);
         }
+        // The address a computed jump reads is a use like any other: without
+        // it, every definition feeding the jump looks dead and the dispatch
+        // block renders empty.
+        if let crate::ir::Term::Indirect { target } = &b.term {
+            bump(target, &mut counts);
+        }
     }
     counts
 }
@@ -694,6 +714,7 @@ fn definition_counts(blocks: &[Block]) -> HashMap<String, u32> {
 ///
 /// Both passes are repeated until nothing changes: removing a dead assignment
 /// can turn another into a copy, and folding a copy can make a third dead.
+///
 pub fn cleanup(blocks: &mut [Block], opaque: &HashSet<String>) {
     for _ in 0..8 {
         let changed = propagate_copies(blocks, opaque);
@@ -786,6 +807,13 @@ fn propagate_constants(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                     changed = true;
                 }
             }
+            Term::Indirect { target } => {
+                let n = target.substitute(&consts).simplify();
+                if n != *target {
+                    *target = n;
+                    changed = true;
+                }
+            }
             _ => {}
         }
     }
@@ -862,6 +890,13 @@ fn propagate_copies(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                     changed = true;
                 }
             }
+            Term::Indirect { target } => {
+                let n = target.substitute(&subst);
+                if n != *target {
+                    *target = n;
+                    changed = true;
+                }
+            }
             Term::Switch { index, .. } => {
                 let n = index.substitute(&subst);
                 if n != *index {
@@ -914,11 +949,19 @@ pub fn fold_tail_copies(blocks: &mut [Block], opaque: &HashSet<String>) -> bool 
         let mut new_term = None;
         match &b.term {
             Term::Ret(Some(v)) => new_term = replace(v).map(|e| Term::Ret(Some(e))),
-            Term::Switch { index, targets } => {
+            Term::Indirect { target } => {
+                new_term = replace(target).map(|t| Term::Indirect { target: t });
+            }
+            Term::Switch {
+                index,
+                targets,
+                first_case,
+            } => {
                 if let Some(i) = replace(index) {
                     new_term = Some(Term::Switch {
                         index: i,
                         targets: targets.clone(),
+                        first_case: *first_case,
                     });
                 }
             }
@@ -1027,6 +1070,7 @@ pub fn coalesce(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                 Term::Branch { cond, .. } => cond.vars(&mut tail),
                 Term::Switch { index, .. } => index.vars(&mut tail),
                 Term::Ret(Some(v)) => v.vars(&mut tail),
+                Term::Indirect { target } => target.vars(&mut tail),
                 _ => {}
             }
             here += tail.iter().filter(|u| **u == src).count() as u32;
@@ -1061,6 +1105,7 @@ pub fn coalesce(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                 Term::Branch { cond, .. } => *cond = cond.substitute(&map),
                 Term::Switch { index, .. } => *index = index.substitute(&map),
                 Term::Ret(Some(v)) => *v = v.substitute(&map),
+                Term::Indirect { target } => *target = target.substitute(&map),
                 _ => {}
             }
             block.stmts.remove(idx);

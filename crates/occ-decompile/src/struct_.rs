@@ -67,7 +67,9 @@ impl Graph {
 fn successors(b: &Block) -> Vec<BlockId> {
     match &b.term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Term::Branch { then_bb, else_bb, .. } => {
+            then_bb.iter().chain(else_bb.iter()).copied().collect()
+        }
         Term::Switch { targets, .. } => targets.clone(),
         _ => Vec::new(),
     }
@@ -356,6 +358,10 @@ impl<'a> Structurer<'a> {
                     break;
                 }
                 Term::Unreachable => break,
+                Term::Indirect { target } => {
+                    nodes.push(Node::ComputedGoto(target));
+                    break;
+                }
                 Term::Jump(t) => {
                     if ctx.loop_header == Some(t) && ctx.stop != Some(t) {
                         nodes.push(Node::Continue);
@@ -377,8 +383,12 @@ impl<'a> Structurer<'a> {
                 } => {
                     cur = self.branch(b, cond, then_bb, else_bb, ctx, &mut nodes);
                 }
-                Term::Switch { index, targets } => {
-                    let (node, join) = self.switch(index, &targets, ctx);
+                Term::Switch {
+                    index,
+                    targets,
+                    first_case,
+                } => {
+                    let (node, join) = self.switch(index, &targets, first_case, ctx);
                     nodes.push(node);
                     cur = join;
                 }
@@ -398,6 +408,7 @@ impl<'a> Structurer<'a> {
         &mut self,
         index: Expr,
         targets: &[BlockId],
+        first_case: Option<i64>,
         ctx: &Region,
     ) -> (Node, Option<BlockId>) {
         let join = common_successor(self.blocks, targets);
@@ -409,7 +420,14 @@ impl<'a> Structurer<'a> {
         let mut cases = Vec::with_capacity(targets.len());
         for (i, t) in targets.iter().enumerate() {
             let body = self.region(*t, &inner);
-            cases.push((i as u64, body));
+            // The table holds positions, and the case value of a position is
+            // the position plus whatever the compiler took off the index
+            // before it looked the table up.
+            let value = match first_case {
+                Some(first) => first.wrapping_add(i as i64),
+                None => i as i64,
+            };
+            cases.push((value as u64, body));
         }
         (
             Node::Switch {
@@ -453,8 +471,8 @@ impl<'a> Structurer<'a> {
                 then_bb,
                 else_bb,
             } => {
-                let then_in = body_blocks.contains(&then_bb);
-                let else_in = body_blocks.contains(&else_bb);
+                let then_in = then_bb.is_some_and(|b| body_blocks.contains(&b));
+                let else_in = else_bb.is_some_and(|b| body_blocks.contains(&b));
                 if then_in == else_in {
                     // Both edges stay inside, or both leave. Neither is a loop
                     // test this structurer can express; treat the header as a
@@ -465,9 +483,9 @@ impl<'a> Structurer<'a> {
                     return self.branch(header, cond, then_bb, else_bb, &inner, nodes);
                 }
                 let (body_entry, exit, body_cond) = if then_in {
-                    (then_bb, else_bb, cond)
+                    (then_bb.unwrap_or_default(), else_bb, cond)
                 } else {
-                    (else_bb, then_bb, negate(cond))
+                    (else_bb.unwrap_or_default(), then_bb, negate(cond))
                 };
                 if body_entry == header {
                     // The header branches to itself: the test runs after the
@@ -476,7 +494,7 @@ impl<'a> Structurer<'a> {
                         body: stmts,
                         cond: body_cond,
                     });
-                    return Some(exit);
+                    return exit;
                 }
                 let mut body = stmts;
                 body.extend(self.region(body_entry, &inner));
@@ -484,12 +502,16 @@ impl<'a> Structurer<'a> {
                     cond: body_cond,
                     body,
                 });
-                Some(exit)
+                exit
             }
-            Term::Switch { index, targets } => {
+            Term::Switch {
+                index,
+                targets,
+                first_case,
+            } => {
                 // A dispatch at the loop header: the cases are the body.
                 let mut body = stmts;
-                let (node, join) = self.switch(index, &targets, &inner);
+                let (node, join) = self.switch(index, &targets, first_case, &inner);
                 body.push(node);
                 nodes.extend(body);
                 join
@@ -521,11 +543,55 @@ impl<'a> Structurer<'a> {
         &mut self,
         b: BlockId,
         cond: Expr,
-        then_bb: BlockId,
-        else_bb: BlockId,
+        then_bb: Option<BlockId>,
+        else_bb: Option<BlockId>,
         ctx: &Region,
         nodes: &mut Vec<Node>,
     ) -> Option<BlockId> {
+        // A side that leaves the function has no block to walk into. The
+        // branch is still two-way, and the sides are not symmetric: the one
+        // that stays is where the code continues, the other one is a
+        // transfer out. Saying so is better than showing an arm that ends
+        // without a return, which reads as a value the code never produced.
+        let (then_bb, else_bb) = match (then_bb, else_bb) {
+            (Some(t), Some(f)) => (t, f),
+            (None, Some(f)) => {
+                let body = self.region(f, &Region {
+                    stop: ctx.stop,
+                    loop_header: ctx.loop_header,
+                    loop_exits: ctx.loop_exits.clone(),
+                });
+                nodes.push(Node::If {
+                    cond: negate(cond),
+                    then_body: body,
+                    else_body: vec![Node::Comment(
+                        "this path leaves the function".into(),
+                    )],
+                });
+                return None;
+            }
+            (Some(t), None) => {
+                let body = self.region(t, &Region {
+                    stop: ctx.stop,
+                    loop_header: ctx.loop_header,
+                    loop_exits: ctx.loop_exits.clone(),
+                });
+                nodes.push(Node::If {
+                    cond,
+                    then_body: body,
+                    else_body: vec![Node::Comment(
+                        "this path leaves the function".into(),
+                    )],
+                });
+                return None;
+            }
+            (None, None) => {
+                nodes.push(Node::Comment(
+                    "both sides of this branch leave the function".into(),
+                ));
+                return None;
+            }
+        };
         // Back edge through a conditional: `if (cond) continue;`.
         if let Some(h) = ctx.loop_header {
             let then_back = then_bb == h;

@@ -1018,6 +1018,10 @@ pub enum Intrinsic {
     Rol,
     /// Rotate right.
     Ror,
+    /// Rotate left through the carry, which joins the value as its top bit.
+    Rcl,
+    /// Rotate right through the carry, which joins the value as its top bit.
+    Rcr,
     /// Swap the bytes of a value.
     Bswap,
     /// Index of the lowest set bit.
@@ -1065,6 +1069,28 @@ pub enum Intrinsic {
     DivRem,
     /// The remainder of a two-word division, read as a signed number.
     IDivRem,
+    /// The low half of a double-width multiplication.
+    MulLo,
+    /// The high half of a double-width multiplication.
+    ///
+    /// A one-operand `mul` produces twice the operand width, and the upper
+    /// half is the whole point of the instruction: it is what tells the reader
+    /// whether the product fitted. Keeping only the low half and calling it
+    /// the product is a semantic error that shows up as a wrong `rax` for
+    /// every operand pair large enough to carry.
+    MulHi,
+    /// `a + b + c` at the stated width, where `c` is the incoming carry.
+    AdcSum,
+    /// Whether `a + b + c` carried out of the width.
+    AdcCarry,
+    /// `a - b - c` at the stated width, where `c` is the incoming borrow.
+    SbbDiff,
+    /// Whether `a - b - c` borrowed.
+    SbbBorrow,
+    /// The low half of the product of two signed numbers.
+    IMulLo,
+    /// The high half of the product of two signed numbers.
+    IMulHi,
 }
 
 impl Intrinsic {
@@ -1085,6 +1111,8 @@ impl Intrinsic {
         match self {
             Intrinsic::Rol => "rol",
             Intrinsic::Ror => "ror",
+            Intrinsic::Rcl => "rcl",
+            Intrinsic::Rcr => "rcr",
             Intrinsic::Bswap => "bswap",
             Intrinsic::Bsf => "bsf",
             Intrinsic::Bsr => "bsr",
@@ -1100,6 +1128,14 @@ impl Intrinsic {
             Intrinsic::IDiv => "idiv",
             Intrinsic::DivRem => "divrem",
             Intrinsic::IDivRem => "idivrem",
+            Intrinsic::MulLo => "mul_lo",
+            Intrinsic::MulHi => "mul_hi",
+            Intrinsic::IMulLo => "imul_lo",
+            Intrinsic::IMulHi => "imul_hi",
+            Intrinsic::AdcSum => "adc_sum",
+            Intrinsic::AdcCarry => "adc_carry",
+            Intrinsic::SbbDiff => "sbb_diff",
+            Intrinsic::SbbBorrow => "sbb_borrow",
         }
     }
 }
@@ -1690,6 +1726,32 @@ fn fold_intrinsic(op: Intrinsic, args: &[Expr], bits: u8) -> Option<u64> {
                 }
             }
         }
+        Intrinsic::Rcl | Intrinsic::Rcr => {
+            // The carry is a ninth bit on a byte, a seventeenth on a word,
+            // and so on: it joins the value at the top and comes back out of
+            // the bottom, so the count is taken modulo one more than the
+            // width.
+            let count = values.get(1).copied().unwrap_or(0) & 31;
+            let carry = values.get(2).copied().unwrap_or(0) & 1;
+            let span = limit as u32 + 1;
+            let n = (count as u32) % span;
+            if n == 0 {
+                value
+            } else if span >= 64 {
+                // A 64-bit rotate through the carry does not fit in a word;
+                // leave it to the interpreter rather than fold it wrong.
+                return None;
+            } else {
+                let all = (1u128 << span) - 1;
+                let wide = (u128::from(value) | (u128::from(carry) << limit)) & all;
+                let turned = if op == Intrinsic::Rcl {
+                    ((wide << n) | (wide >> (span - n))) & all
+                } else {
+                    ((wide >> n) | (wide << (span - n))) & all
+                };
+                (turned as u64) & mask(bits)
+            }
+        }
         Intrinsic::Bswap => {
             let bytes = value.to_le_bytes();
             let mut out = [0u8; 8];
@@ -1754,6 +1816,41 @@ fn fold_intrinsic(op: Intrinsic, args: &[Expr], bits: u8) -> Option<u64> {
             }
             mask_value
         }
+        Intrinsic::MulLo | Intrinsic::MulHi => {
+            let a = values.first().copied().unwrap_or(0) & mask(bits);
+            let b = values.get(1).copied().unwrap_or(0) & mask(bits);
+            let product = u128::from(a) * u128::from(b);
+            if op == Intrinsic::MulLo {
+                (product as u64) & mask(bits)
+            } else {
+                ((product >> (usize::from(bits) * 8)) as u64) & mask(bits)
+            }
+        }
+        Intrinsic::IMulLo | Intrinsic::IMulHi => {
+            // Signed, so the product of two negatives is positive and the high
+            // half is not the upper bits of an unsigned product.
+            let a = i128::from(signed_int(values.first().copied().unwrap_or(0), bits));
+            let b = i128::from(signed_int(values.get(1).copied().unwrap_or(0), bits));
+            let product = a.wrapping_mul(b);
+            if op == Intrinsic::IMulLo {
+                (product as u64) & mask(bits)
+            } else {
+                ((product >> (usize::from(bits) * 8)) as u64) & mask(bits)
+            }
+        }
+        Intrinsic::AdcSum | Intrinsic::AdcCarry | Intrinsic::SbbDiff | Intrinsic::SbbBorrow => {
+            let a = values.first().copied().unwrap_or(0) & mask(bits);
+            let b = values.get(1).copied().unwrap_or(0) & mask(bits);
+            let c = values.get(2).copied().unwrap_or(0) & 1;
+            match op {
+                Intrinsic::AdcSum => a.wrapping_add(b).wrapping_add(c) & mask(bits),
+                Intrinsic::AdcCarry => {
+                    u64::from(u128::from(a) + u128::from(b) + u128::from(c) > u128::from(mask(bits)))
+                }
+                Intrinsic::SbbDiff => a.wrapping_sub(b).wrapping_sub(c) & mask(bits),
+                _ => u64::from(u128::from(a) < u128::from(b) + u128::from(c)),
+            }
+        }
         Intrinsic::Div | Intrinsic::IDiv | Intrinsic::DivRem | Intrinsic::IDivRem => {
             let (Some(high), Some(low), Some(divisor)) = (
                 values.first().copied(),
@@ -1766,16 +1863,29 @@ fn fold_intrinsic(op: Intrinsic, args: &[Expr], bits: u8) -> Option<u64> {
                 // The machine faults; there is no result.
                 return None;
             }
-            let dividend = (u128::from(high) << 64) | u128::from(low);
-            let signed = op == Intrinsic::IDiv || op == Intrinsic::IDivRem;
+            // The pair is one number of twice the operand width, and the
+            // halves are shifted by that width, not by 64: a byte division
+            // divides a word, not a double word.
+            let span = u32::from(bits) * 2;
+            let dividend =
+                (u128::from(truncate(high, usize::from(bits))) << span) | u128::from(low);
             let wants_remainder = op == Intrinsic::DivRem || op == Intrinsic::IDivRem;
+            let signed = op == Intrinsic::IDiv || op == Intrinsic::IDivRem;
             if signed {
-                let dividend = dividend as i128;
-                let divisor = i128::from(divisor);
-                if wants_remainder {
-                    (dividend % divisor) as u64
+                // The sign of the dividend is the top bit of the pair, and the
+                // divisor is signed at the operand width.
+                let dividend = if span >= 128 {
+                    dividend as i128
+                } else if (dividend >> (span - 1)) & 1 == 1 {
+                    (dividend | (!0u128 << span)) as i128
                 } else {
-                    (dividend / divisor) as u64
+                    dividend as i128
+                };
+                let divisor = i128::from(signed_int(divisor, bits));
+                if wants_remainder {
+                    dividend.wrapping_rem(divisor) as u64
+                } else {
+                    dividend.wrapping_div(divisor) as u64
                 }
             } else if wants_remainder {
                 (dividend % u128::from(divisor)) as u64
@@ -2087,13 +2197,20 @@ pub enum Term {
     /// Falls into one block.
     Jump(BlockId),
     /// Two-way branch.
+    ///
+    /// A side is `None` when that path leaves the function: a compiler
+    /// puts the cold half of a branch in a separate chunk, and a branch
+    /// into it is a jump out of the function. Naming the other side
+    /// anyway is what keeps the fall-through: without it the block has no
+    /// successor, the next block loses its predecessor, and every value
+    /// the branch carried into it is undefined.
     Branch {
         /// Condition.
         cond: Expr,
         /// Taken when the condition holds.
-        then_bb: BlockId,
+        then_bb: Option<BlockId>,
         /// Taken otherwise.
-        else_bb: BlockId,
+        else_bb: Option<BlockId>,
     },
     /// Multi-way branch on `index`: case `i` goes to `targets[i]`.
     ///
@@ -2104,9 +2221,30 @@ pub enum Term {
         index: Expr,
         /// One target per case, in table order.
         targets: Vec<BlockId>,
+        /// The case value of the first entry, when the code said which one
+        /// it is.
+        ///
+        /// A compiler that sees `case 100..106` subtracts 100 from the index
+        /// before it looks anything up, so the table holds positions and the
+        /// cases are the positions plus 100. The subtraction is the only
+        /// statement that says so, and without it a switch renders its
+        /// cases numbered from zero whatever they were.
+        first_case: Option<i64>,
     },
     /// Function exit.
     Ret(Option<Expr>),
+    /// Computed jump whose target no recovered table explains.
+    ///
+    /// `target` is the address the jump reads, as an expression over the
+    /// registers the block computed: `goto *rax` carries `rax`, and
+    /// `goto *(%rdx,%rax,8)` carries the load. The edge itself is unknown —
+    /// which is why this has no successors — but the *value* is not, and a
+    /// client that reasons about values (a dispatch table, a switch the
+    /// syntactic resolver missed) needs it.
+    Indirect {
+        /// Address the jump goes to.
+        target: Expr,
+    },
     /// Control leaves in a way the lifter could not model.
     Unreachable,
 }
@@ -2222,6 +2360,8 @@ pub enum Node {
     Return(Option<Expr>),
     /// Unconditional jump to a label.
     Goto(String),
+    /// Unconditional jump to a computed address.
+    ComputedGoto(Expr),
     /// Label definition.
     Label(String),
     /// Break out of the innermost loop.

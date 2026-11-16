@@ -43,6 +43,13 @@ pub struct RecoverOptions {
     pub follow_calls: bool,
     /// Sweep executable bytes that no seed covered, using a prologue check.
     pub sweep_uncovered: bool,
+    /// Stop the sweep after examining this many bytes.
+    ///
+    /// The sweep is the one pass that walks a section one byte at a time, so
+    /// its cost is proportional to the sizes the container claims rather than
+    /// to the code that exists. A cap turns a hostile header from a hang into
+    /// a note.
+    pub max_sweep_bytes: usize,
 }
 
 impl Default for RecoverOptions {
@@ -52,6 +59,7 @@ impl Default for RecoverOptions {
             max_insns: 4_000_000,
             follow_calls: true,
             sweep_uncovered: true,
+            max_sweep_bytes: 64 * 1024 * 1024,
         }
     }
 }
@@ -1094,10 +1102,27 @@ fn sweep(
     notes: &mut Vec<String>,
 ) {
     let mut added = 0usize;
+    let mut budget = opts.max_sweep_bytes;
     for s in view.image().sections.iter().filter(|s| s.is_code() && s.file_size > 0) {
         let mut addr = s.addr;
-        let end = s.addr.add(s.size);
+        // Only bytes the file holds can be decoded. `size` is the virtual
+        // extent, which for `.bss`-like sections is larger than the file — and
+        // for a malformed header is whatever the header says. Walking that one
+        // byte at a time is a hang that looks like a slow analysis.
+        let end = s.addr.add(s.file_size.min(s.size));
         while addr.0 < end.0 {
+            if budget == 0 {
+                notes.push(format!(
+                    "sweep stopped after {} bytes; the sections claim more",
+                    opts.max_sweep_bytes
+                ));
+                return;
+            }
+            budget -= 1;
+            if view.bytes(addr, 1).is_none() {
+                // Nothing is mapped here, so nothing after it can be either.
+                break;
+            }
             if functions.len() >= opts.max_functions {
                 notes.push(format!("sweep stopped at {} functions", opts.max_functions));
                 return;

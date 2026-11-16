@@ -35,6 +35,7 @@
 #![deny(missing_docs)]
 
 pub mod maps;
+pub mod probe;
 pub mod report;
 pub mod run;
 pub mod syscall;

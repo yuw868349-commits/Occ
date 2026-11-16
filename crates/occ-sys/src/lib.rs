@@ -22,6 +22,7 @@ pub mod errno;
 pub mod mem;
 pub mod proc;
 pub mod ptrace;
+pub mod spawn;
 
 pub use errno::{SysError, errno};
 pub use mem::{Mapped, page_size};

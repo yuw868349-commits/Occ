@@ -57,6 +57,7 @@ fn function_at_entry(image: &Image, code: &[u8]) -> occ_core::Function {
             max_insns: 4096,
             follow_calls: false,
             sweep_uncovered: false,
+            ..RecoverOptions::default()
         },
     );
     rec.functions

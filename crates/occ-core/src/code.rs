@@ -228,6 +228,14 @@ pub struct JumpTable {
     /// Register holding the case index, when the table read named one. This is
     /// the discriminant a `switch` renders, not the value jumped to.
     pub index_reg: Option<String>,
+    /// The case value of the first entry, when the code said which one it is.
+    ///
+    /// A compiler that sees `case 100..106` subtracts 100 from the index
+    /// before it looks anything up, so the table holds positions and the
+    /// cases are the positions plus 100. The subtraction is the only
+    /// statement that says so, and without it a switch renders its cases
+    /// numbered from zero whatever they were.
+    pub first_case: Option<i64>,
     /// Case targets, in table order.
     pub targets: Vec<Addr>,
 }

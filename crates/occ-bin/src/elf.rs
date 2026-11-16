@@ -176,7 +176,17 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                 },
                 file_offset: if s.kind == SHT_NOBITS { 0 } else { s.offset },
                 size: s.size,
-                file_size: if s.kind == SHT_NOBITS { 0 } else { s.size },
+                // A section cannot hold more bytes than the file has after its
+                // offset. The header is untrusted input: taking `sh_size` at
+                // face value lets a 26 KB file claim a 77 GB `.text`, and every
+                // pass that walks a section byte by byte then runs for hours.
+                // `size` keeps the virtual extent because `.bss` legitimately
+                // exceeds the file; `file_size` is what can be read.
+                file_size: if s.kind == SHT_NOBITS {
+                    0
+                } else {
+                    s.size.min((data.len() as u64).saturating_sub(s.offset))
+                },
                 kind: classify_section(&name, s),
                 perm: perm_of(s),
                 name,

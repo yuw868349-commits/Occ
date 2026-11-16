@@ -153,6 +153,10 @@ impl Renderer {
             }
             Node::Return(None) => self.line("return;"),
             Node::Goto(l) => self.line(&format!("goto {l};")),
+            // A jump through a value has no label to name, and printing the
+            // value is the only honest thing left: the reader can see which
+            // register or cell the dispatch went through.
+            Node::ComputedGoto(e) => self.line(&format!("goto *({});", expr(e))),
             Node::Label(l) => {
                 self.indent = self.indent.saturating_sub(1);
                 self.line(&format!("{l}:"));

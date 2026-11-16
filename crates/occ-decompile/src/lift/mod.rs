@@ -966,11 +966,22 @@ impl<'a> Core<'a> {
     pub fn dest_value(&self, op: &Operand) -> Expr {
         match op {
             Operand::Reg(r) => {
-                let full = Expr::var(self.name(r.idx));
+                let mut full = Expr::var(self.name(r.idx));
                 let width = self.target.reg_width(r.idx);
+                // A high-byte register is a view at an offset, not at zero:
+                // `ah` is bits 8..16 of `rax`, and the offset is already a bit
+                // count.
+                if r.offset > 0 {
+                    full = Expr::Bin {
+                        op: BinOp::Shr,
+                        lhs: Box::new(full),
+                        rhs: Box::new(Expr::Const(u64::from(r.offset))),
+                        bits: 8,
+                    };
+                }
                 // A narrower view holds only part of the register, and a
                 // flag that reads the result reads that part.
-                if r.size >= width {
+                if r.size >= width && r.offset == 0 {
                     full
                 } else {
                     Expr::Cast {

@@ -21,6 +21,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod exec;
 pub mod ir;
 pub mod lift;
 pub mod render;
@@ -32,6 +33,7 @@ use std::collections::HashMap;
 use occ_core::{Addr, FlowKind, Function, Image};
 
 use ir::{Block, BlockId, Decompiled, Expr, Stmt, Term};
+use lift::Lifted;
 
 /// Options for one decompilation.
 #[derive(Clone, Debug)]
@@ -184,6 +186,25 @@ impl Program {
     }
 }
 
+/// The terminator of a computed jump: no edge, but a target value.
+fn indirect(lifted: &Lifted) -> Term {
+    Term::Indirect {
+        target: lifted
+            .indirect
+            .clone()
+            .unwrap_or_else(|| Expr::Unknown("indirect target".into())),
+    }
+}
+
+fn show(stage: &str, blocks: &[Block]) {
+    for b in blocks {
+        eprintln!("[{stage}] block {} {:#x} term={:?}", b.id, b.addr.0, b.term);
+        for s in &b.stmts {
+            eprintln!("[{stage}]    {s:?}");
+        }
+    }
+}
+
 /// Lift and normalise one function, without recovering control flow.
 pub fn build_program(
     image: &Image,
@@ -283,12 +304,19 @@ pub fn build_program(
                                     Some(reg) => Expr::var(reg.clone()),
                                     None => Expr::Unknown("switch index".into()),
                                 };
-                                Term::Switch { index, targets }
+                                Term::Switch {
+                                    index,
+                                    targets,
+                                    first_case: table.first_case,
+                                }
                             } else {
-                                Term::Unreachable
+                                indirect(&lifted)
                             }
                         }
-                        None => Term::Unreachable,
+                        // No table was recovered, but the jump still reads an
+                        // address, and that address is the one thing a later
+                        // pass can work with.
+                        None => indirect(&lifted),
                     }
                 }
                 FlowKind::ConditionalBranch => {
@@ -304,10 +332,26 @@ pub fn build_program(
                     match (then_bb, else_bb) {
                         (Some(t), Some(f)) => Term::Branch {
                             cond,
-                            then_bb: t,
-                            else_bb: f,
+                            then_bb: Some(t),
+                            else_bb: Some(f),
                         },
-                        _ => Term::Unreachable,
+                        // One side of the branch leaves the function: a
+                        // compiler puts the cold half of a branch in its own
+                        // chunk. The other side is still a successor, and
+                        // dropping it takes the fall-through with it. The
+                        // block after the branch then has no predecessor, and
+                        // every value the branch carried into it is undefined.
+                        (Some(t), None) => Term::Branch {
+                            cond,
+                            then_bb: Some(t),
+                            else_bb: None,
+                        },
+                        (None, Some(f)) => Term::Branch {
+                            cond,
+                            then_bb: None,
+                            else_bb: Some(f),
+                        },
+                        (None, None) => Term::Unreachable,
                     }
                 }
                 _ => match by_addr.get(&bb.end) {
@@ -323,6 +367,12 @@ pub fn build_program(
         stmts.append(&mut tail);
         if !opts.keep_comments {
             stmts.retain(|s| !matches!(s, Stmt::Comment(_)));
+        }
+        if std::env::var("OCC_DEBUG_LIFT").is_ok() {
+            eprintln!("lift {:#x} term={term:?}", bb.start.0);
+            for s in &stmts {
+                eprintln!("   {s:?}");
+            }
         }
         blocks.push(Block {
             id: i,
@@ -398,15 +448,34 @@ pub fn build_program(
         entry = id;
     }
     let order = cfg.rpo(entry);
+    let trace = std::env::var("OCC_DEBUG_LIFT").is_ok();
     notes.extend(ssa::build(&mut cfg.blocks, &cfg.preds, &order, entry));
+    if trace {
+        show("build", &cfg.blocks);
+    }
     // Trivial phis first: they carry no information, and folding them now keeps
     // the copy pass from chasing names that only exist because two paths
     // happened to agree.
     ssa::simplify_phis(&mut cfg.blocks);
+    if trace {
+        show("phis", &cfg.blocks);
+    }
     let opaque = ssa::eliminate_phis(&mut cfg.blocks, &cfg.preds);
+    if trace {
+        show("eliminate", &cfg.blocks);
+    }
     ssa::coalesce(&mut cfg.blocks, &opaque);
+    if trace {
+        show("coalesce", &cfg.blocks);
+    }
     ssa::cleanup(&mut cfg.blocks, &opaque);
+    if trace {
+        show("cleanup", &cfg.blocks);
+    }
     ssa::fold_tail_copies(&mut cfg.blocks, &opaque);
+    if trace {
+        show("tail", &cfg.blocks);
+    }
 
     if debug {
         for b in &cfg.blocks {
@@ -530,7 +599,9 @@ fn is_bare_return(b: &Block) -> bool {
 fn successors_of(b: &Block) -> Vec<BlockId> {
     match &b.term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Term::Branch { then_bb, else_bb, .. } => {
+            then_bb.iter().chain(else_bb.iter()).copied().collect()
+        }
         // Every case of a switch is a successor: leaving them out of the
         // graph makes the phi placement and the rename pass treat the case
         // bodies as unreachable from the dispatch.
@@ -543,11 +614,11 @@ fn redirect(term: &mut Term, from: BlockId, to: BlockId) {
     match term {
         Term::Jump(t) if *t == from => *t = to,
         Term::Branch { then_bb, else_bb, .. } => {
-            if *then_bb == from {
-                *then_bb = to;
+            if then_bb == &Some(from) {
+                *then_bb = Some(to);
             }
-            if *else_bb == from {
-                *else_bb = to;
+            if else_bb == &Some(from) {
+                *else_bb = Some(to);
             }
         }
         Term::Switch { targets, .. } => {
@@ -698,8 +769,8 @@ mod tests {
                 stmts: Vec::new(),
                 term: Term::Branch {
                     cond: Expr::Var("c".into()),
-                    then_bb: 1,
-                    else_bb: 2,
+                    then_bb: Some(1),
+                    else_bb: Some(2),
                 },
             },
             Block {
@@ -737,7 +808,9 @@ mod tests {
         for b in &blocks {
             let out: Vec<usize> = match &b.term {
                 Term::Jump(t) => vec![*t],
-                Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+                Term::Branch { then_bb, else_bb, .. } => {
+            then_bb.iter().chain(else_bb.iter()).copied().collect()
+        }
                 _ => Vec::new(),
             };
             for s in out {

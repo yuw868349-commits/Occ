@@ -325,12 +325,16 @@ impl Runner<'_> {
                     self.push(path);
                     return;
                 }
-                Term::Unreachable => {
+                // The symbolic executor walks the blocks the recovery found
+                // and has nowhere to go through a computed jump.
+                Term::Unreachable | Term::Indirect { .. } => {
                     self.finish(state, Outcome::Unreachable);
                     return;
                 }
                 Term::Jump(target) => state.block = *target,
-                Term::Switch { index, targets } => {
+                Term::Switch {
+                    index, targets, ..
+                } => {
                     // A dispatch: a known index picks one case, an unknown one
                     // makes every case a possible path.
                     let value = self.eval(index, &mut state);
@@ -394,31 +398,68 @@ impl Runner<'_> {
                         return;
                     }
                     match value.truth() {
-                        Some(true) => state.block = *then_bb,
-                        Some(false) => state.block = *else_bb,
+                        Some(true) => match then_bb {
+                            Some(block) => state.block = *block,
+                            // The branch left the function on this side.
+                            None => {
+                                self.finish(state, Outcome::Unreachable);
+                                return;
+                            }
+                        },
+                        Some(false) => match else_bb {
+                            Some(block) => state.block = *block,
+                            None => {
+                                self.finish(state, Outcome::Unreachable);
+                                return;
+                            }
+                        },
                         None => {
-                            let mut other = state.clone();
-                            other.conds.push(Constraint {
-                                expr: cond.clone(),
-                                truth: false,
-                                at: addr,
-                            });
-                            other.block = *else_bb;
-                            state.conds.push(Constraint {
-                                expr: cond.clone(),
-                                truth: true,
-                                at: addr,
-                            });
-                            state.block = *then_bb;
-                            if self.budget == 0 {
-                                self.dropped += 1;
-                                self.note_once(
-                                    "state budget reached; further branches were not followed"
-                                        .into(),
-                                );
-                            } else {
-                                self.budget -= 1;
-                                work.push(other);
+                            // The condition is unknown, so both arms are
+                            // possible. An arm that leaves the function has
+                            // no block to continue in, so it is not
+                            // followed: the state that would have gone
+                            // there ends at the branch.
+                            let mut other = None;
+                            if let Some(block) = else_bb {
+                                let mut alt = state.clone();
+                                alt.conds.push(Constraint {
+                                    expr: cond.clone(),
+                                    truth: false,
+                                    at: addr,
+                                });
+                                alt.block = *block;
+                                other = Some(alt);
+                            }
+                            match then_bb {
+                                Some(block) => {
+                                    state.conds.push(Constraint {
+                                        expr: cond.clone(),
+                                        truth: true,
+                                        at: addr,
+                                    });
+                                    state.block = *block;
+                                    if let Some(alt) = other {
+                                        if self.budget == 0 {
+                                            self.dropped += 1;
+                                            self.note_once(
+                                                "state budget reached; further branches were not followed"
+                                                    .into(),
+                                            );
+                                        } else {
+                                            self.budget -= 1;
+                                            work.push(alt);
+                                        }
+                                    }
+                                }
+                                // The taken arm leaves the function: follow
+                                // the other one, and only that one.
+                                None => match other {
+                                    Some(alt) => state = alt,
+                                    None => {
+                                        self.finish(state, Outcome::Unreachable);
+                                        return;
+                                    }
+                                },
                             }
                         }
                     }

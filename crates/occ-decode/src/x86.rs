@@ -672,16 +672,25 @@ impl Decoder {
                 ))
             }
             0x63 => {
-                // movsxd r64, r/m32
+                // `movsxd r64, r/m32` with REX.W, and `movsxd r32, r/m32`
+                // without it. The second form is a plain 32-bit move that
+                // zero-extends, so printing a 64-bit destination for it
+                // promised a sign extension the processor never makes.
+                //
                 // `m.reg` already carries the REX.R extension; adding it again
                 // pushed the index past the end of the register table.
                 let m = self.modrm(p, Size::D, asz, b, i)?;
+                let destination = if p.rex & 0x08 != 0 {
+                    REG64[usize::from(m.reg & 15)]
+                } else {
+                    REG32[usize::from(m.reg & 15)]
+                };
                 Some((
                     "movsxd",
                     FlowKind::Next,
                     None,
                     vec![
-                        Operand::Reg(REG64[usize::from(m.reg & 15)]),
+                        Operand::Reg(destination),
                         // The source is r/m: using the register form here
                         // turned `movsxd rcx, dword ptr [rax]` into
                         // `movsxd rcx, ecx`.
@@ -1182,11 +1191,18 @@ impl Decoder {
             0xb0..=0xb7 => {
                 let r = ((op & 7) | p.rex_b()) as usize;
                 let v = self.imm(b, i, 1)?;
+                // Without a REX prefix the low three values name the high-byte
+                // registers: `B7 C0` is `mov bh, 0xc0`, not `mov dil, 0xc0`.
+                // With one they name the low bytes of rsp..rdi, which is why
+                // the table has two halves.
                 Some((
                     "mov",
                     FlowKind::Next,
                     None,
-                    vec![Operand::Reg(REG8[r]), Operand::Imm(v, Size::B)],
+                    vec![
+                        Operand::Reg(Size::B.regs(p.rex_present)[r]),
+                        Operand::Imm(v, Size::B),
+                    ],
                 ))
             }
             0xb8..=0xbf => {
@@ -1376,14 +1392,25 @@ impl Decoder {
                 // not in the instruction at all — that is an indirect call even
                 // though the opcode is the direct form.
                 let (flow, target) = match idx {
-                    2 | 4 if m.mode != 3 => (
-                        if idx == 2 {
-                            FlowKind::Call
+                    2 | 4 if m.mode != 3 => {
+                        let target = self.effective_target(&m);
+                        // `jmp *(%rdx,%rax,8)` names no address at all: it
+                        // reads one. Calling that a plain branch loses the
+                        // jump and the table behind it, and the register form
+                        // `jmp *rax` was already an indirect branch.
+                        if idx == 4 && target.is_none() {
+                            (FlowKind::IndirectBranch, None)
                         } else {
-                            FlowKind::UnconditionalBranch
-                        },
-                        self.effective_target(&m),
-                    ),
+                            (
+                                if idx == 2 {
+                                    FlowKind::Call
+                                } else {
+                                    FlowKind::UnconditionalBranch
+                                },
+                                target,
+                            )
+                        }
+                    }
                     2 | 3 => (FlowKind::IndirectCall, None),
                     4 | 5 => (FlowKind::IndirectBranch, None),
                     _ => (FlowKind::Next, None),
@@ -3565,6 +3592,24 @@ mod tests {
         assert_eq!(text(&[0x03, 0x45, 0xfc]), "add eax, dword ptr [rbp - 0x4]");
         // `2b 45 fc` is SUB r32, r/m32.
         assert_eq!(text(&[0x2b, 0x45, 0xfc]), "sub eax, dword ptr [rbp - 0x4]");
+    }
+
+    #[test]
+    fn a_jump_through_memory_is_an_indirect_branch() {
+        // `ff 24 c2` is JMP qword ptr [rdx + rax*8]: the instruction names
+        // no address, it reads one. Calling it a plain branch loses the
+        // jump and the table behind it.
+        let decoded = d64(&[0xff, 0x24, 0xc2]);
+        assert_eq!(decoded.insn.flow, FlowKind::IndirectBranch);
+        assert!(decoded.insn.target.is_none());
+        // The register form was already an indirect branch, and the two
+        // must agree: a compiler that emits one form and not the other
+        // would have its dispatch resolved half the time.
+        let register = d64(&[0xff, 0xe0]);
+        assert_eq!(register.insn.flow, FlowKind::IndirectBranch);
+        // A direct jump is still a direct jump.
+        let direct = d64(&[0xe9, 0x10, 0x00, 0x00, 0x00]);
+        assert_eq!(direct.insn.flow, FlowKind::UnconditionalBranch);
     }
 
     #[test]

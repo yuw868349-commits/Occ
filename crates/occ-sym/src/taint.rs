@@ -506,7 +506,9 @@ fn collect_into(e: &Expr, state: &Taint, out: &mut Labels) {
 fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Term::Branch { then_bb, else_bb, .. } => {
+            then_bb.iter().chain(else_bb.iter()).copied().collect()
+        }
         _ => Vec::new(),
     }
 }

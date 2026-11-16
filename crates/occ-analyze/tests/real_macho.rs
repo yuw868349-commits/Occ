@@ -74,6 +74,7 @@ fn the_object_recovers_a_function_with_instructions() {
             max_insns: 4096,
             follow_calls: false,
             sweep_uncovered: false,
+            ..RecoverOptions::default()
         },
     );
     let main = rec
