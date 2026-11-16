@@ -158,10 +158,29 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
     }
     let mut acc = vec![Acc::default(); functions.len()];
 
+    // Attribute an executed address to the function that actually holds it as
+    // an instruction.
+    //
+    // Finding the function by byte range is not the same thing: a range also
+    // covers alignment padding, a jump table emitted into `.text`, and — when
+    // recovery placed a boundary badly — the body of a nested function. Any of
+    // those counted as this function's instructions makes its covered count
+    // exceed the number of instructions it has, which is a contradiction the
+    // caller has no way to resolve. The tightest function wins, so a body
+    // recovered inside another one is credited to the inner one.
+    let mut owner: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut by_span: Vec<usize> = (0..functions.len()).collect();
+    by_span.sort_by_key(|&i| functions[i].end().0.saturating_sub(functions[i].entry.0));
+    for i in by_span {
+        for insn in &functions[i].insns {
+            owner.entry(insn.addr.0).or_insert(i);
+        }
+    }
+
     let mut orphans = Vec::new();
     for (&addr, &count) in &hits {
         let a = Addr(addr);
-        if let Some(i) = covering(functions, a) {
+        if let Some(&i) = owner.get(&addr) {
             acc[i].hits += u64::from(count);
             acc[i].distinct += 1;
             continue;

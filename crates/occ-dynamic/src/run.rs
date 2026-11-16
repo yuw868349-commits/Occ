@@ -65,6 +65,12 @@ static TRACE_LOCK: Mutex<()> = Mutex::new(());
 /// How far to run and what to record.
 #[derive(Clone, Debug)]
 pub struct RunConfig {
+    /// `argv[0]`: the name the program sees as its own.
+    ///
+    /// Executing the file does not require this to equal the path, and a
+    /// program that prints its usage or dispatches on its name reads this
+    /// value. `None` uses the path, which is what a shell does.
+    pub argv0: Option<String>,
     /// Arguments after the program name.
     pub args: Vec<String>,
     /// Environment entries to add or override.
@@ -86,6 +92,7 @@ pub struct RunConfig {
 impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
+            argv0: None,
             args: Vec::new(),
             env: Vec::new(),
             cwd: None,
@@ -283,6 +290,11 @@ pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
     }
 
     let mut cmd = Command::new(path);
+    if let Some(a0) = &cfg.argv0 {
+        // `Command::new` always execs `path`; `arg0` only changes what the
+        // tracee sees as `argv[0]`.
+        cmd.arg0(a0);
+    }
     cmd.args(&cfg.args);
     if let Some(cwd) = &cfg.cwd {
         cmd.current_dir(cwd);
@@ -446,7 +458,10 @@ pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
     Ok(Trace {
         path: path.display().to_string(),
         argv: {
-            let mut v = vec![path.display().to_string()];
+            let mut v = vec![cfg
+                .argv0
+                .clone()
+                .unwrap_or_else(|| path.display().to_string())];
             v.extend(cfg.args.iter().cloned());
             v
         },

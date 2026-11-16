@@ -79,6 +79,28 @@ impl EvidenceKind {
             EvidenceKind::Absence => "absence",
         }
     }
+
+    /// Inverse of [`EvidenceKind::label`].
+    ///
+    /// Returns `None` for a label this build does not know, so a reader can
+    /// reject a document instead of guessing at its meaning.
+    pub fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "bytes" => EvidenceKind::Bytes,
+            "cfg" => EvidenceKind::ControlFlow,
+            "table" => EvidenceKind::Table,
+            "symbol" => EvidenceKind::Symbol,
+            "string" => EvidenceKind::StringRef,
+            "import" => EvidenceKind::ImportCall,
+            "const" => EvidenceKind::Constant,
+            "entropy" => EvidenceKind::Entropy,
+            "xref" => EvidenceKind::CrossReference,
+            "trace" => EvidenceKind::DynamicTrace,
+            "format" => EvidenceKind::FormatMeta,
+            "absence" => EvidenceKind::Absence,
+            _ => return None,
+        })
+    }
 }
 
 /// Which analysis stage produced an observation.
@@ -112,6 +134,19 @@ impl EvidenceSource {
             EvidenceSource::Tracer => "trace",
             EvidenceSource::Heuristic => "heuristic",
         }
+    }
+
+    /// Inverse of [`EvidenceSource::label`].
+    pub fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "loader" => EvidenceSource::Loader,
+            "disasm" => EvidenceSource::Disassembler,
+            "dataflow" => EvidenceSource::DataFlow,
+            "scan" => EvidenceSource::Scanner,
+            "trace" => EvidenceSource::Tracer,
+            "heuristic" => EvidenceSource::Heuristic,
+            _ => return None,
+        })
     }
 }
 

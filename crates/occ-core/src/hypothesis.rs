@@ -28,6 +28,33 @@ pub enum HypothesisState {
     Inconclusive,
 }
 
+impl HypothesisState {
+    /// One-word label, as it appears on the wire and in a saved session.
+    pub const fn label(self) -> &'static str {
+        match self {
+            HypothesisState::Proposed => "proposed",
+            HypothesisState::Supported => "supported",
+            HypothesisState::Refuted => "refuted",
+            HypothesisState::Inconclusive => "inconclusive",
+        }
+    }
+
+    /// Inverse of [`HypothesisState::label`].
+    ///
+    /// The capitalised spelling is the `Debug` name, which earlier builds put
+    /// on the wire; it is accepted so a session written by one of those builds
+    /// still restores.
+    pub fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "proposed" | "Proposed" => HypothesisState::Proposed,
+            "supported" | "Supported" => HypothesisState::Supported,
+            "refuted" | "Refuted" => HypothesisState::Refuted,
+            "inconclusive" | "Inconclusive" => HypothesisState::Inconclusive,
+            _ => return None,
+        })
+    }
+}
+
 /// Outcome of a single check, reported back to the caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verdict {
@@ -70,6 +97,13 @@ pub struct Hypothesis {
     pub id: u64,
     /// What the hypothesis is about.
     pub handle: Handle,
+    /// Image the claim is about.
+    ///
+    /// An address alone does not identify a subject once more than one image is
+    /// open: `fn:0x401000` exists in every PIE image. Recording the image with
+    /// the claim keeps a later turn from resolving the same handle against a
+    /// different binary and reading the answer as continuation.
+    pub image: Option<u32>,
     /// The assertion, in the caller's own words.
     pub statement: String,
     /// Current standing.
@@ -86,10 +120,17 @@ pub struct Hypothesis {
 
 impl Hypothesis {
     /// File a new hypothesis.
-    pub fn new(id: u64, handle: Handle, statement: impl Into<String>, seq: u64) -> Self {
+    pub fn new(
+        id: u64,
+        handle: Handle,
+        image: Option<u32>,
+        statement: impl Into<String>,
+        seq: u64,
+    ) -> Self {
         Hypothesis {
             id,
             handle,
+            image,
             statement: statement.into(),
             state: HypothesisState::Proposed,
             evidence: Vec::new(),
@@ -174,6 +215,7 @@ mod tests {
         Hypothesis::new(
             1,
             Handle::function(crate::addr::Addr(0x4012a0)),
+            None,
             "decodes base64",
             0,
         )

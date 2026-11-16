@@ -301,7 +301,7 @@ static TOOLS: [ToolDef; 38] = [
     tool!(
         "trace.run",
         "Run the program under ptrace and record what it actually does: the instruction path, every call edge including indirect ones, syscalls with their path arguments, and signals. Compares the run against the recovered functions and reports which ones never ran, which executed addresses belong to no function, and where each indirect call went. Bounded by a step count and a wall clock; a cut run says so.",
-        r#"{"type":"object","properties":{"image":{"type":"integer"},"argv":{"type":"array","items":{"type":"string"},"description":"arguments after the program name"},"steps":{"type":"integer","description":"instruction budget, default 200000, max 2000000"},"millis":{"type":"integer","description":"wall clock budget, default 5000, max 60000"},"from_entry":{"type":"boolean","description":"start at the entry point (default true); false traces the dynamic loader as well"},"syscalls":{"type":"boolean","description":"record syscalls and the strings behind their path arguments (default true)"},"limit":{"type":"integer","description":"rows per list, default 16"}},"required":["image"],"additionalProperties":false}"#,
+        r#"{"type":"object","properties":{"image":{"type":"integer"},"argv":{"type":"array","items":{"type":"string"},"description":"full argv, argv[0] included; the first entry is the name the program sees as its own, and defaults to the image path"},"steps":{"type":"integer","description":"instruction budget, default 200000, max 2000000"},"millis":{"type":"integer","description":"wall clock budget, default 5000, max 60000"},"from_entry":{"type":"boolean","description":"start at the entry point (default true); false traces the dynamic loader as well"},"syscalls":{"type":"boolean","description":"record syscalls and the strings behind their path arguments (default true)"},"limit":{"type":"integer","description":"rows per list, default 16"}},"required":["image"],"additionalProperties":false}"#,
         trace_run
     ),
     tool!(
@@ -462,6 +462,7 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
             obj!(
                 "code_bytes" => Value::from(file.analysis.coverage.code_bytes),
                 "decoded_bytes" => Value::from(file.analysis.coverage.decoded_bytes),
+                "covered_bytes" => Value::from(file.analysis.coverage.covered_bytes),
                 "functions" => Value::from(file.analysis.coverage.functions),
                 "insns" => Value::from(file.analysis.coverage.insns),
                 "blocks" => Value::from(file.analysis.coverage.blocks),
@@ -470,7 +471,19 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
         )
         .field(
             "notes",
-            Value::Array(file.analysis.notes.iter().cloned().map(Value::String).collect()),
+            Value::Array(
+                file.analysis
+                    .notes
+                    .iter()
+                    .chain(file.image.warnings.iter())
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        )
+        .field(
+            "warnings",
+            Value::Array(file.image.warnings.iter().cloned().map(Value::String).collect()),
         )
         .field(
             "entry",
@@ -566,7 +579,7 @@ fn binary_sections(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
     let kind = args.opt_str("kind").map(|s| s.to_ascii_lowercase());
-    let (offset, limit) = args.page(200, 2000);
+    let (offset, limit) = args.page(200, 2000)?;
     let items: Vec<Value> = file
         .image
         .sections
@@ -597,7 +610,7 @@ fn binary_sections(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_imports(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let (offset, limit) = args.page(200, 2000);
+    let (offset, limit) = args.page(200, 2000)?;
     let items: Vec<Value> = file
         .image
         .imports
@@ -622,7 +635,7 @@ fn binary_imports(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_exports(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let (offset, limit) = args.page(200, 2000);
+    let (offset, limit) = args.page(200, 2000)?;
     let items: Vec<Value> = file
         .image
         .exports
@@ -647,8 +660,8 @@ fn binary_exports(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_symbols(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let defined_only = args.bool_or("defined_only", false);
-    let (offset, limit) = args.page(200, 2000);
+    let defined_only = args.bool_or("defined_only", false)?;
+    let (offset, limit) = args.page(200, 2000)?;
     let items: Vec<Value> = file
         .image
         .symbols
@@ -683,7 +696,7 @@ fn binary_symbols(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_relocations(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let (offset, limit) = args.page(200, 2000);
+    let (offset, limit) = args.page(200, 2000)?;
     let items: Vec<Value> = file
         .image
         .relocations
@@ -720,11 +733,11 @@ fn binary_relocations(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_strings(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let pattern = args.opt_str("pattern");
-    let min_len = args.u64_or("min_len", 0) as usize;
+    let min_len = args.u64_in("min_len", 0, 0, u64::MAX)? as usize;
     let section = args.opt_str("section");
     let encoding = args.opt_str("encoding");
-    let sort = args.opt_str("sort").unwrap_or("addr");
-    let (offset, limit) = args.page(100, 1000);
+    let sort = args.one_of("sort", "addr", &["addr", "length"])?;
+    let (offset, limit) = args.page(100, 1000)?;
     let mut hits: Vec<&occ_analyze::strings::Found> = file
         .analysis
         .strings
@@ -755,8 +768,8 @@ fn binary_strings(session: &Session, args: &Args) -> Result<Value, String> {
 fn binary_hexdump(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let at = args.req_addr("addr")?;
-    let len = args.u64_clamped("len", 256, 4096) as usize;
-    let width = args.u64_clamped("width", 16, 32) as usize;
+    let len = args.u64_in("len", 256, 1, 4096)? as usize;
+    let width = args.u64_in("width", 16, 1, 32)? as usize;
     let view = occ_analyze::view::View::new(&file.image, &file.data);
     let bytes = view
         .bytes(at, len)
@@ -777,7 +790,7 @@ fn binary_entropy(session: &Session, args: &Args) -> Result<Value, String> {
             .image
             .section_by_name(name)
             .ok_or_else(|| format!("no section named {name}"))?;
-        let window = args.u64_clamped("window", 256, 65536) as usize;
+        let window = args.u64_in("window", 256, 1, 65536)? as usize;
         let threshold = args.raw("threshold").and_then(|v| v.as_f64()).unwrap_or(7.2) as f32;
         let view = occ_analyze::view::View::new(&file.image, &file.data);
         let wins = occ_analyze::entropy::sliding(
@@ -864,9 +877,13 @@ fn binary_fingerprint(session: &Session, args: &Args) -> Result<Value, String> {
 fn code_functions(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let min_insns = args.u64_or("min_insns", 0) as usize;
-    let sort = args.opt_str("sort").unwrap_or("addr");
-    let (offset, limit) = args.page(100, 2000);
+    let min_insns = args.u64_in("min_insns", 0, 0, u64::MAX)? as usize;
+    let sort = args.one_of(
+        "sort",
+        "addr",
+        &["addr", "size", "insns", "complexity", "callers", "callees"],
+    )?;
+    let (offset, limit) = args.page(100, 2000)?;
     let mut items: Vec<&Function> = file
         .analysis
         .functions
@@ -924,8 +941,8 @@ fn code_function(session: &Session, args: &Args) -> Result<Value, String> {
     let t = handle_target(session, id, target)?;
     let f = function_of(&file, &t)
         .ok_or_else(|| format!("no function contains {target}"))?;
-    let depth = args.depth();
-    let include_body = args.bool_or("include_body", depth == Depth::Raw);
+    let depth = args.depth()?;
+    let include_body = args.bool_or("include_body", depth == Depth::Raw)?;
     let mut data = function_json(f, &file.analysis, depth, &file.image);
     if include_body
         && let Value::Object(m) = &mut data
@@ -969,8 +986,8 @@ fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
     let t = handle_target(session, id, target)?;
     let f = function_of(&file, &t).ok_or_else(|| format!("no function contains {target}"))?;
     let opts = occ_decompile::Options {
-        max_blocks: args.u64_clamped("max_blocks", 20_000, 200_000) as usize,
-        keep_comments: args.bool_or("comments", true),
+        max_blocks: args.u64_in("max_blocks", 20_000, 1, 200_000)? as usize,
+        keep_comments: args.bool_or("comments", true)?,
         keep_dead: false,
     };
     // Call targets are resolved through the recovered function table, so a call
@@ -1062,9 +1079,9 @@ fn code_explore(session: &Session, args: &Args) -> Result<Value, String> {
     };
     let mut cfg = occ_sym::ExecConfig {
         mode,
-        max_paths: args.u64_clamped("max_paths", 16, 200) as usize,
-        max_states: args.u64_clamped("max_states", 128, 4096) as usize,
-        max_loop: args.u64_clamped("unroll", 3, 64) as u16,
+        max_paths: args.u64_in("max_paths", 16, 1, 200)? as usize,
+        max_states: args.u64_in("max_states", 128, 1, 4096)? as usize,
+        max_loop: args.u64_in("unroll", 3, 1, 64)? as u16,
         ..occ_sym::ExecConfig::default()
     };
     // Inputs arrive as `{"rdi": 3, "rsi": "0x4000"}`; both forms are common in
@@ -1270,6 +1287,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
         calls: Vec::new(),
         branches: true,
         stores: false,
+        forwards: std::collections::HashMap::new(),
     };
     if let Some(value) = args.raw("sinks") {
         let list = value.as_array().ok_or("`sinks` must be an array")?;
@@ -1290,6 +1308,22 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
     }
 
     let analysis = &file.analysis;
+    // A call site in a stripped image names a `sub_` body. Recording what each
+    // body forwards to lets a name filter match the call that carries the
+    // argument to the library function it eventually reaches.
+    if !sinks.any_call && !sinks.calls.is_empty() {
+        sinks.forwards = callee_forwards(analysis);
+    }
+    let unmatched: Vec<String> = if sinks.any_call {
+        Vec::new()
+    } else {
+        sinks
+            .calls
+            .iter()
+            .filter(|wanted| !image_names_any(analysis, &file.image, wanted))
+            .cloned()
+            .collect()
+    };
     let name_of = |a: Addr| -> String {
         analysis
             .function_at(a)
@@ -1377,7 +1411,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
             report.iterations
         )
     };
-    Ok(Envelope::ok(summary)
+    let mut e = Envelope::ok(summary)
         .handle(Handle::function(f.entry).to_string())
         .field(
             "function",
@@ -1406,8 +1440,96 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
         .next(vec![
             "code.decompile for the statements the flow passes through".into(),
             "code.explore to see which inputs actually reach the branch".into(),
-        ])
-        .build())
+        ]);
+    if !unmatched.is_empty() {
+        // Saying "no flows" without saying why reads as a clean bill of health,
+        // and here the reason is that the filter cannot match anything.
+        e = e.caveats(vec![format!(
+            "no call site or forwarded name in this image matches {}; it has {} import(s) and {} named function(s), so a name filter has nothing to match. Drop `sinks` to report every call, or pass `sinks: [\"call\"]`",
+            unmatched
+                .iter()
+                .map(|w| format!("`{w}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            file.image.imports.len(),
+            analysis
+                .functions
+                .iter()
+                .filter(|f| f.name.is_some())
+                .count()
+        )]);
+    }
+    Ok(e.build())
+}
+
+/// What each recovered function forwards to.
+///
+/// The value is every name the body can reach in one call: its imports and the
+/// names of the functions it calls. A second pass folds in what those forward
+/// to, which covers the wrapper-a-call pattern (`main -> sub_x -> memcpy`).
+fn callee_forwards(
+    analysis: &occ_analyze::Analysis,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut out: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for f in &analysis.functions {
+        if f.insns.is_empty() {
+            continue;
+        }
+        let mut names: Vec<String> = f.import_calls.clone();
+        for callee in &f.callees {
+            if let Some(g) = analysis.function_at(*callee) {
+                let n = g.display_name();
+                if n != f.display_name() {
+                    names.push(n);
+                }
+            }
+        }
+        names.sort();
+        names.dedup();
+        if !names.is_empty() {
+            out.insert(f.display_name(), names);
+        }
+    }
+    let snapshot = out.clone();
+    for names in out.values_mut() {
+        let mut extra: Vec<String> = names
+            .iter()
+            .flat_map(|n| snapshot.get(n).cloned().unwrap_or_default())
+            .collect();
+        extra.sort();
+        extra.dedup();
+        names.extend(extra);
+        names.sort();
+        names.dedup();
+    }
+    out
+}
+
+/// True when `wanted` names anything the image can reach: an import, an
+/// exported name, a symbol, a recovered function, or a name one step behind a
+/// recovered function.
+fn image_names_any(
+    analysis: &occ_analyze::Analysis,
+    image: &occ_core::Image,
+    wanted: &str,
+) -> bool {
+    image
+        .imports
+        .iter()
+        .any(|i| i.name.contains(wanted))
+        || image
+        .exports
+        .iter()
+        .any(|e| e.name.contains(wanted))
+        || image.symbols.iter().any(|s| s.name.contains(wanted))
+        || analysis
+            .functions
+            .iter()
+            .any(|f| f.display_name().contains(wanted))
+        || callee_forwards(analysis)
+            .values()
+            .any(|names| names.iter().any(|n| n.contains(wanted)))
 }
 
 /// Parse one source label.
@@ -1445,7 +1567,7 @@ fn code_disasm(session: &Session, args: &Args) -> Result<Value, String> {
     let id = args.image(session)?;
     let file = args.file(session)?;
     let target = args.req_str("target")?;
-    let count = args.u64_clamped("count", 40, 2000) as usize;
+    let count = args.u64_in("count", 40, 1, 2000)? as usize;
     let t = handle_target(session, id, target)?;
     let start = match &t {
         Target::Function { entry, .. } => *entry,
@@ -1491,7 +1613,7 @@ fn code_blocks(session: &Session, args: &Args) -> Result<Value, String> {
     let target = args.req_str("target")?;
     let t = handle_target(session, id, target)?;
     let f = function_of(&file, &t).ok_or_else(|| format!("no function contains {target}"))?;
-    let include_body = args.bool_or("include_body", false);
+    let include_body = args.bool_or("include_body", false)?;
     let blocks: Vec<Value> = f
         .blocks
         .iter()
@@ -1582,7 +1704,7 @@ fn code_indirect(session: &Session, args: &Args) -> Result<Value, String> {
         }
     }
     let total = rows.len();
-    let (offset, limit) = args.page(50, 500);
+    let (offset, limit) = args.page(50, 500)?;
     let (page, truncated) = paginate(&rows, offset, limit);
     let stats = &report.stats;
     Ok(Envelope::ok(format!(
@@ -1624,7 +1746,7 @@ fn code_xrefs(session: &Session, args: &Args) -> Result<Value, String> {
     let target = args.req_str("target")?;
     let direction = args.opt_str("direction").unwrap_or("to");
     let kind = args.opt_str("kind");
-    let limit = args.u64_clamped("limit", 100, 2000) as usize;
+    let limit = args.u64_in("limit", 100, 1, 2000)? as usize;
     let t = handle_target(session, id, target)?;
     let at = match &t {
         Target::Function { entry, .. } => *entry,
@@ -1674,8 +1796,8 @@ fn code_callgraph(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let target = args.req_str("target")?;
     let direction = args.opt_str("direction").unwrap_or("callers");
-    let depth = args.u64_clamped("depth", 2, 4) as usize;
-    let max_nodes = args.u64_clamped("max_nodes", 200, 5000) as usize;
+    let depth = args.u64_in("depth", 2, 1, 4)? as usize;
+    let max_nodes = args.u64_in("max_nodes", 200, 1, 5000)? as usize;
     let t = handle_target(session, id, target)?;
     let root = match &t {
         Target::Function { entry, .. } => *entry,
@@ -1745,7 +1867,7 @@ fn code_search(session: &Session, args: &Args) -> Result<Value, String> {
     if mnemonic.is_none() && text.is_none() && value.is_none() {
         return Err("give at least one of: mnemonic, text, value".into());
     }
-    let limit = args.u64_clamped("limit", 50, 1000) as usize;
+    let limit = args.u64_in("limit", 50, 1, 1000)? as usize;
     let mut rows = Vec::new();
     'outer: for f in &file.analysis.functions {
         for i in &f.insns {
@@ -1791,15 +1913,29 @@ fn code_search(session: &Session, args: &Args) -> Result<Value, String> {
 fn hypothesis_create(session: &Session, args: &Args) -> Result<Value, String> {
     let target = args.req_str("target")?;
     let statement = args.req_str("statement")?;
-    let handle = if target.contains(':') {
-        Handle::parse(target).map_err(|e| e.to_string())?
+    // A claim needs a subject that stays the same subject. An address is not
+    // one: every PIE image has a `fn:0x401000`. The image is resolved here,
+    // where `args.image` already refuses to guess between open images, and
+    // recorded with the hypothesis.
+    let (handle, image) = if target.contains(':') {
+        let h = Handle::parse(target).map_err(|e| e.to_string())?;
+        let image = match h.kind() {
+            occ_core::HandleKind::Image => {
+                let id = h.value().parse::<u32>().map_err(|_| {
+                    format!("`target` is {target:?}; image handles carry a numeric id")
+                })?;
+                Some(id)
+            }
+            _ => Some(args.image(session)?),
+        };
+        (h, image)
     } else if let Some(addr) = occ_core::addr::parse_addr(target) {
-        Handle::function(addr)
+        (Handle::function(addr), Some(args.image(session)?))
     } else {
-        Handle::symbol(target)
+        (Handle::symbol(target), Some(args.image(session)?))
     };
     let hyp_id = session
-        .hypothesise(handle.clone(), statement)
+        .hypothesise(handle.clone(), image, statement)
         .map_err(|e| e.to_string())?;
     Ok(Envelope::ok(format!("hypothesis {hyp_id} recorded"))
         .handle(Handle::hypothesis(hyp_id).to_string())
@@ -1813,16 +1949,32 @@ fn hypothesis_create(session: &Session, args: &Args) -> Result<Value, String> {
 }
 
 fn hypothesis_evidence(session: &Session, args: &Args) -> Result<Value, String> {
-    let id = args.opt_u64("id").ok_or("`id` is required")?;
+    let id = args.opt_u64("id")?.ok_or("`id` is required")?;
     let detail = args.req_str("detail")?;
-    let support = args.bool_or("support", true);
-    let weight = args
-        .raw("weight")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.5)
-        .clamp(0.0, 1.0) as f32;
+    let support = args.bool_or("support", true)?;
+    // A weight outside the unit interval is not a weaker observation, it is a
+    // number in the wrong range: say so instead of clamping it into agreement.
+    let weight = match args.raw("weight") {
+        None => 0.5,
+        Some(v) => {
+            let w = v
+                .as_f64()
+                .ok_or_else(|| format!("`weight` must be a number, got {}", v.type_name()))?;
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!("`weight` must be between 0 and 1, got {w}"));
+            }
+            w as f32
+        }
+    };
     let at = args.opt_addr("at")?;
-    let kind = match args.opt_str("kind").unwrap_or("bytes") {
+    let kind = match args.one_of(
+        "kind",
+        "bytes",
+        &[
+            "bytes", "cfg", "table", "symbol", "string", "import", "const", "entropy", "xref",
+            "trace", "format", "absence",
+        ],
+    )? {
         "cfg" => EvidenceKind::ControlFlow,
         "table" => EvidenceKind::Table,
         "symbol" => EvidenceKind::Symbol,
@@ -1862,7 +2014,12 @@ fn hypothesis_list(session: &Session, _args: &Args) -> Result<Value, String> {
                     .map(|h| {
                         obj!(
                             "id" => Value::from(h.id),
-                            "handle" => h.handle.to_string(),
+                            // The hypothesis' own handle, not the handle of what
+                            // it is about: `hyp:3` is what the other tools take,
+                            // and printing `fn:0x4020` here gave the caller a
+                            // handle it could not use for the next call.
+                            "handle" => h.handle().to_string(),
+                            "target" => h.handle.to_string(),
                             "statement" => h.statement.clone(),
                             "verdict" => h.verdict().label(),
                             "confidence" => f64::from(h.confidence),
@@ -1880,13 +2037,13 @@ fn hypothesis_list(session: &Session, _args: &Args) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 fn diff_functions(session: &Session, args: &Args) -> Result<Value, String> {
-    let a_id = args.opt_u64("image_a").ok_or("`image_a` is required")? as u32;
-    let b_id = args.opt_u64("image_b").ok_or("`image_b` is required")? as u32;
+    let a_id = args.opt_u64("image_a")?.ok_or("`image_a` is required")? as u32;
+    let b_id = args.opt_u64("image_b")?.ok_or("`image_b` is required")? as u32;
     let fa = session.image(a_id).ok_or_else(|| format!("image {a_id} is not open"))?;
     let fb = session.image(b_id).ok_or_else(|| format!("image {b_id} is not open"))?;
     let d = diff::diff(&fa.analysis, &fb.analysis);
-    let only_changed = args.bool_or("only_changed", true);
-    let limit = args.u64_clamped("limit", 100, 2000) as usize;
+    let only_changed = args.bool_or("only_changed", true)?;
+    let limit = args.u64_in("limit", 100, 1, 2000)? as usize;
     let selected: Vec<&diff::Pair> = if only_changed {
         d.changed().into_iter().take(limit).collect()
     } else {
@@ -1948,10 +2105,13 @@ fn scan_pattern(session: &Session, args: &Args) -> Result<Value, String> {
             size: s.file_size,
         })
         .collect();
-    let limit = args.u64_clamped("limit", 100, 1000) as usize;
-    let mut hits = Vec::new();
-    // Scan each section separately so addresses are virtual and `in <section>`
-    // works without a second pass.
+    let limit = args.u64_in("limit", 100, 1, 1000)? as usize;
+
+    // One row per (rule, address). A rule whose string occurs five times in a
+    // section is five findings; the previous shape kept only the lowest
+    // address and reported one, so the caller could not tell a single hit from
+    // a sweep.
+    let mut rows: Vec<(String, String, Addr, Vec<String>)> = Vec::new();
     for s in &sections {
         let Some(bytes) = file
             .image
@@ -1964,25 +2124,73 @@ fn scan_pattern(session: &Session, args: &Args) -> Result<Value, String> {
             continue;
         };
         for m in pattern::scan(bytes, s.start, &rules, &sections) {
-            hits.push(obj!(
-                "rule" => m.rule,
-                "addr" => addr(m.addr),
-                "handle" => Handle::new(occ_core::HandleKind::Insn, m.addr.to_string()).to_string(),
-                "section" => s.name.clone(),
-                "strings" => Value::Array(m.matched.into_iter().map(Value::String).collect()),
-            ));
-            if hits.len() >= limit {
-                break;
+            for a in &m.addrs {
+                let ids: Vec<String> = m
+                    .strings
+                    .iter()
+                    .filter(|(_, at)| at.contains(a))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                rows.push((m.rule.clone(), s.name.clone(), *a, ids));
             }
         }
-        if hits.len() >= limit {
-            break;
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2 .0.cmp(&b.2 .0)));
+
+    let known_strings: std::collections::HashSet<u64> =
+        file.analysis.strings.iter().map(|s| s.addr.0).collect();
+    let total = rows.len();
+    let shown: Vec<Value> = rows
+        .iter()
+        .take(limit)
+        .map(|(rule, section, at, ids)| {
+            let mut m = occ_json::Map::new();
+            m.insert("rule", Value::String(rule.clone()));
+            m.insert("addr", addr(*at));
+            m.insert("section", Value::String(section.clone()));
+            m.insert(
+                "strings",
+                Value::Array(ids.iter().cloned().map(Value::String).collect()),
+            );
+            // A hit on a string the string pass recovered can be addressed by
+            // handle; a hit in anonymous bytes cannot, and inventing an
+            // instruction handle for data would resolve to the wrong thing.
+            if known_strings.contains(&at.0) {
+                m.insert(
+                    "handle",
+                    Value::String(Handle::new(occ_core::HandleKind::Str, at.0.to_string()).to_string()),
+                );
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let mut per_rule: Vec<(String, usize)> = Vec::new();
+    for (rule, _, _, _) in &rows {
+        match per_rule.iter_mut().find(|(name, _)| name == rule) {
+            Some((_, n)) => *n += 1,
+            None => per_rule.push((rule.clone(), 1)),
         }
     }
-    let e = Envelope::ok(format!("{} rule match(es) across {} rule(s)", hits.len(), rules.len()))
-        .field("matches", Value::Array(hits))
-        .field("rules", Value::from(rules.len()));
-    Ok(e.truncated(false).build())
+    let rule_rows: Vec<Value> = per_rule
+        .iter()
+        .map(|(name, n)| obj!("rule" => name.clone(), "matches" => Value::from(*n as u64)))
+        .collect();
+
+    let truncated = total > shown.len();
+    let e = Envelope::ok(format!(
+        "{total} match(es) across {} rule(s){}",
+        rules.len(),
+        if truncated {
+            format!("; showing the first {}", shown.len())
+        } else {
+            String::new()
+        }
+    ))
+    .field("matches", Value::Array(shown))
+    .field("rules", Value::Array(rule_rows))
+    .field("total", Value::from(total as u64));
+    Ok(e.truncated(truncated).build())
 }
 
 // ---------------------------------------------------------------------------
@@ -2131,8 +2339,8 @@ fn debug_functions(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let dw = dwarf_of(&file)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
-    let sort = args.opt_str("sort").unwrap_or("addr");
-    let (offset, limit) = args.page(200, 2000);
+    let sort = args.one_of("sort", "addr", &["addr", "size", "params", "name"])?;
+    let (offset, limit) = args.page(200, 2000)?;
     let mut funcs: Vec<&occ_dwarf::DwarfFunction> = dw
         .units
         .iter()
@@ -2223,8 +2431,8 @@ fn debug_types(session: &Session, args: &Args) -> Result<Value, String> {
     let dw = dwarf_of(&file)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
     let kind = args.opt_str("kind").map(|s| s.to_ascii_lowercase());
-    let include_members = args.bool_or("include_members", true);
-    let (offset, limit) = args.page(200, 2000);
+    let include_members = args.bool_or("include_members", true)?;
+    let (offset, limit) = args.page(200, 2000)?;
     let mut types: Vec<Value> = dw
         .types()
         .filter(|t| {
@@ -2510,15 +2718,24 @@ fn trace_run(session: &Session, args: &Args) -> Result<Value, String> {
             );
         }
     }
+    // `argv` is the whole vector, so its first element is the program name the
+    // tracee sees. Dropping it would run the file under its path and shift
+    // every argument by one.
+    let argv0 = if argv.is_empty() {
+        None
+    } else {
+        Some(argv.remove(0))
+    };
     let cfg = occ_dynamic::RunConfig {
+        argv0,
         args: argv,
-        max_steps: args.u64_clamped("steps", 200_000, 2_000_000),
-        max_millis: args.u64_clamped("millis", 5_000, 60_000),
-        from_entry: args.bool_or("from_entry", true),
-        trace_syscalls: args.bool_or("syscalls", true),
+        max_steps: args.u64_in("steps", 200_000, 1, 2_000_000)?,
+        max_millis: args.u64_in("millis", 5_000, 1, 60_000)?,
+        from_entry: args.bool_or("from_entry", true)?,
+        trace_syscalls: args.bool_or("syscalls", true)?,
         ..occ_dynamic::RunConfig::default()
     };
-    let (_, limit) = args.page(16, 128);
+    let (_, limit) = args.page(16, 128)?;
 
     let trace = occ_dynamic::run(path, &file.image, &cfg)
         .map_err(|e| format!("could not trace {}: {e}", file.image.path))?;
@@ -2644,7 +2861,7 @@ fn trace_get(session: &Session, args: &Args) -> Result<Value, String> {
     let (trace_id, record, file) = trace_record(session, args)?;
     let trace = &record.trace;
     let corr = occ_dynamic::correlate(trace, &file.image, &file.analysis);
-    let (_, limit) = args.page(16, 128);
+    let (_, limit) = args.page(16, 128)?;
 
     let Some(target) = args.opt_str("target") else {
         let (syscalls, kinds) = syscall_rows(trace, limit);

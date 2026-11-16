@@ -425,6 +425,28 @@ pub fn function_json(f: &Function, an: &Analysis, depth: Depth, image: &Image) -
     m.insert("entry", addr(f.entry));
     m.insert("name", f.display_name());
     m.insert("size", Value::from(f.size));
+    // Bytes of the body that no instruction occupies. A large value is not a
+    // contradiction: compilers lay a function's cold blocks far from its hot
+    // path, and a jump table can sit in `.text` between them. Reporting the
+    // number keeps `size` and the instruction count from looking inconsistent
+    // when they are not.
+    // Union, not sum: a branch into the middle of a decoded instruction makes
+    // two instructions claim the same byte, and adding their lengths would
+    // count it twice.
+    let mut insn_bytes = 0u64;
+    let mut gaps = 0u64;
+    let mut covered = f.entry.0;
+    for insn in &f.insns {
+        if insn.addr.0 > covered {
+            gaps += 1;
+        }
+        let from = insn.addr.0.max(covered);
+        insn_bytes += insn.end().0.saturating_sub(from);
+        covered = covered.max(insn.end().0);
+    }
+    m.insert("insn_bytes", Value::from(insn_bytes));
+    m.insert("gap_bytes", Value::from(f.size.saturating_sub(insn_bytes)));
+    m.insert("gaps", Value::from(gaps));
     m.insert("end", addr(f.end()));
     m.insert("insns", Value::from(f.insns.len()));
     m.insert("blocks", Value::from(f.blocks.len()));
@@ -522,6 +544,10 @@ pub fn hypothesis_json(h: &Hypothesis) -> Value {
     obj!(
         "id" => Value::from(h.id),
         "handle" => h.handle.to_string(),
+        "image" => match h.image {
+            Some(id) => Value::from(id),
+            None => Value::Null,
+        },
         "statement" => h.statement.clone(),
         "state" => format!("{:?}", h.state),
         "verdict" => h.verdict().label(),

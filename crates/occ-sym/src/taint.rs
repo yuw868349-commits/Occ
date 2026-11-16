@@ -65,6 +65,14 @@ pub struct SinkFilter {
     pub branches: bool,
     /// Report memory writes whose value or address depends on a source.
     pub stores: bool,
+    /// What a callee forwards to, keyed by the callee's own name.
+    ///
+    /// A call site names the function it reaches, and in a stripped image that
+    /// name is `sub_4a1c0`. If the same body then calls `memcpy`, the argument
+    /// passed at the call site does reach `memcpy`, and a caller filtering for
+    /// it should be told so. Without this map, a name filter can only match
+    /// calls that are named at the site, which in a stripped binary is none.
+    pub forwards: std::collections::HashMap<String, Vec<String>>,
 }
 
 impl Default for SinkFilter {
@@ -76,6 +84,7 @@ impl Default for SinkFilter {
             calls: Vec::new(),
             branches: true,
             stores: true,
+            forwards: std::collections::HashMap::new(),
         }
     }
 }
@@ -83,7 +92,42 @@ impl Default for SinkFilter {
 impl SinkFilter {
     /// True when a call to `name` is a sink.
     pub fn wants_call(&self, name: &str) -> bool {
-        self.any_call || self.calls.iter().any(|c| name.contains(c.as_str()))
+        if self.any_call {
+            return true;
+        }
+        if self.calls.iter().any(|c| name.contains(c.as_str())) {
+            return true;
+        }
+        self.forwards.get(name).is_some_and(|next| {
+            next.iter().any(|n| self.calls.iter().any(|c| n.contains(c.as_str())))
+        })
+    }
+
+    /// What to call this sink in a flow report.
+    ///
+    /// A call the filter names directly is reported under its own name. A call
+    /// that only reaches the requested sink through its body is reported with
+    /// the names it forwards to, because `run` says nothing about why a flow
+    /// looking for `system` stopped there.
+    pub fn sink_label(&self, name: &str) -> String {
+        if self.any_call || self.calls.iter().any(|c| name.contains(c.as_str())) {
+            return name.to_string();
+        }
+        let Some(next) = self.forwards.get(name) else {
+            return name.to_string();
+        };
+        let mut hits: Vec<&str> = next
+            .iter()
+            .map(String::as_str)
+            .filter(|n| self.calls.iter().any(|c| n.contains(c.as_str())))
+            .collect();
+        hits.sort_unstable();
+        hits.dedup();
+        if hits.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name} -> {}", hits.join(" | "))
+        }
     }
 }
 
@@ -387,7 +431,7 @@ fn transfer(
                         for bit in &labels {
                             sink(Flow {
                                 source: sources[usize::from(*bit)].label(),
-                                sink: name.clone(),
+                                sink: filter.sink_label(name),
                                 at: *addr,
                                 arg: Some(i),
                                 value: a.to_string(),
@@ -608,5 +652,26 @@ mod tests {
             signed: false,
         };
         assert_eq!(labels_of(&e, &state).len(), 1);
+    }
+
+    #[test]
+    fn a_wrapper_reports_what_it_forwards_to() {
+        // `run` calls `system` in its own body, so a filter looking for
+        // `system` matches the call to `run`. Naming the sink `run` alone
+        // leaves the reader asking why the flow was reported.
+        let mut filter = SinkFilter {
+            any_call: false,
+            calls: vec!["system".into()],
+            branches: false,
+            stores: false,
+            forwards: std::collections::HashMap::new(),
+        };
+        filter
+            .forwards
+            .insert("run".into(), vec!["system@plt".into()]);
+        assert!(filter.wants_call("run"));
+        assert_eq!(filter.sink_label("run"), "run -> system@plt");
+        // A call the filter names itself keeps its own name.
+        assert_eq!(filter.sink_label("system@plt"), "system@plt");
     }
 }

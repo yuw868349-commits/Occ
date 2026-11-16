@@ -343,6 +343,26 @@ impl<'a> Obj<'a> {
         }
     }
 
+    /// Optional number, read as `f64`.
+    ///
+    /// A member that is present but not a number is an error, not a default:
+    /// the caller asked for a number and the document holds something else.
+    pub fn opt_f64(&self, key: &str) -> Result<Option<f64>, FieldError> {
+        let path = self.child_path(key);
+        match self.member(key) {
+            None => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .map(Some)
+                .ok_or_else(|| FieldError::new(&path, "a number", v)),
+        }
+    }
+
+    /// Raw member, for a field whose shape the caller validates itself.
+    pub fn opt_value(&self, key: &str) -> Option<&'a Value> {
+        self.member(key)
+    }
+
     /// Optional integer that must fit `usize`.
     pub fn opt_usize(&self, key: &str) -> Result<Option<usize>, FieldError> {
         let path = self.child_path(key);

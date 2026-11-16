@@ -66,7 +66,7 @@ Trimmed output from a real session against `/bin/ls`.
 {
   "ok": true,
   "handle": "img:0",
-  "summary": "elf x86_64 64-bit pie (/bin/ls) — 300 functions, 700 strings, 98.1% of code decoded",
+  "summary": "elf x86_64 64-bit pie (/bin/ls) — 372 functions, 700 strings, 88.6% of code decoded",
   "data": {
     "identity": { "format": "elf", "arch": "x86_64", "bits": 64, "entry": "0x6d30",
                   "image_base": "0x0", "linkage": "pie", "imports": 120,
@@ -74,7 +74,7 @@ Trimmed output from a real session against `/bin/ls`.
                   "sha256": "0148f5ab3062a905281d8deb9645363da5131011c9e7b6dcaa38b504e41b68ea" },
     "fingerprint": { "compiler": "unknown", "language": "c", "linkage": "pie",
                      "runtime": "glibc", "stripped": false, "has_dwarf": false },
-    "coverage": { "code_bytes": 85818, "decoded_bytes": 84197, "fraction": 0.9811 }
+    "coverage": { "code_bytes": 85818, "decoded_bytes": 76017, "covered_bytes": 82620, "fraction": 0.8858 }
   },
   "next": ["code.functions with image=0, sort=insns, limit=20", "binary.strings ..."]
 }

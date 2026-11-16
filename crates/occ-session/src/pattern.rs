@@ -100,10 +100,15 @@ pub struct Rule {
 pub struct RuleMatch {
     /// Rule name.
     pub rule: String,
-    /// Address of the first matching string.
-    pub addr: Addr,
-    /// Identifiers of every string that matched.
-    pub matched: Vec<String>,
+    /// Every address the rule matched at, ascending and de-duplicated.
+    ///
+    /// A rule that anchors three times is three findings, not one: collapsing
+    /// them to the lowest address hides the other two and makes the count
+    /// wrong.
+    pub addrs: Vec<Addr>,
+    /// Identifiers of the strings that matched, each with every address it was
+    /// found at.
+    pub strings: Vec<(String, Vec<Addr>)>,
 }
 
 /// Parse a rule file.
@@ -534,17 +539,22 @@ pub fn scan(
             }
         }
         if eval(&rule.condition, &hits, sections, &rule.strings) {
-            let mut ids: Vec<String> = hits.keys().map(|s| s.to_string()).collect();
-            ids.sort();
-            let first = hits
+            let mut strings: Vec<(String, Vec<Addr>)> = hits
+                .iter()
+                .map(|(id, at)| (id.to_string(), at.iter().map(|a| Addr(*a)).collect()))
+                .collect();
+            strings.sort_by(|a, b| a.0.cmp(&b.0));
+            let mut addrs: Vec<Addr> = hits
                 .values()
-                .filter_map(|v| v.first().copied())
-                .min()
-                .unwrap_or(base);
+                .flatten()
+                .map(|a| Addr(*a))
+                .collect::<Vec<_>>();
+            addrs.sort_unstable();
+            addrs.dedup();
             out.push(RuleMatch {
                 rule: rule.name.clone(),
-                addr: Addr(first),
-                matched: ids,
+                addrs,
+                strings,
             });
         }
     }
@@ -695,7 +705,32 @@ mod tests {
         let m = scan(SAMPLE, 0x1000, &rules, &sections());
         assert_eq!(m.len(), 1);
         assert_eq!(m[0].rule, "greeting");
-        assert_eq!(m[0].addr, Addr(0x1000 + 4));
+        assert_eq!(m[0].addrs, vec![Addr(0x1000 + 4)]);
+    }
+
+    #[test]
+    fn every_occurrence_is_reported() {
+        let data = b"AAAAxxAAAAyyAAAA";
+        let rules = parse(
+            r#"
+            rule rep {
+              strings:
+                $a = "AAAA"
+              condition:
+                $a
+            }
+            "#,
+        )
+        .unwrap();
+        let m = scan(data, 0x2000, &rules, &sections());
+        assert_eq!(m.len(), 1);
+        assert_eq!(
+            m[0].addrs,
+            vec![Addr(0x2000), Addr(0x2000 + 6), Addr(0x2000 + 12)]
+        );
+        assert_eq!(m[0].strings.len(), 1);
+        assert_eq!(m[0].strings[0].0, "$a");
+        assert_eq!(m[0].strings[0].1.len(), 3);
     }
 
     #[test]

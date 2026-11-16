@@ -50,23 +50,51 @@ impl Args {
     }
 
     /// Optional unsigned integer.
-    pub fn opt_u64(&self, key: &str) -> Option<u64> {
-        self.get(key).and_then(|v| v.as_u64())
+    ///
+    /// A negative number, a float or a string is a caller mistake, not a
+    /// missing argument: `-1` does not mean "use the default", so the value
+    /// that was sent is named in the error instead of being dropped.
+    pub fn opt_u64(&self, key: &str) -> Result<Option<u64>, String> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| {
+                format!("`{key}` must be a non-negative integer, got {n}")
+            }),
+            Some(other) => Err(format!(
+                "`{key}` must be a non-negative integer, got {}",
+                other.type_name()
+            )),
+        }
     }
 
-    /// Unsigned integer with a default.
-    pub fn u64_or(&self, key: &str, default: u64) -> u64 {
-        self.opt_u64(key).unwrap_or(default)
-    }
-
-    /// Unsigned integer clamped to a range.
-    pub fn u64_clamped(&self, key: &str, default: u64, max: u64) -> u64 {
-        self.opt_u64(key).unwrap_or(default).min(max)
+    /// Integer with a default and a closed range.
+    ///
+    /// Values below `min` and above `max` are both refused: a cap the caller
+    /// was not told about turns "keep 500 paths" into "the tool silently kept
+    /// 200" and the caller cannot tell the difference from having found only
+    /// 200. The message names the bound so the retry is obvious.
+    pub fn u64_in(&self, key: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
+        let Some(v) = self.opt_u64(key)? else {
+            return Ok(default);
+        };
+        if v < min || v > max {
+            let bound = if min == 0 {
+                format!("at most {max}")
+            } else {
+                format!("between {min} and {max}")
+            };
+            return Err(format!("`{key}` must be {bound}, got {v}"));
+        }
+        Ok(v)
     }
 
     /// Boolean with a default.
-    pub fn bool_or(&self, key: &str, default: bool) -> bool {
-        self.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+    pub fn bool_or(&self, key: &str, default: bool) -> Result<bool, String> {
+        match self.get(key) {
+            None => Ok(default),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(other) => Err(format!("`{key}` must be true or false, got {}", other.type_name())),
+        }
     }
 
     /// Required address, accepting `0x...`, decimal, or a bare hex string.
@@ -90,25 +118,45 @@ impl Args {
         }
     }
 
-    /// Render depth, defaulting to `detail`.
-    pub fn depth(&self) -> Depth {
-        match self.opt_str("depth") {
-            Some("summary") => Depth::Summary,
-            Some("raw") => Depth::Raw,
-            _ => Depth::Detail,
+    /// A string that must be one of `allowed`, or `default` when absent.
+    ///
+    /// An unrecognised value is refused with the list, because a misspelt
+    /// `sort` that quietly falls back to address order looks like a tool that
+    /// ignored the request.
+    pub fn one_of<'a>(
+        &'a self,
+        key: &str,
+        default: &'a str,
+        allowed: &[&str],
+    ) -> Result<&'a str, String> {
+        match self.get(key) {
+            None => Ok(default),
+            Some(Value::String(s)) if allowed.contains(&s.as_str()) => Ok(s),
+            Some(Value::String(s)) => Err(format!(
+                "`{key}` is {s:?}; use one of {}",
+                allowed.join(", ")
+            )),
+            Some(other) => Err(format!("`{key}` must be a string, got {}", other.type_name())),
         }
+    }
+
+    /// Render depth, defaulting to `detail`.
+    pub fn depth(&self) -> Result<Depth, String> {
+        Ok(match self.one_of("depth", "detail", &["summary", "detail", "raw"])? {
+            "summary" => Depth::Summary,
+            "raw" => Depth::Raw,
+            _ => Depth::Detail,
+        })
     }
 
     /// Pagination as `(offset, limit)`. Callers compute truncation as
     /// `total > offset + limit`, which is the only thing they need.
-    pub fn page(&self, default_limit: usize, hard_max: usize) -> (usize, usize) {
-        let offset = self.opt_u64("offset").unwrap_or(0) as usize;
-        let limit = self
-            .opt_u64("limit")
-            .map(|v| v as usize)
-            .unwrap_or(default_limit)
-            .clamp(1, hard_max);
-        (offset, limit)
+    pub fn page(&self, default_limit: usize, hard_max: usize) -> Result<(usize, usize), String> {
+        let offset = self.opt_u64("offset")?.unwrap_or(0);
+        let offset = usize::try_from(offset)
+            .map_err(|_| format!("`offset` does not fit in memory: {offset}"))?;
+        let limit = self.u64_in("limit", default_limit as u64, 1, hard_max as u64)? as usize;
+        Ok((offset, limit))
     }
 
     /// Select the image this call applies to.
@@ -118,8 +166,11 @@ impl Args {
     /// because guessing would analyse the wrong binary and look like a wrong
     /// answer rather than a missing argument.
     pub fn image(&self, session: &Session) -> Result<u32, String> {
-        if let Some(id) = self.opt_u64("image") {
-            let id = id as u32;
+        if let Some(id) = self.opt_u64("image")? {
+            // `as u32` would wrap 2^32 into image 0 and silently analyse the
+            // wrong binary.
+            let id = u32::try_from(id)
+                .map_err(|_| format!("`image` is not an id this server issues: {id}"))?;
             if session.image(id).is_none() {
                 return Err(format!(
                     "image {id} is not open; open images: {:?}",

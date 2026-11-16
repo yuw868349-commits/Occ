@@ -419,6 +419,7 @@ pub unsafe extern "C" fn occ_info(
             object(vec![
                 ("code_bytes", Value::from(a.coverage.code_bytes)),
                 ("decoded_bytes", Value::from(a.coverage.decoded_bytes)),
+                ("covered_bytes", Value::from(a.coverage.covered_bytes)),
                 ("functions", Value::from(a.coverage.functions as u64)),
                 ("instructions", Value::from(a.coverage.insns as u64)),
                 ("blocks", Value::from(a.coverage.blocks as u64)),

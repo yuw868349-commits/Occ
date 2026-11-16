@@ -269,7 +269,7 @@ impl Session {
     /// member has one. The members that do not parse as an object — a linker
     /// index, a resource blob — are skipped, and the open fails only when
     /// nothing in the archive could be read.
-    pub fn open_bytes(&self, data: Vec<u8>, path: &str) -> Result<Vec<u32>> {
+    pub fn open_bytes(&self, mut data: Vec<u8>, path: &str) -> Result<Vec<u32>> {
         let mut inner = self.inner.write().map_err(|_| poisoned())?;
         if occ_bin::probe_format(&data) == Format::Archive {
             let members = occ_bin::ar::members(&data)?;
@@ -279,11 +279,17 @@ impl Session {
                 .collect();
             let mut ids = Vec::with_capacity(parts.len());
             let mut first_error: Option<CoreError> = None;
-            for (name, bytes) in parts {
+            for (name, mut bytes) in parts {
                 let id = inner.next_id;
                 let label = format!("{path}({name})");
                 match occ_bin::load(&bytes, &label, ImageId(id)) {
-                    Ok(image) => {
+                    Ok(mut image) => {
+                        // A member of an archive is usually an unlinked object,
+                        // and an unlinked object's branch targets are
+                        // placeholders until its relocations are applied.
+                        if let Some(applied) = occ_bin::reloc::apply(&mut bytes, &image) {
+                            image.warnings.extend(applied.notes);
+                        }
                         let (analysis, dwarf) = {
                             let view = View::new(&image, &bytes);
                             (
@@ -324,7 +330,10 @@ impl Session {
         let id = inner.next_id;
         // Parse before taking an id so a failed open does not consume one and
         // leave a hole that a persisted handle would later point into.
-        let image = occ_bin::load(&data, path, ImageId(id))?;
+        let mut image = occ_bin::load(&data, path, ImageId(id))?;
+        if let Some(applied) = occ_bin::reloc::apply(&mut data, &image) {
+            image.warnings.extend(applied.notes);
+        }
         let (analysis, dwarf) = {
             let view = View::new(&image, &data);
             (
@@ -606,14 +615,19 @@ impl Session {
     }
 
     /// Create a hypothesis about `handle`.
-    pub fn hypothesise(&self, handle: Handle, statement: &str) -> Result<u64> {
+    pub fn hypothesise(
+        &self,
+        handle: Handle,
+        image: Option<u32>,
+        statement: &str,
+    ) -> Result<u64> {
         let mut inner = self.inner.write().map_err(|_| poisoned())?;
         let id = inner.next_hyp;
         inner.next_hyp += 1;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         inner
             .hypotheses
-            .insert(id, Hypothesis::new(id, handle, statement, seq));
+            .insert(id, Hypothesis::new(id, handle, image, statement, seq));
         Ok(id)
     }
 
@@ -691,25 +705,45 @@ impl Session {
             }
         }
         for h in &saved.hypotheses {
-            if let Ok(mut inner) = self.inner.write() {
-                let id = inner.next_hyp;
-                inner.next_hyp += 1;
-                let _ = id;
-                let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-                inner.hypotheses.insert(
-                    h.id,
-                    Hypothesis {
-                        id: h.id,
-                        handle: Handle::parse(&h.handle).unwrap_or_else(|_| Handle::image(0)),
-                        statement: h.statement.clone(),
-                        state: occ_core::HypothesisState::Proposed,
-                        evidence: Vec::new(),
-                        confidence: 0.0,
-                        created_seq: seq,
-                        updated_seq: seq,
-                    },
-                );
+            // A handle that does not parse is not silently rewritten to
+            // `img:0`: that would file the hypothesis against whatever image
+            // happens to be first, which is a different claim.
+            let Ok(handle) = Handle::parse(&h.handle) else {
+                warnings.push(format!(
+                    "hypothesis {}: handle {:?} does not parse; skipped",
+                    h.id, h.handle
+                ));
+                continue;
+            };
+            let Ok(mut inner) = self.inner.write() else {
+                warnings.push("session state is poisoned; hypotheses not restored".to_string());
+                break;
+            };
+            if inner.hypotheses.contains_key(&h.id) {
+                warnings.push(format!(
+                    "hypothesis {}: id is already in use in this session; skipped",
+                    h.id
+                ));
+                continue;
             }
+            let id = h.id;
+            inner.hypotheses.insert(
+                id,
+                Hypothesis {
+                    id,
+                    handle,
+                    image: h.image,
+                    statement: h.statement.clone(),
+                    state: h.state,
+                    evidence: h.evidence.clone(),
+                    confidence: h.confidence.clamp(0.0, 1.0),
+                    created_seq: h.created_seq,
+                    updated_seq: h.updated_seq,
+                },
+            );
+            // Keep the allocator ahead of every id the file used, so a
+            // hypothesis filed after the restore cannot collide with one.
+            inner.next_hyp = inner.next_hyp.max(id.saturating_add(1));
         }
         if !self.trace_ids().is_empty() {
             warnings.push(
