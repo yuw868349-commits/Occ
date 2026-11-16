@@ -81,7 +81,7 @@ macro_rules! tool {
     };
 }
 
-static TOOLS: [ToolDef; 37] = [
+static TOOLS: [ToolDef; 38] = [
     tool!(
         "session.info",
         "List open images and their ids, plus hypotheses and notes. Call this first when continuing a conversation to see what state exists.",
@@ -237,6 +237,12 @@ static TOOLS: [ToolDef; 37] = [
         "Map addresses to source file:line:column and name the enclosing debug function. Accepts one address, a comma-separated list, a symbol name, or a fn: handle.",
         r#"{"type":"object","properties":{"image":{"type":"integer"},"at":{"type":"string","description":"address, symbol, fn: handle or comma-separated list"}},"required":["at"],"additionalProperties":false}"#,
         debug_line
+    ),
+    tool!(
+        "code.indirect",
+        "Resolve every computed jump and every call through a register by value-set analysis. Each site reports the register it goes through, the table behind it when there is one, and the blocks it can reach. A target is reported only when it is a block the recovery already found, so the answer cannot invent one.",
+        r#"{"type":"object","properties":{"image":{"type":"integer"},"function":{"type":"string","description":"only sites inside this function (fn: handle, name or address)"},"kind":{"type":"string","description":"calls, jumps or both (default both)"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
+        code_indirect
     ),
     tool!(
         "debug.functions",
@@ -965,6 +971,7 @@ fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
     let opts = occ_decompile::Options {
         max_blocks: args.u64_clamped("max_blocks", 20_000, 200_000) as usize,
         keep_comments: args.bool_or("comments", true),
+        keep_dead: false,
     };
     // Call targets are resolved through the recovered function table, so a call
     // reads as the name the rest of the tools use for that address.
@@ -1112,6 +1119,7 @@ fn code_explore(session: &Session, args: &Args) -> Result<Value, String> {
         &occ_decompile::Options {
             max_blocks: 20_000,
             keep_comments: false,
+            keep_dead: false,
         },
         &name_of,
         &read_static,
@@ -1291,6 +1299,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
     let opts = occ_decompile::Options {
         max_blocks: 20_000,
         keep_comments: false,
+        keep_dead: false,
     };
     // Parameters are the default source: the question is nearly always "what
     // does the caller control here".
@@ -1503,6 +1512,110 @@ fn code_blocks(session: &Session, args: &Args) -> Result<Value, String> {
         Handle::function(f.entry)
     )]);
     Ok(e.build())
+}
+
+fn code_indirect(session: &Session, args: &Args) -> Result<Value, String> {
+    let file = args.file(session)?;
+    let view = occ_analyze::View::new(&file.image, &file.data);
+    let report = occ_vsa::analyze(&view, &file.analysis, &occ_vsa::Options::default());
+    let only = args.opt_str("function");
+    let kind = args.opt_str("kind").unwrap_or("both");
+    let wanted = |entry: Addr| -> bool {
+        let Some(only) = &only else { return true };
+        if let Some(rest) = only.strip_prefix("fn:") {
+            if let Ok(v) = u64::from_str_radix(rest.trim_start_matches("0x"), 16) {
+                return entry.0 == v;
+            }
+        }
+        file.analysis
+            .functions
+            .iter()
+            .find(|f| f.entry == entry)
+            .map(|f| f.display_name() == *only)
+            .unwrap_or(false)
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    if kind != "jumps" {
+        for call in report.calls.iter().filter(|c| wanted(c.in_function)) {
+            rows.push(obj!(
+                "kind" => "call",
+                "at" => addr(call.at),
+                "function" => addr(call.in_function),
+                "via" => call.via.clone(),
+                "targets" => Value::Array(
+                    call.targets.iter().map(|t| addr(*t)).collect()
+                ),
+                "evidence" => call.evidence.clone(),
+            ));
+        }
+    }
+    if kind != "calls" {
+        for jump in report.jumps.iter().filter(|j| wanted(j.in_function)) {
+            let table = match jump.table {
+                Some(t) => obj!(
+                    "base" => addr(t.base),
+                    "stride" => Value::from(t.stride),
+                    "bias" => Value::from(t.bias),
+                    "entries" => Value::from(t.entries as u64),
+                ),
+                None => Value::Null,
+            };
+            rows.push(obj!(
+                "kind" => "jump",
+                "at" => addr(jump.at),
+                "function" => addr(jump.in_function),
+                "via" => jump.via.clone(),
+                "table" => table,
+                "two_level" => jump.two_level,
+                "cases" => Value::Array(
+                    jump.cases
+                        .iter()
+                        .map(|c| obj!(
+                            "index" => Value::from(c.index as u64),
+                            "label" => Value::from(c.label),
+                            "target" => addr(c.target),
+                        ))
+                        .collect()
+                ),
+                "evidence" => jump.evidence.clone(),
+            ));
+        }
+    }
+    let total = rows.len();
+    let (offset, limit) = args.page(50, 500);
+    let (page, truncated) = paginate(&rows, offset, limit);
+    let stats = &report.stats;
+    Ok(Envelope::ok(format!(
+        "{} indirect site(s): {} of {} calls and {} of {} jumps resolved; \
+         {} table(s) read, {} two-level; the syntactic resolver found {} table(s) in the same image",
+        total,
+        stats.calls_resolved,
+        stats.call_sites,
+        stats.jumps_resolved,
+        stats.jump_sites,
+        stats.tables,
+        stats.two_level,
+        stats.syntactic_tables,
+    ))
+    .field("sites", Value::Array(page))
+    .field("total", Value::from(total as u64))
+    .field(
+        "stats",
+        obj!(
+            "functions" => Value::from(stats.functions as u64),
+            "blocks" => Value::from(stats.blocks as u64),
+            "call_sites" => Value::from(stats.call_sites as u64),
+            "calls_resolved" => Value::from(stats.calls_resolved as u64),
+            "jump_sites" => Value::from(stats.jump_sites as u64),
+            "jumps_resolved" => Value::from(stats.jumps_resolved as u64),
+            "tables" => Value::from(stats.tables as u64),
+            "two_level" => Value::from(stats.two_level as u64),
+            "syntactic_tables" => Value::from(stats.syntactic_tables as u64),
+        ),
+    )
+    .truncated(truncated)
+    .next(vec!["code.function on a resolved target".into()])
+    .build())
 }
 
 fn code_xrefs(session: &Session, args: &Args) -> Result<Value, String> {

@@ -1,0 +1,18 @@
+[package]
+name = "occ-vsa"
+description = "Value-set analysis: what an indirect branch or call can reach, and why"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+occ-core.workspace = true
+occ-analyze.workspace = true
+occ-decompile.workspace = true
+
+[dev-dependencies]
+occ-sys.workspace = true
+occ-bin.workspace = true
+occ-session.workspace = true

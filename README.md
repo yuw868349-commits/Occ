@@ -110,7 +110,7 @@ statement the binary contradicts comes back `refuted`, not `inconclusive`.
 
 ## Tools
 
-Thirty-seven, in seven groups. The names carry the intent.
+Thirty-eight, in seven groups. The names carry the intent.
 
 **Session — what state exists**
 
@@ -150,6 +150,7 @@ Thirty-seven, in seven groups. The names carry the intent.
 | `code.xrefs` | Who refers to this, and what this refers to. |
 | `code.callgraph` | Breadth-first callers or callees, bounded by depth and node count. |
 | `code.search` | Instructions by mnemonic, text, or immediate value; each hit names its function. |
+| `code.indirect` | What an indirect branch or call can reach: the cases of a `switch`, the entries of a function-pointer table, and the value the jump went through. |
 
 **Debug — what the compiler recorded**
 
@@ -338,10 +339,178 @@ Three details that only show up when the tracer is real:
   image" only if `addr - load_base` falls inside a mapped section. Otherwise it is
   counted in `external_steps` and kept out of the call-edge table, so a libc
   address never masquerades as a low file offset.
+- **A program that dies leaves no core file.** The tracee runs with the caller's
+  privileges in the caller's directory, so a core dump would land in the middle
+  of a source tree and say nothing the trace has not already said. The child's
+  core-dump limit is lowered before it execs, and the tracer's own report — the
+  signal, the faulting address, the instruction — is the artifact that survives.
+
+## The C ABI
+
+`occ-ffi` is the same analysis behind a C interface: thirteen functions, one
+hand-written header, no build script and no dependency. A caller needs a C
+compiler and nothing else.
+
+```c
+#include "occ.h"
+
+int main(int argc, char **argv) {
+    char err[256];
+    OccSession *s = occ_open(argv[1], err, sizeof err);
+    if (!s) { fprintf(stderr, "%s\n", err); return 1; }
+    int64_t image = occ_image_at(s, 0);
+    char *json = occ_function(s, image, "main", err, sizeof err);
+    if (json) { puts(json); occ_free(json); }
+    occ_close(s);
+    return 0;
+}
+```
+
+There are two error channels, and they mean different things:
+
+| Return | Means |
+| --- | --- |
+| `NULL` | The call did not happen: a null pointer, invalid UTF-8, an image that is not open, or a panic caught at the language boundary. `err` says which. |
+| a JSON document | The call happened. `"ok": true` with the payload, or `"error": true` when the analysis declined the question. |
+
+Conflating the two is how a caller ends up reporting a bad argument as a fact
+about the binary, so they stay apart: `NULL` is the absence of an answer, and
+`"error": true` is an answer that says no.
+
+Strings belong to the caller and are released with `occ_free()`. A string stays
+valid after `occ_close()`, because it is a copy and not a view into the
+session. The release profile unwinds rather than aborts, so a panic inside the
+analysis is caught at the boundary and reported through `err` instead of
+taking the caller's process down.
+
+`scripts/ffi_check.sh` builds the library and proves three things: a C99
+program links and runs against it, the same header compiles as C++17 without
+changes, and the exported symbols are the ones the header promises — a rename
+in Rust cannot silently produce a library that links but answers nothing.
+
+## Differential semantics
+
+The lifter turns instructions into expressions and the interpreter evaluates
+them. Every step in that chain can be wrong in a way no unit test sees, because
+a unit test encodes the author's expectation and the hardware has none.
+
+So the semantics are checked against the hardware. `semantic_diff` runs every
+integer encoding the decoder recognises twice: once on the real processor under
+`ptrace`, and once through the lifted IR and the concrete interpreter. A
+disagreement is a bug in one of the two, and the report names the register or
+the flag.
+
+```
+$ cargo run --release -p occ-dynamic --example semantic_diff -- --cases 16
+encodings tested   9584
+agree              111157
+differ             0
+not arithmetic     17417
+no statements      15648
+skipped: faulted on the processor     3275
+skipped: segment register operand     7360
+skipped: stack-relative operand       15904
+```
+
+Those numbers are the same on every run, and that is a property the tool has to
+earn rather than assume. The registers the traced process starts with point
+into a mapped region, and where the kernel puts that region decides whether a
+division overflows and whether a memory operand lands inside it — so an
+address that moves with ASLR means the same seed tests a different set of
+encodings each time. The regions are therefore mapped at fixed addresses, and
+the run says so out loud when it could not get them and is not comparable with
+another run's.
+
+The first run disagreed on 11094 cases. Every one was a real difference — a
+carry flag computed from the result instead of from the operand, a shift count
+masked by the width instead of by the machine's five-bit rule, a multiply that
+reused the unsigned high half for a signed product — and fixing them moved the
+number to zero.
+
+The exclusions are counted and printed, because an exclusion that is not
+counted is an exclusion nobody can check. `faulted on the processor` is an
+input the processor rejected, such as a divide by zero or a shift past the
+width: the run says so instead of comparing two different things. `segment
+register operand` is a move that names a segment, `stack-relative operand` one
+that reads through the stack pointer — the lifter promotes those to named
+locals on purpose, so the promotion is a fact about the output rather than
+about the machine. `not arithmetic` and `no statements` count the encodings
+the comparison does not model.
+
+## Value-set analysis
+
+`occ-vsa` answers a question the rest of the toolkit can only guess at: what
+can an indirect branch or call reach, and why.
+
+A `switch` compiled to a jump table reaches its case bodies through a value
+the program computed. A dispatch through a table of function pointers reaches
+its callees the same way. Both look like `jmp rax` in a listing, and both are
+opaque without the values.
+
+The pass keeps a value set per register — a finite set, an arithmetic
+progression, a symbol with a known offset, or nothing known — and from that it
+reads the table behind a computed jump and names the entries.
+
+Two things make the answer checkable:
+
+- **The table is read out of the image, and a run of entries ends where the
+  first entry stops naming code.** Not at the end of the section: a ten-entry
+  table sitting next to another table is how a switch grows cases it never had.
+- **The case values come from the data flow, not from the table.** A compiler
+  that sees `case 100..106` takes a hundred off the index before it looks
+  anything up, so the table holds positions and the case value of a position
+  is the position plus a hundred.
+
+The two readings are independent — one is what the value analysis says, the
+other is what the instruction stream says — and the pass reports a
+disagreement rather than picking one.
+
+```console
+$ cargo run --release -p occ-vsa --example report ./switch
+./switch: 18 functions, 61 blocks
+calls           1 sites,      0 resolved (0.0%)
+jumps           5 sites,      3 resolved (60.0%)
+tables          1 read, 0 two-level; syntactic resolver found 2
+jump      0x134e in     0x1330 via rax   7 cases  (the table was recovered: 7 cases, and the index carries -100, so the first case is 100)
+        case    100 -> 0x1388
+        case    101 -> 0x13a0
+        case    102 -> 0x13b8
+```
+
+The same numbers are behind `code.indirect`, so the pass is available over MCP
+without leaving the session.
+
+## Fuzzing the boundary
+
+Everything above reads a file the caller did not write. `scripts/fuzz.py`
+mutates seeds and feeds them to the parsers until one of them does something it
+should not.
+
+A failure is a panic, an abort, a segfault, or a batch that does not finish
+inside the time allowed — a hang is a failure until it is proven otherwise, and
+it is reported rather than retried quietly. A rejected input is not a failure:
+the parser is supposed to refuse most of what this produces, and the refusal
+is the bounds checking working.
+
+Ten million runs at the load depth:
+
+```
+10000000 iterations
+  5999715 loaded
+  4000285 rejected
+        0 panics
+        0 crashes
+        0 timeouts
+  1225.3s  (8161/s)
+```
+
+The mutator is in Rust because a file write per iteration costs more than the
+parse it is trying to test. The script owns the parts Python is good at:
+choosing seeds, sizing batches, surviving a hang, and saying what happened.
 
 ## Zero dependencies
 
-`Cargo.lock` has twelve packages, all of them workspace members, and not one
+`Cargo.lock` has fourteen packages, all of them workspace members, and not one
 `source = "registry"` line. That is checkable in one command:
 
 ```bash
@@ -360,7 +529,7 @@ What a dependency would have been, and what replaced it:
 | `cpp_demangle` + `rustc-demangle` | Itanium demangler and Rust hash stripping | `occ-bin/src/demangle.rs` |
 | `sha2` | SHA-256 | `occ-bin/src/sha256.rs` |
 | `memmap2` | `mmap` declared directly, with an owned lifetime | `occ-sys/src/mem.rs` |
-| `libc` / `nix` | `extern "C"` declarations for the nine symbols used | `occ-sys` |
+| `libc` / `nix` | `extern "C"` declarations for the fifteen symbols used | `occ-sys` |
 | `iced-x86` | Table-driven x86 decoder | `occ-decode/src/x86.rs` |
 | `gimli` | DWARF 2–5 reader, line program, location lists | `occ-dwarf` |
 | `rmcp` / `tokio` | JSON-RPC 2.0 over stdio and a hand-rolled HTTP loop | `occ-mcp` |
@@ -396,20 +565,22 @@ the evidence."*
 
 | Crate | Responsibility | Lines |
 | --- | --- | --- |
-| `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 2.9k |
-| `occ-json` | JSON value, parser, writer, schema validation. | 1.9k |
-| `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid` as `extern "C"`. | 1.3k |
+| `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 3.0k |
+| `occ-json` | JSON value, parser, writer, schema validation. | 2.0k |
+| `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid`, `setrlimit`, `atexit` as `extern "C"`. | 1.8k |
 | `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, `ar` archives, demangling, SHA-256. | 4.7k |
 | `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.6k |
-| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 3.8k |
-| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.3k |
-| `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 13.2k |
-| `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.5k |
-| `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 2.0k |
+| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 4.2k |
+| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.4k |
+| `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 15.1k |
+| `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.6k |
+| `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 3.1k |
+| `occ-vsa` | Value sets: what an indirect branch or call can reach, and why. | 2.7k |
 | `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.6k |
-| `occ-mcp` | The 37 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.4k |
+| `occ-mcp` | The 38 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.6k |
+| `occ-ffi` | The C interface: thirteen functions, one hand-written header. | 1.4k |
 
-53.7k lines of Rust, 403 tests, 82 end-to-end MCP checks.
+61.7k lines of Rust, 466 tests, 82 end-to-end MCP checks.
 
 ## Verification
 
@@ -417,9 +588,12 @@ Unit tests are necessary and not sufficient: most of the serious bugs found whil
 building this were invisible to them and obvious against a real file.
 
 ```bash
-cargo test --workspace                                         # 403 tests
+cargo test --workspace                                         # 466 tests
 cargo clippy --workspace --all-targets -- -D warnings          # clean
 python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
+scripts/ffi_check.sh /bin/true                                 # the C interface
+cargo run --release -p occ-dynamic --example semantic_diff -- --cases 16
+python3 scripts/fuzz.py                                         # ten million runs
 ```
 
 One test compiles the same C source for three architectures and asks each one
@@ -430,6 +604,11 @@ carry the taint to the same three branches. A lifter that treats a signed
 comparison as an unsigned one still produces paths — just the wrong ones — and
 the answers say so.
 
+The suite also checks the tracer's effect on the machine around it: a program
+that dies under the tracer must leave no core file in the working directory, and
+the fixtures the tests compile must not pile up in `/tmp`. Both are assertions,
+not habits, because both were true the other way once.
+
 `scripts/mcp_smoke.py` is a real MCP client: JSON-RPC handshake, `tools/list`,
 schema validation, then every tool against `/bin/ls`, a cross-compiled PE, a
 Mach-O object, a COFF object, a WASM module and a compiled trace fixture. It
@@ -437,6 +616,20 @@ asserts on things like *the entry point reaches `__libc_start_main`*, *string
 addresses are not zero*, *the tracee's stdout does not corrupt the protocol
 stream*, *a PIE breakpoint actually hits*, and *changing argv changes block
 coverage by exactly one block*.
+
+Three of those commands check the parts that cannot be checked by a unit test.
+`semantic_diff` runs the lifted semantics against the processor and requires
+zero disagreements; `fuzz.py` feeds ten million mutated binaries to the parsers
+and requires zero panics, crashes and hangs; `ffi_check.sh` compiles a C
+program against the library and requires the exported symbols to be the ones
+the header promises.
+
+`semantic_diff` is also the one command whose numbers are only meaningful if
+they repeat, so the run is arranged to repeat: the regions the traced process
+sees are mapped at fixed addresses, and the report says so when it could not
+get them. A differential run that covers a different set of encodings each
+time cannot be compared with the last one, and a difference between two such
+runs is not a finding.
 
 ### The opcode tables are measured, not written down
 
@@ -590,22 +783,33 @@ Stated because the tool is supposed to state them, not because they are temporar
   replies list these as unchecked rather than implying absence. `trace.run` is the
   answer for the cases where the program can be run.
 - **Indirect calls** resolve to `CallTarget::Indirect { via }` when the slot is
-  known and stay unresolved otherwise; there is no points-to analysis.
+  known, and the value-set pass reads the table behind a computed jump when it
+  can. What it cannot do is follow a pointer the program builds at run time:
+  there is no points-to analysis, and a table whose entries are written rather
+  than read is not a table this pass can see.
 - **DWARF** covers versions 2 to 5, without split DWARF or compressed
   `.zdebug_*` sections. A variable whose location cannot be determined is reported
   as such, not guessed.
 - **No decompilation of hand-written assembly idioms** beyond the patterns the
   lifter models; those instructions appear as comments with their bytes intact.
-- **Only two dispatch shapes are resolved.** A table built by `lea` / `movsxd` /
-  `add` before a `jmp` through a register, and an absolute-pointer table read by
-  `jmp [base + index*8]`. A jump through a slot the program computed at runtime,
-  or a table whose entries are values rather than targets — which is what a
-  compiler emits for a small switch — is not a dispatch and is not treated as
-  one.
-- **Case numbers are table indices.** When the compiler normalises the
-  discriminant before dispatching (`sub edi, 'a'`), that offset is kept in the
-  instruction stream, so the recovered `case` values are `0, 1, 2, …` rather
-  than the source's `'a', 'b', 'c'`. The offset is visible in the disassembly.
+- **Dispatch is resolved in two shapes, and they are different shapes.** The
+  syntactic resolver handles a table built by `lea` / `movsxd` / `add` before a
+  `jmp` through a register, and an absolute-pointer table read by
+  `jmp [base + index*8]`. The value-set pass reads a table out of the image
+  whenever the address of the lookup has the shape `base + index * stride`,
+  which covers both and also the tables a compiler writes for a function
+  pointer dispatch. What neither can do is follow a jump through a slot the
+  program computed at run time, or a table whose entries are values rather than
+  targets — which is what a compiler emits for a small switch, and which is
+  not a dispatch at all.
+- **Case numbers come from the offset the compiler took off the index.** A
+  compiler that normalises the discriminant (`sub edi, 'a'`) leaves the offset
+  in the instruction stream, and both readers of it — the syntactic resolver
+  and the value-set pass — use it, so the recovered `case` values are the
+  source's. The two readings are independent and the pass reports a
+  disagreement rather than picking one, but a compiler that transforms the
+  index in a way neither can see leaves the case values numbered from zero
+  again.
 
 ## License
 

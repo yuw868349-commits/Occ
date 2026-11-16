@@ -296,13 +296,18 @@ pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    // SAFETY: `pre_exec` runs in the child between fork and exec. Both calls are
-    // async-signal-safe — `ptrace` and `setpgid` are single system calls with no
-    // allocation — and nothing else is touched in the closure.
+    // SAFETY: `pre_exec` runs in the child between fork and exec. Every call
+    // is async-signal-safe — `ptrace`, `setpgid` and `setrlimit` are single
+    // system calls with no allocation — and nothing else is touched in the
+    // closure.
     unsafe {
         cmd.pre_exec(|| {
             ptrace::trace_me().map_err(|e| io::Error::from_raw_os_error(e.code))?;
             proc::setpgid_self().map_err(|e| io::Error::from_raw_os_error(e.code))?;
+            // A tracee that dies must not leave a core file behind. The
+            // report says what happened; a core file in the caller's source
+            // tree says nothing and costs megabytes.
+            proc::disable_core_dumps().map_err(|e| io::Error::from_raw_os_error(e.code))?;
             Ok(())
         });
     }

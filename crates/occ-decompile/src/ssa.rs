@@ -715,11 +715,18 @@ fn definition_counts(blocks: &[Block]) -> HashMap<String, u32> {
 /// Both passes are repeated until nothing changes: removing a dead assignment
 /// can turn another into a copy, and folding a copy can make a third dead.
 ///
-pub fn cleanup(blocks: &mut [Block], opaque: &HashSet<String>) {
+/// `keep_dead` skips the removal, and is for the clients that read the values
+/// a block computes rather than the statements it renders: see
+/// [`crate::Options::keep_dead`].
+pub fn cleanup(blocks: &mut [Block], opaque: &HashSet<String>, keep_dead: bool) {
     for _ in 0..8 {
         let changed = propagate_copies(blocks, opaque);
         let folded = propagate_constants(blocks, opaque);
-        let removed = remove_dead(blocks);
+        let removed = if keep_dead {
+            false
+        } else {
+            remove_dead(blocks)
+        };
         if !changed && !folded && !removed {
             break;
         }

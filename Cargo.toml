@@ -13,6 +13,8 @@ members = [
     "crates/occ-decompile",
     "crates/occ-sym",
     "crates/occ-dynamic",
+    "crates/occ-vsa",
+    "crates/occ-ffi",
 ]
 
 [workspace.package]
@@ -34,6 +36,7 @@ occ-dwarf = { path = "crates/occ-dwarf" }
 occ-decompile = { path = "crates/occ-decompile" }
 occ-sym = { path = "crates/occ-sym" }
 occ-dynamic = { path = "crates/occ-dynamic" }
+occ-vsa = { path = "crates/occ-vsa" }
 
 [profile.release]
 opt-level = 3

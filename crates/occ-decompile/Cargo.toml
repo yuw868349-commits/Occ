@@ -11,5 +11,6 @@ description = "Recovered control flow and pseudo-C from decoded instructions."
 occ-core.workspace = true
 
 [dev-dependencies]
+occ-sys.workspace = true
 occ-bin.workspace = true
 occ-analyze.workspace = true

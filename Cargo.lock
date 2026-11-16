@@ -9,6 +9,7 @@ dependencies = [
  "occ-bin",
  "occ-core",
  "occ-decode",
+ "occ-sys",
 ]
 
 [[package]]
@@ -41,6 +42,7 @@ dependencies = [
  "occ-analyze",
  "occ-bin",
  "occ-core",
+ "occ-sys",
 ]
 
 [[package]]
@@ -60,7 +62,21 @@ dependencies = [
  "occ-bin",
  "occ-core",
  "occ-decode",
+ "occ-decompile",
  "occ-sys",
+]
+
+[[package]]
+name = "occ-ffi"
+version = "0.1.0"
+dependencies = [
+ "occ-analyze",
+ "occ-bin",
+ "occ-core",
+ "occ-decode",
+ "occ-decompile",
+ "occ-json",
+ "occ-session",
 ]
 
 [[package]]
@@ -80,6 +96,7 @@ dependencies = [
  "occ-session",
  "occ-sym",
  "occ-sys",
+ "occ-vsa",
 ]
 
 [[package]]
@@ -102,8 +119,21 @@ dependencies = [
  "occ-bin",
  "occ-core",
  "occ-decompile",
+ "occ-sys",
 ]
 
 [[package]]
 name = "occ-sys"
 version = "0.1.0"
+
+[[package]]
+name = "occ-vsa"
+version = "0.1.0"
+dependencies = [
+ "occ-analyze",
+ "occ-bin",
+ "occ-core",
+ "occ-decompile",
+ "occ-session",
+ "occ-sys",
+]

@@ -52,6 +52,7 @@ fn build() -> Option<PathBuf> {
     let n = SEQ.fetch_add(1, Ordering::SeqCst);
     let dir = std::env::temp_dir().join(format!("occ-jumptable-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch directory");
+    occ_sys::cleanup::remove_dir_at_exit(&dir);
     let src = dir.join("unit.c");
     std::fs::write(&src, SOURCE).expect("write source");
     let out = dir.join("unit");

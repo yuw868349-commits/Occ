@@ -24,6 +24,7 @@ int entry_point(int a, int b) { return helper(a) + b; }
 fn scratch() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("occ-objects-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch directory");
+    occ_sys::cleanup::remove_dir_at_exit(&dir);
     dir
 }
 

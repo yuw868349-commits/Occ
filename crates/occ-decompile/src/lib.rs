@@ -42,6 +42,17 @@ pub struct Options {
     pub max_blocks: usize,
     /// Keep `// comment` statements for instructions that were not lifted.
     pub keep_comments: bool,
+    /// Keep definitions that nothing in the function reads.
+    ///
+    /// A statement is dead when no later statement and no terminator uses the
+    /// name it defines, and the clean-up pass drops those, which is what makes
+    /// the rendered output readable. A client that reads *values* instead of
+    /// statements cannot afford that: a block that ends in a branch the
+    /// recovery could not follow (`ja .cold`) has no terminator to use
+    /// anything, so every definition in it looks dead, and the value the
+    /// branch tested is gone. Such a client sets this and reads the block as
+    /// lifted.
+    pub keep_dead: bool,
 }
 
 impl Default for Options {
@@ -49,6 +60,7 @@ impl Default for Options {
         Options {
             max_blocks: 20_000,
             keep_comments: true,
+            keep_dead: false,
         }
     }
 }
@@ -468,7 +480,7 @@ pub fn build_program(
     if trace {
         show("coalesce", &cfg.blocks);
     }
-    ssa::cleanup(&mut cfg.blocks, &opaque);
+    ssa::cleanup(&mut cfg.blocks, &opaque, opts.keep_dead);
     if trace {
         show("cleanup", &cfg.blocks);
     }

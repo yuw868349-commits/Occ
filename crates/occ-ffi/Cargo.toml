@@ -1,0 +1,25 @@
+[package]
+name = "occ-ffi"
+description = "C ABI for occ: open a binary and question it from any language."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `libocc.a` and `libocc.so`, so a caller links with `-locc` and includes
+# `occ.h`. The rlib exists so the crate's own tests can call into it.
+name = "occ"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+occ-core.workspace = true
+occ-json.workspace = true
+occ-session.workspace = true
+occ-analyze.workspace = true
+occ-decode.workspace = true
+occ-decompile.workspace = true
+
+[dev-dependencies]
+occ-bin.workspace = true

@@ -12,5 +12,6 @@ occ-core.workspace = true
 occ-decompile.workspace = true
 
 [dev-dependencies]
+occ-sys.workspace = true
 occ-analyze.workspace = true
 occ-bin.workspace = true

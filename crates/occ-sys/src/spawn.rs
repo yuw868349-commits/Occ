@@ -179,8 +179,8 @@ impl Drop for Shared {
 ///
 /// Returns 0 in the child, which is the caller's cue to do nothing further and
 /// let the tracer drive it, and the child's pid in the parent. The child makes
-/// three calls before it stops — `ptrace(TRACEME)`, `raise(SIGSTOP)` and a
-/// spin — all of them async-signal-safe, which is the only thing a forked
+/// four calls before it stops — `ptrace(TRACEME)`, `setrlimit`, `raise(SIGSTOP)`
+/// and a spin — all of them async-signal-safe, which is the only thing a forked
 /// child may do.
 pub fn fork_stopped_child() -> Result<i32, SysError> {
     // SAFETY: `fork` takes no arguments, and the child performs no allocation.
@@ -190,9 +190,14 @@ pub fn fork_stopped_child() -> Result<i32, SysError> {
     }
     if pid == 0 {
         // SAFETY: single-step tracing of the calling process, then a stop the
-        // parent is waiting for.
+        // parent is waiting for. The child executes one instruction at a time
+        // and many of those instructions fault on purpose, so the core-dump
+        // limit is lowered before it does anything: a faulting instruction
+        // would otherwise write a core file into the directory the tracer was
+        // started from.
         unsafe {
             let _ = crate::ptrace::trace_me();
+            let _ = crate::proc::disable_core_dumps();
             raise(SIGSTOP);
         }
         // The tracer resumes this only to execute one instruction at a time.

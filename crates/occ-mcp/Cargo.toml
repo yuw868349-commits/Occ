@@ -18,6 +18,7 @@ occ-session.workspace = true
 occ-dwarf.workspace = true
 occ-decompile.workspace = true
 occ-sym.workspace = true
+occ-vsa.workspace = true
 occ-dynamic.workspace = true
 occ-json.workspace = true
 occ-sys.workspace = true

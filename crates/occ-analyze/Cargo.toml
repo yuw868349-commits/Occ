@@ -12,4 +12,5 @@ occ-core.workspace = true
 occ-decode.workspace = true
 
 [dev-dependencies]
+occ-sys.workspace = true
 occ-bin.workspace = true

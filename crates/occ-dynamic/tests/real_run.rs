@@ -49,10 +49,45 @@ int main(void) {
 }
 "#;
 
+/// The directory the fixtures are compiled into.
+///
+/// It is named after the process so two test runs cannot collide, and it is
+/// removed when the test binary exits. Leaving it behind would fill `/tmp`
+/// with a directory per test run, each holding a copy of every fixture
+/// source and binary.
 fn scratch() -> PathBuf {
+    static ONCE: std::sync::Once = std::sync::Once::new();
     let dir = std::env::temp_dir().join(format!("occ-run-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create scratch directory");
+    occ_sys::cleanup::remove_dir_at_exit(&dir);
+    ONCE.call_once(|| remove_scratch_on_exit(&dir));
     dir
+}
+
+/// Remove the scratch directory when the process ends.
+///
+/// `Drop` on a value held in a `static` does not run at exit, so the cleanup
+/// is registered with `atexit` instead: the C runtime calls it while the
+/// process is still single-threaded and the filesystem is still there.
+fn remove_scratch_on_exit(dir: &Path) {
+    unsafe extern "C" {
+        fn atexit(f: extern "C" fn()) -> i32;
+    }
+    static DIR: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+    extern "C" fn cleanup() {
+        let taken = DIR.lock().ok().and_then(|mut g| g.take());
+        if let Some(dir) = taken {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    if let Ok(mut slot) = DIR.lock() {
+        *slot = Some(dir.to_path_buf());
+    }
+    // SAFETY: `cleanup` is a plain `extern "C" fn` with no arguments, and
+    // `atexit` takes exactly that.
+    unsafe {
+        atexit(cleanup);
+    }
 }
 
 /// Compile `source` into a uniquely named binary.
@@ -279,6 +314,43 @@ fn a_faulting_program_reports_the_signal_and_the_address() {
         .find(|s| s.signal == 11)
         .expect("SIGSEGV is recorded");
     assert_eq!(segv.fault, Some(0), "the fault address is the null page");
+}
+
+#[test]
+fn a_program_that_dies_leaves_no_core_file_behind() {
+    let Some(l) = build("fault", FAULT).map(load) else {
+        return;
+    };
+    // The tracee runs in the directory the test binary was started from, which
+    // is the crate directory. A core file there would land in the source tree
+    // of the project being developed, and the tracer's report already says
+    // what happened. The core-dump limit is lowered in the child before it
+    // execs, so the file is never created.
+    let before = core_files_in(&std::env::current_dir().expect("the current directory"));
+    let t = trace_of(&l, &RunConfig::default());
+    assert_eq!(t.end, End::Signaled(11), "{}", t.end.label());
+    let after = core_files_in(&std::env::current_dir().expect("the current directory"));
+    assert_eq!(
+        before, after,
+        "the tracee wrote a core file into the working directory"
+    );
+}
+
+/// Core files in `dir`, by name.
+///
+/// The names are compared rather than the count so that a core file left by
+/// something else running at the same time is not mistaken for one the tracee
+/// wrote, and one the tracee wrote is not missed because a different one
+/// disappeared.
+fn core_files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read the directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("core"))
+        .collect();
+    names.sort();
+    names
 }
 
 #[test]
