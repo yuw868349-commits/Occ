@@ -205,6 +205,57 @@ fn immediate(text: &str) -> Option<i64> {
     Some(if negative { -value } else { value })
 }
 
+/// The register the switch counts cases in, traced through a widening copy.
+///
+/// Compilers widen the index before the scaled load — `movzx eax, sil` — and
+/// the bound check that says how long the table is stays on the narrow
+/// register. Following the copy does two things: it names an expression whose
+/// value the case numbers describe, and it lets the bound check be found at
+/// all. Without it the switch was printed against the computed jump address,
+/// so `case 0x0` claimed to be the value the register holds at the jump.
+fn traced_index(window: &[&Instruction], index: &str) -> String {
+    let mut reg = family(index).to_string();
+    for _ in 0..4 {
+        let mut next = None;
+        for insn in window.iter().rev() {
+            let Some((dst, src)) = move_pair(&insn.text) else {
+                continue;
+            };
+            if family(dst) != reg {
+                continue;
+            }
+            // The last write to the register is the one that reaches the
+            // table. A copy from another register renames the value; one from
+            // memory or an immediate ends the chain, because `[rbx]` is not a
+            // register the case numbers can be counted in.
+            next = src.map(|s| family(s).to_string());
+            break;
+        }
+        match next {
+            Some(src) if src != reg => reg = src,
+            _ => break,
+        }
+    }
+    reg
+}
+
+/// `movzx eax, sil` → ("eax", Some("sil")); `mov eax, [rbx]` → ("eax", None).
+fn move_pair(text: &str) -> Option<(&str, Option<&str>)> {
+    let (op, rest) = text.split_once(' ')?;
+    if !matches!(op, "mov" | "movzx" | "movsx" | "movsxd") {
+        return None;
+    }
+    let (dst, src) = rest.split_once(", ")?;
+    let dst = dst.trim();
+    let src = src.trim();
+    let src = if !src.is_empty() && src.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(src)
+    } else {
+        None
+    };
+    Some((dst, src))
+}
+
 /// The 64-bit name of a register, whatever width it was written at.
 ///
 /// `edi` and `rdi` are one register, and a bound check written at 32 bits
@@ -282,13 +333,18 @@ fn shape(
     // Confirm the entry width rather than assuming it: a scaled load into the
     // jumped register with scale 4 means 32-bit relative offsets.
     let mut entry = None;
-    for insn in slice.iter().rev() {
+    for (at, insn) in slice.iter().enumerate().rev() {
         if let Some((dst, mem)) = load_pair(&insn.text)
             && dst == reg
             && mem.base.as_deref() == Some(base_reg)
             && matches!(mem.scale, 4 | 8)
         {
-            entry = Some((mem.scale as u8, mem.index));
+            // The load itself overwrites the index register with the entry, so
+            // the value the cases count is whatever it held before this
+            // instruction — trace it through the copies before the load, not
+            // through the load.
+            let index = mem.index.map(|r| traced_index(&slice[..at], &r));
+            entry = Some((mem.scale as u8, index));
             break;
         }
     }
@@ -332,8 +388,12 @@ fn read_targets(
         if target == base {
             break;
         }
+        // Several cases can share one body — `case 1: case 2:` compiles to two
+        // entries naming the same address — so a repeated target is a fact
+        // about the switch, not the end of the table. Stopping here kept only
+        // the first few entries and left every other case body undecoded.
         if !seen.insert(target.0) {
-            break;
+            continue;
         }
         out.push(target);
     }
@@ -526,6 +586,38 @@ mod tests {
         assert_eq!(cmp_against_immediate("cmp edi, 0x9"), Some(("edi", 9)));
         assert_eq!(cmp_against_immediate("cmp edi, 0x0"), Some(("edi", 0)));
         assert_eq!(cmp_against_immediate("cmp eax, esi"), None);
+    }
+
+    #[test]
+    fn a_table_whose_cases_share_a_body_keeps_its_later_entries() {
+        // `case 1: case 2:` compiles to two slots holding one address. Reading
+        // used to stop at the first repeat, which kept the first two cases of a
+        // real switch and left the rest of the function undecoded.
+        let mut data = vec![0u8; 0x100];
+        for (slot, offset) in [(0usize, 0x10u32), (4, 0x10), (8, 0x20), (12, 0x40)] {
+            data[slot..slot + 4].copy_from_slice(&offset.to_le_bytes());
+        }
+        let image = crate::testutil::image_with_code(&data);
+        let view = View::new(&image, &data);
+        let targets = read_targets(&view, Addr(0x1000), 4, true, None);
+        assert_eq!(targets, vec![Addr(0x1010), Addr(0x1020), Addr(0x1040)]);
+    }
+
+    #[test]
+    fn a_widened_index_is_traced_back_to_the_value_the_cases_count() {
+        // `movzx eax, sil` feeds the table, and the bound check that says how
+        // many cases there are stays on `sil`. Naming the index `rax` printed
+        // the switch against the computed jump address.
+        let owned = [
+            insn("movzx eax, sil"),
+            insn("movsxd rax, dword ptr [rdx + rax*4]"),
+            insn("add rax, rdx"),
+            insn("jmp rax"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(traced_index(&window[..1], "rax"), "rsi");
+        // Without a widening copy the register is its own index.
+        assert_eq!(traced_index(&window[..1], "rdi"), "rdi");
     }
 
     fn insn(text: &str) -> Instruction {

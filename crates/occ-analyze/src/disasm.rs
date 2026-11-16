@@ -80,6 +80,7 @@ pub struct Recovery {
     pub notes: Vec<String>,
 }
 
+#[derive(Clone)]
 struct Seed {
     addr: Addr,
     size: Option<u64>,
@@ -107,11 +108,26 @@ fn decode_native(
     // Sized seeds first: their exact bounds keep unsized ones from growing into
     // their neighbours.
     seeds.sort_by_key(|s| (s.size.is_none(), s.addr.0));
-    for s in seeds {
+    for s in seeds.iter() {
         if seen.insert(s.addr.0) {
-            queue.push_back(s);
+            queue.push_back(s.clone());
         }
     }
+
+    // Where one function has to stop. A size hint from the symbol table is the
+    // best answer when it is present; otherwise the next known entry is. Using
+    // the end of the section instead lets a jump into unrelated code extend a
+    // body by kilobytes, which shows up as a function whose size dwarfs its
+    // instruction count and whose range swallows its neighbours.
+    let mut bounds: Vec<u64> = seeds.iter().map(|s| s.addr.0).collect();
+    bounds.sort_unstable();
+    bounds.dedup();
+    let upper_bound = |addr: Addr| -> Addr {
+        match bounds.partition_point(|&b| b <= addr.0) {
+            i if i < bounds.len() => Addr(bounds[i]),
+            _ => section_end(view, addr).unwrap_or_else(|| addr.add(0x10_0000)),
+        }
+    };
 
     let mut total_insns = 0usize;
     let mut budget_hit = false;
@@ -128,7 +144,15 @@ fn decode_native(
         if inside_owned(&owned, seed.addr) {
             continue;
         }
-        let outcome = decode_function(view, dec, seed.addr, seed.size, &owned, opts);
+        let next_entry = upper_bound(seed.addr);
+        let limit = match seed.size {
+            Some(size) if size > 0 => {
+                let hinted = seed.addr.add(size);
+                if hinted < next_entry { hinted } else { next_entry }
+            }
+            _ => next_entry,
+        };
+        let outcome = decode_function(view, dec, seed.addr, seed.size, limit, &owned, opts);
         if outcome.func.insns.is_empty() {
             continue;
         }
@@ -255,13 +279,18 @@ fn wasm_functions(view: &View, opts: &RecoverOptions, notes: &mut Vec<String>) -
 pub fn recover(view: &View, opts: &RecoverOptions) -> Recovery {
     let image = view.image();
     let mut notes = Vec::new();
+    let mut decoder: Option<AnyDecoder> = None;
     let (mut functions, thunks) = if image.arch == Arch::Wasm {
         // A module has no address space to search: every function body is named
         // by a symbol and its extent is declared by the code section.
         (wasm_functions(view, opts, &mut notes), Vec::new())
     } else {
         match AnyDecoder::new(image.arch, image.bits) {
-            Some(dec) => decode_native(view, &dec, opts, &mut notes),
+            Some(dec) => {
+                let recovered = decode_native(view, &dec, opts, &mut notes);
+                decoder = Some(dec);
+                recovered
+            }
             None => {
                 notes.push(format!(
                     "no decoder for {} {}-bit; function recovery skipped",
@@ -280,7 +309,47 @@ pub fn recover(view: &View, opts: &RecoverOptions) -> Recovery {
         }
     };
 
+    if let Some(dec) = &decoder
+        && let Some(main_addr) = startup_main(view, dec, &functions)
+    {
+        let known = functions.iter().any(|f| f.entry == main_addr);
+        if !known {
+            let owned: BTreeMap<u64, u64> =
+                functions.iter().map(|f| (f.entry.0, f.end().0)).collect();
+            let limit = functions
+                .iter()
+                .filter(|f| f.entry > main_addr)
+                .map(|f| f.entry.0)
+                .min()
+                .map(Addr)
+                .unwrap_or_else(|| {
+                    section_end(view, main_addr).unwrap_or_else(|| main_addr.add(0x10_0000))
+                });
+            let out = decode_function(view, dec, main_addr, None, limit, &owned, opts);
+            if out.func.insns.len() >= 2 {
+                functions.push(out.func);
+            }
+        }
+        if let Some(f) = functions.iter_mut().find(|f| f.entry == main_addr) {
+            if f.name.is_none() {
+                f.name = Some("main".to_string());
+            }
+            notes.push(format!(
+                "main is {main_addr} — the address the entry point passes to the C runtime as \"main\""
+            ));
+        }
+    }
+
     functions.sort_by_key(|f| f.entry.0);
+    resolve_overlaps(&mut functions);
+    if let Some(dec) = &decoder {
+        let filled = fill_holes(view, dec, &mut functions, opts);
+        if filled > 0 {
+            notes.push(format!(
+                "decoded {filled} instruction(s) behind jumps that landed on bytes no block had claimed"
+            ));
+        }
+    }
     // A function reached only through a call has no seed name; the symbol table
     // may still know it. Filling names here costs one hash lookup per function
     // and turns `sub_4d84` into `main` on every non-stripped image.
@@ -381,13 +450,10 @@ fn decode_function(
     dec: &AnyDecoder,
     entry: Addr,
     size_hint: Option<u64>,
+    limit: Addr,
     owned: &BTreeMap<u64, u64>,
     opts: &RecoverOptions,
 ) -> Outcome {
-    let limit = match size_hint {
-        Some(s) if s > 0 => entry.add(s),
-        _ => section_end(view, entry).unwrap_or_else(|| entry.add(0x10_0000)),
-    };
 
     let mut insns: BTreeMap<u64, Instruction> = BTreeMap::new();
     let mut case_targets: BranchTargets = BranchTargets::new();
@@ -410,7 +476,7 @@ fn decode_function(
             if pc.0 >= limit.0 || budget == 0 {
                 break;
             }
-            if pc != entry && inside_owned(owned, pc) {
+            if pc != entry && owned_past(owned, pc, entry) {
                 break;
             }
             if insns.contains_key(&pc.0) {
@@ -461,11 +527,23 @@ fn decode_function(
                         Some(CallTarget::Direct { to })
                             if to.0 >= entry.0
                                 && to.0 < limit.0
-                                && !(to.0 > pc.0 && inside_owned(owned, to)) =>
+                                && !(to.0 > pc.0 && owned_past(owned, to, entry)) =>
                         {
                             // Backward jumps are loops; forward jumps inside
-                            // the bound are if/else joins. Anything that lands
-                            // in another function is a tail call.
+                            // the bound are if/else joins. A jump to something
+                            // that reads as a function entry — a known body, a
+                            // prologue, or an address the compiler padded up
+                            // to — is a tail call. Following it folds the other
+                            // function into this one and stretches the range
+                            // over everything between them.
+                            if to != entry
+                                && (owned_past(owned, to, entry)
+                                    || padding_before(view, to)
+                                    || looks_like_prologue(view, to))
+                            {
+                                callees.push(to);
+                                break;
+                            }
                             work.push_back(to);
                             break;
                         }
@@ -535,6 +613,152 @@ fn decode_function(
         func,
         callees,
     }
+}
+
+/// Make every function's body and range exclusive.
+///
+/// A decode can jump over an already-known body to a block laid out beyond it,
+/// and the bytes in between belong to that other function. Leaving them in this
+/// body makes two functions claim one address: one of them then reports a size
+/// its instructions do not fill, and the other reports instructions outside its
+/// own range. The later entry is the more specific claim — a call says "a
+/// function starts here" — so the earlier body gives up everything from there
+/// on, and its block graph is rebuilt from what remains.
+fn resolve_overlaps(functions: &mut [Function]) {
+    for i in 0..functions.len() {
+        let start = functions[i].entry.0;
+        let end = functions[i].end().0;
+        if end <= start {
+            continue;
+        }
+        // Entries are sorted, so the first following one is the only claim
+        // that can start inside this body.
+        let Some(next) = functions[i + 1..]
+            .iter()
+            .map(|f| f.entry.0)
+            .find(|&next| next < end)
+        else {
+            continue;
+        };
+        functions[i].insns.retain(|insn| insn.addr.0 < next);
+        let f = &mut functions[i];
+        let mut targets: BranchTargets = BranchTargets::new();
+        for table in &f.jump_tables {
+            targets.insert(table.at.0, table.targets.clone());
+        }
+        f.blocks = build_blocks_with_branch_targets(&f.insns, f.entry, &targets);
+        let end = f.insns.last().map(|x| x.end().0).unwrap_or(start);
+        f.size = end.saturating_sub(start);
+    }
+}
+
+/// Decode the bytes a function jumps into but never claimed.
+///
+/// Recursive descent follows a branch only while the target still looks like
+/// this function's own code, and an aligned block behind padding looks like
+/// somebody else's entry — so the jump survives and the bytes behind it do not.
+/// The listing then has an edge that leads nowhere. By this point every range
+/// is final, so the question "whose code is this" has an answer: a target
+/// inside `[entry, end)` that no instruction covers belongs to this function.
+///
+/// Only bytes reached from such a target are decoded, and a chain is kept only
+/// when it arrives at an instruction the function already had or ends on a
+/// terminator. A hole that is really a jump table therefore stays a hole: its
+/// bytes do not decode into a path with two ends.
+fn fill_holes(
+    view: &View,
+    dec: &AnyDecoder,
+    functions: &mut [Function],
+    opts: &RecoverOptions,
+) -> usize {
+    let mut added = 0usize;
+    for f in functions.iter_mut() {
+        let start = f.entry.0;
+        let end = f.end().0;
+        if end <= start || f.insns.is_empty() {
+            continue;
+        }
+        let mut have: HashSet<u64> = f.insns.iter().map(|i| i.addr.0).collect();
+        let mut wanted: Vec<u64> = Vec::new();
+        for insn in &f.insns {
+            if let Some(CallTarget::Direct { to }) = &insn.target
+                && to.0 > start
+                && to.0 < end
+                && !have.contains(&to.0)
+            {
+                wanted.push(to.0);
+            }
+        }
+        if wanted.is_empty() {
+            continue;
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        let cap = opts.max_insns.min(4096);
+        let mut extra: Vec<Instruction> = Vec::new();
+        for target in wanted {
+            if have.contains(&target) {
+                continue;
+            }
+            let mut chain: Vec<Instruction> = Vec::new();
+            let mut pc = Addr(target);
+            let mut connected = false;
+            while pc.0 < end && !have.contains(&pc.0) && chain.len() < cap {
+                let Some(bytes) = view.bytes_to_end(pc) else {
+                    break;
+                };
+                let Some(decoded) = dec.decode(pc, bytes) else {
+                    break;
+                };
+                let insn = decoded.insn;
+                let next = insn.end();
+                if next.0 > end {
+                    break;
+                }
+                let terminal = matches!(
+                    insn.flow,
+                    FlowKind::Return | FlowKind::UnconditionalBranch | FlowKind::IndirectBranch
+                );
+                chain.push(insn);
+                pc = next;
+                if terminal {
+                    break;
+                }
+                if have.contains(&pc.0) {
+                    connected = true;
+                    break;
+                }
+            }
+            let ends_on_terminator = chain.last().is_some_and(|i| {
+                matches!(
+                    i.flow,
+                    FlowKind::Return | FlowKind::UnconditionalBranch | FlowKind::IndirectBranch
+                )
+            });
+            if chain.is_empty() || !(connected || ends_on_terminator) {
+                continue;
+            }
+            for insn in &chain {
+                have.insert(insn.addr.0);
+            }
+            added += chain.len();
+            extra.extend(chain);
+        }
+        if extra.is_empty() {
+            continue;
+        }
+        f.insns.extend(extra);
+        f.insns.sort_by_key(|i| i.addr.0);
+        f.insns.dedup_by_key(|i| i.addr.0);
+        let mut targets: BranchTargets = BranchTargets::new();
+        for table in &f.jump_tables {
+            targets.insert(table.at.0, table.targets.clone());
+        }
+        f.blocks = build_blocks_with_branch_targets(&f.insns, f.entry, &targets);
+        let end = f.insns.last().map(|x| x.end().0).unwrap_or(start);
+        f.size = end.saturating_sub(start);
+    }
+    added
 }
 
 /// Confidence that the recovered range is exactly one function.
@@ -616,6 +840,24 @@ fn section_end(view: &View, addr: Addr) -> Option<Addr> {
 
 fn inside_owned(owned: &BTreeMap<u64, u64>, addr: Addr) -> bool {
     if let Some((_, &end)) = owned.range(..=addr.0).next_back()
+        && addr.0 < end
+    {
+        return true;
+    }
+    false
+}
+
+/// True when `addr` lies in a body that belongs to a function starting at or
+/// after `entry`.
+///
+/// A range that starts *before* the function being decoded cannot be a reason
+/// to stop: the later entry wins, [`resolve_overlaps`] clips the earlier body
+/// at this entry, and every byte from `entry` on is this function's. Treating
+/// those bytes as somebody else's left a hole — valid instructions that no
+/// block claimed, with a jump into them that the lift could only describe.
+fn owned_past(owned: &BTreeMap<u64, u64>, addr: Addr, entry: Addr) -> bool {
+    if let Some((&start, &end)) = owned.range(..=addr.0).next_back()
+        && start > entry.0
         && addr.0 < end
     {
         return true;
@@ -1039,6 +1281,226 @@ fn build_xrefs(functions: &[Function], thunks: &[(Addr, String)], image: &Image)
 }
 
 /// Heuristic prologue match, used only when no symbol covers the address.
+/// Find `main` from the arguments the entry point hands the C runtime.
+///
+/// Every libc start-up path — glibc and musl, static or dynamic — calls
+/// `__libc_start_main` with `main` as the first argument, and the entry point
+/// has to put it there with an immediate or a PC-relative `lea`, because no
+/// memory holds it yet. When the symbol table is stripped, that instruction is
+/// the only record of where the program's own code begins. Without it, a
+/// stripped static binary has no `main`: every tool that starts from `main`
+/// reports "not found", and the analysis of the program's own code stops at the
+/// entry point.
+///
+/// The tracker is deliberately narrow. It follows one register and gives up on
+/// the first instruction that writes it in a form it does not model, so a
+/// failed guess is a missing `main`, never a wrong one.
+fn startup_main(view: &View, dec: &AnyDecoder, functions: &[Function]) -> Option<Addr> {
+    let image = view.image();
+    let entry = image.entry;
+    if entry.is_null() || !view.is_exec(entry) {
+        return None;
+    }
+    // Prefer the recovered `_start`: it has already been bounded, so it ends
+    // before the next function instead of running into it. Fall back to a
+    // bounded decode when recovery did not keep it.
+    let owned: BTreeMap<u64, u64> = functions.iter().map(|f| (f.entry.0, f.end().0)).collect();
+    let body: Vec<Instruction> = match functions.iter().find(|f| f.entry == entry) {
+        Some(f) if f.insns.len() >= 2 => f.insns.clone(),
+        _ => {
+            let limit = section_end(view, entry).unwrap_or_else(|| entry.add(0x1000));
+            decode_function(view, dec, entry, None, limit, &owned, &RecoverOptions::default())
+                .func
+                .insns
+        }
+    };
+    if body.len() < 2 {
+        return None;
+    }
+    let candidate = match image.arch {
+        Arch::X86_64 | Arch::X86 => first_argument_x86(&body),
+        Arch::Aarch64 => first_argument_aarch64(&body),
+        Arch::RiscV32 | Arch::RiscV64 => first_argument_riscv(&body),
+        _ => None,
+    }?;
+    let candidate = Addr(candidate);
+    // It has to be code in this image, and not the entry point itself.
+    if candidate == entry || !view.is_exec(candidate) {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Strip legacy and REX prefixes, returning the REX byte when present.
+fn x86_prefixes(bytes: &[u8]) -> (Option<u8>, &[u8]) {
+    let mut i = 0;
+    let mut rex = None;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 | 0x2e | 0x3e | 0x26 | 0x36 | 0x64 | 0x65 => i += 1,
+            0x40..=0x4f => {
+                rex = Some(bytes[i]);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    (rex, &bytes[i.min(bytes.len())..])
+}
+
+fn first_argument_x86(insns: &[Instruction]) -> Option<u64> {
+    let mut tracked: Option<u64> = None;
+    for insn in insns {
+        let raw = &insn.bytes[..(insn.len as usize).min(insn.bytes.len())];
+        let (rex, b) = x86_prefixes(raw);
+        let wide = rex.is_some_and(|r| r & 0x08 != 0);
+        if insn.flow.is_call() {
+            return tracked;
+        }
+        if b.len() >= 2 && b[0] == 0xc7 && b[1] & 0xf8 == 0xc0 && b[1] & 0x07 == 0x07 {
+            // mov rdi, imm32 — sign-extended to the operand size.
+            if b.len() >= 6 {
+                let imm = i32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                tracked = Some(imm as i64 as u64);
+                continue;
+            }
+        }
+        if b.len() == 5 && b[0] == 0xbf && !wide {
+            // mov edi, imm32 — zero-extended.
+            tracked = Some(u64::from(u32::from_le_bytes([b[1], b[2], b[3], b[4]])));
+            continue;
+        }
+        if b.len() == 10 && b[0] == 0xbf && wide {
+            tracked = Some(u64::from_le_bytes([
+                b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8],
+            ]));
+            continue;
+        }
+        if b.len() == 6 && b[0] == 0x8d && b[1] == 0x3d {
+            // lea rdi, [rip+disp32].
+            let disp = i32::from_le_bytes([b[2], b[3], b[4], b[5]]) as i64;
+            tracked = Some(insn.end().0.wrapping_add_signed(disp));
+            continue;
+        }
+        if x86_writes_rdi(b) {
+            tracked = None;
+        }
+    }
+    None
+}
+
+/// True when the instruction's destination is `rdi`.
+fn x86_writes_rdi(b: &[u8]) -> bool {
+    let Some(&op) = b.first() else {
+        return false;
+    };
+    // pop rdi
+    if op == 0x5f {
+        return true;
+    }
+    // The arithmetic and move opcodes whose `reg` field is a destination.
+    let writes_reg = matches!(
+        op,
+        0x89 | 0x8b | 0x31 | 0x33 | 0x01 | 0x03 | 0x21 | 0x23 | 0x09 | 0x0b | 0x29 | 0x2b
+    ) || matches!(op, 0x0f) && b.get(1).is_some_and(|v| matches!(v & 0xf0, 0xb0..=0xbf));
+    if !writes_reg {
+        return false;
+    }
+    let modrm = b[1];
+    (modrm >> 3) & 7 == 7
+}
+
+fn first_argument_aarch64(insns: &[Instruction]) -> Option<u64> {
+    let mut x0: Option<u64> = None;
+    for insn in insns {
+        if insn.flow.is_call() {
+            return x0;
+        }
+        let b = &insn.bytes;
+        let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        // adrp x0, label
+        if w & 0x9f00_0000 == 0x9000_0000 && w & 0x1f == 0 {
+            let immlo = ((w >> 29) & 3) as i64;
+            let immhi = ((w >> 5) & 0x7ffff) as i64;
+            let imm = ((immhi << 2) | immlo) << 43 >> 43;
+            x0 = Some((insn.addr.0 & !0xfff).wrapping_add_signed(imm << 12));
+            continue;
+        }
+        // add x0, x0, #imm
+        if w & 0xffc0_03ff == 0x9100_0000 && w & 0x1f == 0 {
+            let shift = if w & 0x0040_0000 != 0 { 12 } else { 0 };
+            let imm = u64::from((w >> 10) & 0xfff) << shift;
+            x0 = x0.map(|v| v.wrapping_add(imm));
+            continue;
+        }
+        // movz x0, #imm16, lsl #n
+        if w & 0xff80_0000 == 0xd280_0000 && w & 0x1f == 0 {
+            let imm = u64::from((w >> 5) & 0xffff) << (((w >> 21) & 3) * 16);
+            x0 = Some(imm);
+            continue;
+        }
+        if (w & 0x1f) == 0 && writes_rd(w, true) {
+            x0 = None;
+        }
+    }
+    None
+}
+
+fn first_argument_riscv(insns: &[Instruction]) -> Option<u64> {
+    let mut a0: Option<u64> = None;
+    for insn in insns {
+        if insn.flow.is_call() {
+            return a0;
+        }
+        let b = &insn.bytes;
+        if insn.len < 4 {
+            // A compressed instruction may write a0 in a form not modelled
+            // here; forget the value rather than carry a stale one.
+            let h = u16::from_le_bytes([b[0], b[1]]);
+            if (h & 0x7f) == 0x01 {
+                a0 = None;
+            }
+            continue;
+        }
+        let w = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let rd = (w >> 7) & 0x1f;
+        let rs1 = (w >> 15) & 0x1f;
+        // auipc a0, imm20
+        if w & 0x7f == 0x17 && rd == 10 {
+            let hi = (w & 0xffff_f000) as i32 as i64;
+            a0 = Some(insn.addr.0.wrapping_add_signed(hi));
+            continue;
+        }
+        // addi a0, a0, imm12
+        if w & 0x7f == 0x13 && rd == 10 && rs1 == 10 && (w >> 12) & 7 == 0 {
+            let lo = (w as i32) >> 20;
+            a0 = a0.map(|v| v.wrapping_add_signed(i64::from(lo)));
+            continue;
+        }
+        // lui a0, imm20
+        if w & 0x7f == 0x37 && rd == 10 {
+            a0 = Some((w & 0xffff_f000) as i32 as i64 as u64);
+            continue;
+        }
+        if rd == 10 && matches!(w & 0x7f, 0x13 | 0x33 | 0x37 | 0x1b | 0x3b) {
+            a0 = None;
+        }
+    }
+    None
+}
+
+/// True when the byte before `addr` is padding the compiler emitted between
+/// functions rather than code that falls through.
+fn padding_before(view: &View, addr: Addr) -> bool {
+    if addr.0 == 0 {
+        return false;
+    }
+    matches!(
+        view.bytes(addr.offset(-1), 1),
+        Some([0x90] | [0xcc] | [0x00] | [0xc3] | [0x66])
+    )
+}
+
 fn looks_like_prologue(view: &View, addr: Addr) -> bool {
     let Some(b) = view.bytes(addr, 8) else {
         return false;
@@ -1103,6 +1565,11 @@ fn sweep(
 ) {
     let mut added = 0usize;
     let mut budget = opts.max_sweep_bytes;
+    // Every call a swept body makes names a function the sweep has not reached
+    // yet. Without following them, a stripped image recovers only the bodies
+    // that happen to open with a recognisable prologue, which is less than half
+    // of a real binary.
+    let mut pending: Vec<Addr> = Vec::new();
     for s in view.image().sections.iter().filter(|s| s.is_code() && s.file_size > 0) {
         let mut addr = s.addr;
         // Only bytes the file holds can be decoded. `size` is the virtual
@@ -1131,18 +1598,60 @@ fn sweep(
                 addr = addr.add(1);
                 continue;
             }
+            // Padding is not code. Starting a decode in a run of `nop`/`int3`
+            // produces a "function" whose body is the padding followed by the
+            // real one, and its entry is a byte the compiler never meant as a
+            // boundary.
+            if addr != s.addr && matches!(view.bytes(addr, 1), Some([0x90] | [0xcc] | [0x00])) {
+                addr = addr.add(1);
+                continue;
+            }
             let boundary = if addr == s.addr {
                 true
             } else {
                 matches!(view.bytes(addr.offset(-1), 1), Some([0xcc] | [0x90] | [0x00]))
             };
-            if boundary && looks_like_prologue(view, addr) {
-                let out = decode_function(view, dec, addr, None, owned, opts);
-                if out.func.insns.len() >= 3 {
+            // Fixed-width architectures do not need a prologue to prove a
+            // function starts here: every arm64 instruction is four bytes and
+            // a leaf function opens with `add`/`li`, no frame at all. What the
+            // sweep can still check is alignment, and that a decode ending in
+            // `ret` accounts for the bytes it claims.
+            let aligned = match view.image().arch {
+                occ_core::Arch::Aarch64 => addr.0 % 4 == 0,
+                occ_core::Arch::RiscV32 | occ_core::Arch::RiscV64 => addr.0 % 2 == 0,
+                _ => true,
+            };
+            let prologue = looks_like_prologue(view, addr);
+            let fixed_width = matches!(
+                view.image().arch,
+                occ_core::Arch::Aarch64 | occ_core::Arch::RiscV32 | occ_core::Arch::RiscV64
+            );
+            // The prologue is evidence, not a requirement: a leaf function
+            // compiled with `-O2` starts with a `mov` and ends with a `ret`,
+            // and requiring a frame record skipped every one of them. The body
+            // still has to end in a return to be accepted, which is what keeps
+            // a decode that fell into unrelated bytes from becoming a function.
+            let _ = fixed_width;
+            if boundary && aligned {
+                // The body cannot run past a function that is already placed:
+                // those bytes belong to that function, whatever the decoder
+                // finds there.
+                let next_owned = owned
+                    .range((std::ops::Bound::Excluded(addr.0), std::ops::Bound::Unbounded))
+                    .next()
+                    .map(|(start, _)| Addr(*start))
+                    .unwrap_or(end);
+                let out = decode_function(view, dec, addr, None, next_owned, owned, opts);
+                let ends_in_return = matches!(
+                    out.func.insns.last().map(|i| i.flow),
+                    Some(FlowKind::Return)
+                );
+                if out.func.insns.len() >= 3 && (prologue || ends_in_return) {
                     let mut f = out.func;
                     f.is_thunk = is_thunk(&f);
                     owned.insert(f.entry.0, f.end().0);
                     addr = f.end().max(addr.add(1));
+                    pending.extend(out.callees.iter().copied());
                     functions.push(f);
                     added += 1;
                     continue;
@@ -1150,6 +1659,44 @@ fn sweep(
             }
             addr = addr.add(1);
         }
+    }
+    // Follow the calls the sweep found. A called address is a function entry
+    // by definition, so these need no prologue check; they also cascade, since
+    // each one names its own callees.
+    let mut followed = 0usize;
+    while let Some(addr) = pending.pop() {
+        if functions.len() >= opts.max_functions {
+            notes.push(format!(
+                "call-following stopped at {} functions; {} address(es) were not recovered",
+                opts.max_functions,
+                pending.len() + 1
+            ));
+            break;
+        }
+        if !view.is_exec(addr) || inside_owned(owned, addr) {
+            continue;
+        }
+        let next_owned = owned
+            .range((std::ops::Bound::Excluded(addr.0), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(start, _)| Addr(*start))
+            .unwrap_or_else(|| section_end(view, addr).unwrap_or_else(|| addr.add(0x10_0000)));
+        let out = decode_function(view, dec, addr, None, next_owned, owned, opts);
+        if out.func.insns.is_empty() {
+            continue;
+        }
+        let mut f = out.func;
+        f.is_thunk = is_thunk(&f);
+        owned.insert(f.entry.0, f.end().0);
+        pending.extend(out.callees.iter().copied());
+        functions.push(f);
+        added += 1;
+        followed += 1;
+    }
+    if followed > 0 {
+        notes.push(format!(
+            "sweep followed calls to {followed} function(s) that no symbol named"
+        ));
     }
     if added > 0 {
         notes.push(format!("sweep recovered {added} functions without symbol support"));

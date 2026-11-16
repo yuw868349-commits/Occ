@@ -52,8 +52,15 @@ impl Default for AnalysisOptions {
 pub struct Coverage {
     /// Executable bytes declared by sections.
     pub code_bytes: u64,
-    /// Bytes inside a recovered function.
+    /// Bytes an instruction covers, unioned across functions.
+    ///
+    /// This is the number the summary means by "code decoded". It is not the
+    /// same as the space the functions claim: a body can jump over a chunk the
+    /// recovery never followed, and counting the range would report those bytes
+    /// as decoded when nothing reads them.
     pub decoded_bytes: u64,
+    /// Bytes inside a recovered function's range, holes included.
+    pub covered_bytes: u64,
     /// Functions recovered.
     pub functions: usize,
     /// Instructions decoded.
@@ -125,7 +132,8 @@ impl Analysis {
 
         // Union, not sum: two functions that overlap (a shared tail, a
         // mis-recovered bound) must not push coverage past 100%.
-        let decoded_bytes = union_len(&functions);
+        let decoded_bytes = insn_bytes(&functions);
+        let covered_bytes = union_len(&functions);
         let blocks = functions.iter().map(|f| f.blocks.len()).sum();
         let insns = functions.iter().map(|f| f.insns.len()).sum();
 
@@ -139,6 +147,7 @@ impl Analysis {
             coverage: Coverage {
                 code_bytes: rec.code_bytes,
                 decoded_bytes,
+                covered_bytes,
                 functions: functions.len(),
                 insns,
                 blocks,
@@ -254,6 +263,26 @@ fn union_len(functions: &[Function]) -> u64 {
         .filter(|(a, b)| b > a)
         .collect();
     ranges.sort_unstable();
+    span_union(ranges)
+}
+
+/// Total bytes covered by the union of decoded instructions.
+///
+/// A function's range can be larger than the instructions inside it, so this is
+/// the only count that answers "was this byte decoded". Overlaps are unioned
+/// for the same reason as above: two functions that share a tail are one run of
+/// bytes, not two.
+fn insn_bytes(functions: &[Function]) -> u64 {
+    let mut ranges: Vec<(u64, u64)> = functions
+        .iter()
+        .flat_map(|f| f.insns.iter().map(|i| (i.addr.0, i.end().0)))
+        .filter(|(a, b)| b > a)
+        .collect();
+    ranges.sort_unstable();
+    span_union(ranges)
+}
+
+fn span_union(ranges: Vec<(u64, u64)>) -> u64 {
     let mut total = 0u64;
     let mut cur: Option<(u64, u64)> = None;
     for (a, b) in ranges {
