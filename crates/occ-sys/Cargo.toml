@@ -1,0 +1,10 @@
+[package]
+name = "occ-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+description = "Linux ptrace and mmap bindings declared directly against libc."
+
+[dependencies]

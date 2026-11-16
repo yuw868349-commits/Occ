@@ -1,0 +1,16 @@
+[package]
+name = "occ-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Session state, handle resolution, persistence and diffing."
+
+[dependencies]
+occ-core.workspace = true
+occ-bin.workspace = true
+occ-analyze.workspace = true
+occ-json.workspace = true
+occ-dwarf.workspace = true
+occ-dynamic.workspace = true

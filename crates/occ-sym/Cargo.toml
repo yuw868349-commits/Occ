@@ -1,0 +1,16 @@
+[package]
+name = "occ-sym"
+description = "Concrete and symbolic execution, and taint propagation, over the decompiler IR"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+occ-core.workspace = true
+occ-decompile.workspace = true
+
+[dev-dependencies]
+occ-analyze.workspace = true
+occ-bin.workspace = true

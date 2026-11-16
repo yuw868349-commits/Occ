@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/occ-json",
+    "crates/occ-sys",
+    "crates/occ-bin",
+    "crates/occ-decode",
+    "crates/occ-core",
+    "crates/occ-analyze",
+    "crates/occ-session",
+    "crates/occ-mcp",
+    "crates/occ-dwarf",
+    "crates/occ-decompile",
+    "crates/occ-sym",
+    "crates/occ-dynamic",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://example.invalid/occ"
+
+[workspace.dependencies]
+occ-sys = { path = "crates/occ-sys" }
+occ-core = { path = "crates/occ-core" }
+occ-bin = { path = "crates/occ-bin" }
+occ-decode = { path = "crates/occ-decode" }
+occ-analyze = { path = "crates/occ-analyze" }
+occ-json = { path = "crates/occ-json" }
+occ-session = { path = "crates/occ-session" }
+occ-dwarf = { path = "crates/occ-dwarf" }
+occ-decompile = { path = "crates/occ-decompile" }
+occ-sym = { path = "crates/occ-sym" }
+occ-dynamic = { path = "crates/occ-dynamic" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 1

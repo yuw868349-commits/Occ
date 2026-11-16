@@ -1,0 +1,15 @@
+[package]
+name = "occ-dwarf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "DWARF line tables, functions, variables and types."
+
+[dependencies]
+occ-core.workspace = true
+occ-analyze.workspace = true
+
+[dev-dependencies]
+occ-bin.workspace = true

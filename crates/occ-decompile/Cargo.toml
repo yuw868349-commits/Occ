@@ -1,0 +1,15 @@
+[package]
+name = "occ-decompile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Recovered control flow and pseudo-C from decoded instructions."
+
+[dependencies]
+occ-core.workspace = true
+
+[dev-dependencies]
+occ-bin.workspace = true
+occ-analyze.workspace = true

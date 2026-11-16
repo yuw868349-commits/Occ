@@ -1,0 +1,15 @@
+[package]
+name = "occ-analyze"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Function recovery, cross references, strings and decompilation."
+
+[dependencies]
+occ-core.workspace = true
+occ-decode.workspace = true
+
+[dev-dependencies]
+occ-bin.workspace = true

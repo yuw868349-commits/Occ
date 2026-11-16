@@ -1,0 +1,23 @@
+[package]
+name = "occ-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP server exposing binary analysis to AI clients."
+
+[[bin]]
+name = "occ"
+path = "src/main.rs"
+
+[dependencies]
+occ-core.workspace = true
+occ-analyze.workspace = true
+occ-session.workspace = true
+occ-dwarf.workspace = true
+occ-decompile.workspace = true
+occ-sym.workspace = true
+occ-dynamic.workspace = true
+occ-json.workspace = true
+occ-sys.workspace = true

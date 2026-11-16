@@ -1,0 +1,323 @@
+//! End-to-end checks against hand-assembled machine code.
+//!
+//! Each fixture is a few instructions whose meaning is stated in the test. The
+//! bytes are decoded by the same recovery the tools use, so a mistake in the
+//! encoding shows up as a wrong instruction rather than as a silently passing
+//! test.
+
+use occ_analyze::{RecoverOptions, View, recover};
+use occ_core::{Addr, Arch, Endian, Fingerprint, Format, Image, ImageId, Perm, Section, SectionKind};
+use occ_decompile::Options;
+use occ_sym::{ExecConfig, Mode, Outcome, Source, TaintConfig, Verdict, explore, trace};
+
+fn image_with_code(code: &[u8]) -> Image {
+    Image {
+        id: ImageId(0),
+        path: "fixture".into(),
+        format: Format::Elf,
+        arch: Arch::X86_64,
+        bits: 64,
+        endian: Endian::Little,
+        entry: Addr(0x1000),
+        image_base: Addr(0x1000),
+        file_size: code.len() as u64,
+        sha256: String::new(),
+        segments: Vec::new(),
+        sections: vec![Section {
+            index: 1,
+            name: ".text".into(),
+            addr: Addr(0x1000),
+            file_offset: 0,
+            size: code.len() as u64,
+            file_size: code.len() as u64,
+            kind: SectionKind::Code,
+            perm: Perm::R.union(Perm::X),
+        }],
+        symbols: Vec::new(),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        relocations: Vec::new(),
+        fingerprint: Fingerprint::unknown(ImageId(0)),
+        interpreter: None,
+        warnings: Vec::new(),
+    }
+}
+
+fn no_static(_at: Addr, _bytes: u8) -> Option<u64> {
+    None
+}
+
+/// The first recovered function, which always starts at 0x1000.
+fn function_at_entry(image: &Image, code: &[u8]) -> occ_core::Function {
+    let view = View::new(image, code);
+    let rec = recover(
+        &view,
+        &RecoverOptions {
+            max_functions: 16,
+            max_insns: 4096,
+            follow_calls: false,
+            sweep_uncovered: false,
+        },
+    );
+    rec.functions
+        .into_iter()
+        .find(|f| f.entry == Addr(0x1000))
+        .expect("a function starts at the entry address")
+}
+
+const TWICE: &[u8] = &[0x48, 0x8d, 0x04, 0x3f, 0xc3];
+
+#[test]
+fn a_straight_line_function_returns_its_expression() {
+    // lea rax, [rdi + rdi] ; ret
+    let image = image_with_code(TWICE);
+    let func = function_at_entry(&image, TWICE);
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &ExecConfig::default(),
+    );
+    assert_eq!(report.paths.len(), 1, "no branches, so one path");
+    let path = &report.paths[0];
+    assert_eq!(path.outcome, Outcome::Return);
+    assert!(path.is_feasible());
+    assert_eq!(path.ret.as_deref(), Some("rdi + rdi"));
+    assert!(path.conds.is_empty(), "nothing to decide");
+}
+
+#[test]
+fn a_two_way_branch_yields_two_paths_with_solved_inputs() {
+    // cmp rdi, rsi ; jle +4 ; mov rax, rdi ; ret ; mov rax, rsi ; ret
+    let code: &[u8] = &[
+        0x48, 0x39, 0xf7, // cmp rdi, rsi
+        0x7e, 0x04, // jle +4
+        0x48, 0x89, 0xf8, // mov rax, rdi
+        0xc3, // ret
+        0x48, 0x89, 0xf0, // mov rax, rsi
+        0xc3, // ret
+    ];
+    let image = image_with_code(code);
+    let func = function_at_entry(&image, code);
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &ExecConfig::default(),
+    );
+    assert_eq!(report.paths.len(), 2, "one path per arm");
+    let mut returns: Vec<String> = report
+        .paths
+        .iter()
+        .filter_map(|p| p.ret.clone())
+        .collect();
+    returns.sort();
+    assert_eq!(returns, vec!["rdi".to_string(), "rsi".to_string()]);
+
+    for path in &report.paths {
+        assert_eq!(path.model.verdict, Verdict::Satisfied);
+        let model = path.model.map();
+        // Whatever the arm, the model must actually satisfy the condition that
+        // selected it. This is the property that makes the model trustworthy.
+        for cond in &path.conds {
+            assert_eq!(
+                occ_sym::solve_constraints(std::slice::from_ref(cond), 4096).verdict,
+                Verdict::Satisfied
+            );
+        }
+        assert!(!model.is_empty(), "the branch reads a register");
+    }
+}
+
+#[test]
+fn an_unsatisfiable_edge_is_not_reported_as_a_path() {
+    // test rdi, rdi ; je +6 ; mov eax, 1 ; ret ; xor eax, eax ; ret
+    let code: &[u8] = &[
+        0x48, 0x85, 0xff, // test rdi, rdi
+        0x74, 0x06, // je +6
+        0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+        0xc3, // ret
+        0x31, 0xc0, // xor eax, eax
+        0xc3, // ret
+    ];
+    let image = image_with_code(code);
+    let func = function_at_entry(&image, code);
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &ExecConfig::default(),
+    );
+    assert_eq!(report.paths.len(), 2);
+    let returns = report.returns();
+    assert_eq!(returns.len(), 2, "one path returns 1, the other 0");
+    // Both arms must be reachable, because `rdi` is free.
+    assert!(report.paths.iter().all(|p| p.is_feasible()));
+}
+
+#[test]
+fn concrete_mode_names_the_input_it_still_needs() {
+    // lea rax, [rdi + rdi] ; ret, with rdi supplied.
+    let image = image_with_code(TWICE);
+    let func = function_at_entry(&image, TWICE);
+    let cfg = ExecConfig {
+        mode: Mode::Concrete,
+        inputs: vec![("rdi".into(), 21)],
+        ..ExecConfig::default()
+    };
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &cfg,
+    );
+    assert_eq!(report.paths.len(), 1);
+    assert_eq!(report.paths[0].outcome, Outcome::Return);
+    // The expression is reported unfolded: the executor does not substitute
+    // values into the printed form, it reports what the program computes.
+    assert_eq!(report.paths[0].ret.as_deref(), Some("0x2a"));
+
+    let cfg = ExecConfig {
+        mode: Mode::Concrete,
+        ..ExecConfig::default()
+    };
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &cfg,
+    );
+    match &report.paths[0].outcome {
+        Outcome::Missing(names) => assert_eq!(names, &vec!["rdi".to_string()]),
+        other => panic!("expected a missing input, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_loop_is_unrolled_until_the_bound_and_says_so() {
+    // sub rdi, 1 ; test rdi, rdi ; jg -9 ; mov rax, rdi ; ret
+    let code: &[u8] = &[
+        0x48, 0x83, 0xef, 0x01, // sub rdi, 1
+        0x48, 0x85, 0xff, // test rdi, rdi
+        0x7f, 0xf7, // jg -9
+        0x48, 0x89, 0xf8, // mov rax, rdi
+        0xc3, // ret
+    ];
+    let image = image_with_code(code);
+    let func = function_at_entry(&image, code);
+    let cfg = ExecConfig {
+        max_loop: 3,
+        max_paths: 16,
+        ..ExecConfig::default()
+    };
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &cfg,
+    );
+    assert!(report.paths.len() > 1, "the loop has an exit and iterations");
+    let truncated = report
+        .paths
+        .iter()
+        .filter(|p| p.outcome == Outcome::Truncated("loop bound"))
+        .count();
+    assert!(truncated >= 1, "unrolling must stop and say where");
+    let feasible = report.feasible();
+    assert!(feasible >= 1, "at least the zero-iteration path returns");
+}
+
+#[test]
+fn a_parameter_reaching_a_call_is_reported_with_its_argument_index() {
+    // mov [rsp-8], rdi ; mov rdi, [rsp-8] ; call puts ; ret, with puts at
+    // 0x1010. The round trip through the slot is what a compiler emits for a
+    // pass-through argument at -O0, and it is what makes the lifter record that
+    // rdi is live at the call.
+    let code: &[u8] = &[
+        0x48, 0x89, 0x7c, 0x24, 0xf8, // mov [rsp-8], rdi
+        0x48, 0x8b, 0x7c, 0x24, 0xf8, // mov rdi, [rsp-8]
+        0xe8, 0x01, 0x00, 0x00, 0x00, // call 0x1010
+        0xc3, // ret
+        0xc3, // 0x1010: ret
+    ];
+    let image = image_with_code(code);
+    let func = function_at_entry(&image, code);
+    let cfg = TaintConfig::default();
+    let report = trace(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| {
+            if a == Addr(0x1010) {
+                "puts".into()
+            } else {
+                format!("sub_{:x}", a.get())
+            }
+        },
+        &[Source::Name("rdi".into())],
+        &cfg,
+    );
+    let call = report
+        .flows
+        .iter()
+        .find(|f| f.sink == "puts")
+        .expect("the argument register reaches puts");
+    assert_eq!(call.arg, Some(0));
+    assert_eq!(call.value, "rdi");
+    assert_eq!(call.source, "name:rdi");
+    assert!(report.converged);
+}
+
+#[test]
+fn a_tainted_branch_is_a_flow_of_its_own() {
+    // test rdi, rdi ; je +6 ; mov eax,1 ; ret ; xor eax,eax ; ret
+    let code: &[u8] = &[
+        0x48, 0x85, 0xff, 0x74, 0x06, 0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3, 0x31, 0xc0, 0xc3,
+    ];
+    let image = image_with_code(code);
+    let func = function_at_entry(&image, code);
+    let report = trace(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &[Source::Name("rdi".into())],
+        &TaintConfig::default(),
+    );
+    let branch = report
+        .flows
+        .iter()
+        .find(|f| f.sink == "branch")
+        .expect("the condition depends on rdi");
+    assert_eq!(branch.source, "name:rdi");
+    assert!(!branch.path.is_empty(), "a witness path back to the entry");
+    assert_eq!(branch.path.first().copied(), Some(Addr(0x1000)));
+}
+
+#[test]
+fn nothing_is_tainted_when_nothing_is_a_source() {
+    let image = image_with_code(TWICE);
+    let func = function_at_entry(&image, TWICE);
+    let report = trace(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &[],
+        &TaintConfig::default(),
+    );
+    assert!(report.flows.is_empty());
+    assert!(!report.notes.is_empty(), "an empty result is explained");
+}

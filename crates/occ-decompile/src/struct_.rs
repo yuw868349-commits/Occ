@@ -1,0 +1,808 @@
+//! Recovering structured control flow from the block graph.
+//!
+//! The output is C-shaped: `if`/`else`, `while`, `do`/`while`, `break`,
+//! `continue`, `return`. That covers what compilers emit for C, C++ and Rust at
+//! every optimisation level in practice. Irreducible graphs — mostly hand
+//! written assembly and obfuscated binaries — fall back to labelled `goto`, and
+//! the count of those is reported rather than hidden.
+//!
+//! Two analyses do the work: dominators (to find loops and their headers) and
+//! post-dominators (to find where the two arms of a branch rejoin).
+
+use std::collections::{HashMap, HashSet};
+
+use crate::ir::{Block, BlockId, Expr, Node, Stmt, Term};
+
+/// Control-flow facts the structurer needs.
+pub struct Graph {
+    /// Immediate dominator of each block, itself for the entry.
+    pub idom: Vec<BlockId>,
+    /// Immediate post-dominator; `None` when control does not rejoin.
+    pub ipdom: Vec<Option<BlockId>>,
+    /// Natural loops by header: every block in the loop.
+    pub loops: HashMap<BlockId, HashSet<BlockId>>,
+}
+
+impl Graph {
+    /// Compute dominators, post-dominators and natural loops.
+    pub fn new(blocks: &[Block], preds: &[Vec<BlockId>], succs: &[Vec<BlockId>], entry: BlockId) -> Graph {
+        let idom = dominators(blocks.len(), preds, entry);
+        let ipdom = post_dominators(blocks, succs);
+        let mut loops: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+        for (u, block) in blocks.iter().enumerate() {
+            for target in successors(block) {
+                if dominates(&idom, target, u) {
+                    // Back edge u -> target: the natural loop is target plus
+                    // every block that reaches u without passing through it.
+                    let mut set = HashSet::new();
+                    set.insert(target);
+                    let mut stack = vec![u];
+                    while let Some(x) = stack.pop() {
+                        if !set.insert(x) {
+                            continue;
+                        }
+                        for p in &preds[x] {
+                            if *p != target {
+                                stack.push(*p);
+                            }
+                        }
+                    }
+                    loops.entry(target).or_default().extend(set);
+                }
+            }
+        }
+        Graph {
+            idom,
+            ipdom,
+            loops,
+        }
+    }
+
+    /// True when `a` dominates `b`.
+    pub fn dominates(&self, a: BlockId, b: BlockId) -> bool {
+        dominates(&self.idom, a, b)
+    }
+}
+
+fn successors(b: &Block) -> Vec<BlockId> {
+    match &b.term {
+        Term::Jump(t) => vec![*t],
+        Term::Branch { then_bb, else_bb, .. } => vec![*then_bb, *else_bb],
+        Term::Switch { targets, .. } => targets.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// Cooper-Harvey-Kennedy dominators over a reverse post-order.
+fn dominators(n: usize, preds: &[Vec<BlockId>], entry: BlockId) -> Vec<BlockId> {
+    let mut order = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack = vec![(entry, 0usize)];
+    seen[entry] = true;
+    // Build a successor list from preds so the DFS does not need the CFG twice.
+    let mut succs = vec![Vec::new(); n];
+    for (b, ps) in preds.iter().enumerate() {
+        for p in ps {
+            succs[*p].push(b);
+        }
+    }
+    while let Some((b, i)) = stack.pop() {
+        if i < succs[b].len() {
+            stack.push((b, i + 1));
+            let s = succs[b][i];
+            if !seen[s] {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            order.push(b);
+        }
+    }
+    order.reverse();
+
+    let mut rpo = vec![usize::MAX; n];
+    for (i, b) in order.iter().enumerate() {
+        rpo[*b] = i;
+    }
+    let mut idom = vec![usize::MAX; n];
+    idom[entry] = entry;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &order {
+            if b == entry {
+                continue;
+            }
+            let mut new = usize::MAX;
+            for p in &preds[b] {
+                if idom[*p] == usize::MAX {
+                    continue;
+                }
+                new = if new == usize::MAX {
+                    *p
+                } else {
+                    intersect(&idom, &rpo, new, *p)
+                };
+            }
+            if new != usize::MAX && idom[b] != new {
+                idom[b] = new;
+                changed = true;
+            }
+        }
+    }
+    // Unreachable blocks dominate only themselves.
+    for (b, d) in idom.iter_mut().enumerate() {
+        if *d == usize::MAX {
+            *d = b;
+        }
+    }
+    idom
+}
+
+fn intersect(idom: &[BlockId], rpo: &[usize], mut a: BlockId, mut b: BlockId) -> BlockId {
+    while a != b {
+        while rpo[a] < rpo[b] {
+            let d = idom[a];
+            if d == a {
+                return a;
+            }
+            a = d;
+        }
+        while rpo[b] < rpo[a] {
+            let d = idom[b];
+            if d == b {
+                return b;
+            }
+            b = d;
+        }
+    }
+    a
+}
+
+/// Post-dominators, computed on the reversed graph from a virtual exit.
+fn post_dominators(blocks: &[Block], succs: &[Vec<BlockId>]) -> Vec<Option<BlockId>> {
+    let n = blocks.len();
+    let mut preds = vec![Vec::new(); n];
+    let mut exits = Vec::new();
+    for (b, ss) in succs.iter().enumerate() {
+        if ss.is_empty() {
+            exits.push(b);
+        }
+        for s in ss {
+            preds[*s].push(b);
+        }
+    }
+    // A virtual exit at index `n` with an edge from every real exit.
+    let mut rev_preds = preds;
+    for e in exits {
+        rev_preds[e].push(n);
+    }
+    let idom = dominators(n + 1, &rev_preds, n);
+    idom.iter()
+        .take(n)
+        .enumerate()
+        .map(|(b, &d)| if d == b || d == n { None } else { Some(d) })
+        .collect()
+}
+
+fn dominates(idom: &[BlockId], a: BlockId, b: BlockId) -> bool {
+    let mut cur = b;
+    for _ in 0..4096 {
+        if cur == a {
+            return true;
+        }
+        let next = idom[cur];
+        if next == cur {
+            return false;
+        }
+        cur = next;
+    }
+    false
+}
+
+/// Context for one region being structured.
+struct Region {
+    /// Block that ends the region, if any.
+    stop: Option<BlockId>,
+    /// Header of the innermost loop, so a jump back becomes `continue`.
+    loop_header: Option<BlockId>,
+    /// Exit blocks of the innermost loop: a branch there becomes `break`.
+    loop_exits: HashSet<BlockId>,
+}
+
+/// The structurer itself.
+pub struct Structurer<'a> {
+    blocks: &'a [Block],
+    graph: &'a Graph,
+    /// Blocks already placed in the output, so a second visit becomes a label.
+    placed: HashSet<BlockId>,
+    /// Blocks a `goto` points at, in the order they were first needed.
+    ///
+    /// A second visit to a block the structure already emitted cannot be
+    /// inlined again without repeating its statements, so it becomes a jump.
+    /// The jump needs a target: the block is emitted once more at the end of
+    /// the function, under a label, and the jump goes there.
+    goto_targets: Vec<BlockId>,
+    /// Blocks that must be reached by a jump rather than inlined.
+    ///
+    /// The first pass over the function finds out which blocks the structure
+    /// has to reach twice. The second pass treats them as boundaries: the
+    /// block is emitted once, under a label, and every path that reaches it
+    /// jumps there. Without the second pass the block appears twice — once
+    /// inlined into the path that got there first, once at the end — and the
+    /// reader has to work out that the two copies are the same code.
+    boundary: HashSet<BlockId>,
+    /// Blocks whose labelled copy is being emitted right now.
+    ///
+    /// A block inside its own copy is not a boundary: it is already there.
+    expanding: HashSet<BlockId>,
+    /// Number of blocks that needed a `goto`.
+    pub unstructured: usize,
+    /// Notes about approximations.
+    pub notes: Vec<String>,
+}
+
+impl Region {
+    /// The outermost context: no stop block, no loop.
+    fn root() -> Region {
+        Region {
+            stop: None,
+            loop_header: None,
+            loop_exits: HashSet::new(),
+        }
+    }
+}
+
+impl<'a> Structurer<'a> {
+    /// Build a structurer over a graph.
+    pub fn new(blocks: &'a [Block], graph: &'a Graph) -> Self {
+        Structurer {
+            blocks,
+            graph,
+            placed: HashSet::new(),
+            goto_targets: Vec::new(),
+            boundary: HashSet::new(),
+            expanding: HashSet::new(),
+            unstructured: 0,
+            notes: Vec::new(),
+        }
+    }
+
+    /// Structure the whole function starting at `entry`.
+    pub fn run(&mut self, entry: BlockId) -> Vec<Node> {
+        // First pass: find out which blocks the structure has to reach twice.
+        // The result is thrown away; only the set of shared blocks matters.
+        let _ = self.region(entry, &Region::root());
+        self.boundary = self.goto_targets.iter().copied().collect();
+
+        // Second pass: the shared blocks are boundaries now. Every path that
+        // reaches one jumps to it, and it is emitted once, under a label.
+        self.placed.clear();
+        self.goto_targets.clear();
+        self.unstructured = 0;
+        let mut body = self.region(entry, &Region::root());
+
+        // Emit the shared blocks under their labels, after the structured
+        // body. A jump lands on the copy, so the statements run exactly once
+        // whichever path reached them.
+        let mut queue = std::mem::take(&mut self.goto_targets);
+        let mut i = 0;
+        while i < queue.len() {
+            let b = queue[i];
+            i += 1;
+            self.expanding.insert(b);
+            let mut nodes = vec![Node::Label(label(b))];
+            nodes.extend(self.region(b, &Region::root()));
+            self.expanding.remove(&b);
+            body.extend(nodes);
+            // Emitting the copy can need a label of its own.
+            for t in std::mem::take(&mut self.goto_targets) {
+                if !queue.contains(&t) {
+                    queue.push(t);
+                }
+            }
+        }
+        body
+    }
+
+    fn region(&mut self, start: BlockId, ctx: &Region) -> Vec<Node> {
+        let mut nodes = Vec::new();
+        let mut cur = Some(start);
+        let mut guard = 0usize;
+        while let Some(b) = cur {
+            guard += 1;
+            if guard > 200_000 {
+                self.notes.push("structuring stopped after 200k blocks".into());
+                break;
+            }
+            if Some(b) == ctx.stop {
+                break;
+            }
+            // A loop is structured as one unit *before* its header's statements
+            // are emitted. Emitting the header first would leave every value it
+            // computes outside the loop that uses it.
+            if ctx.loop_header != Some(b) && self.graph.loops.contains_key(&b) {
+                cur = self.structure_loop(b, &mut nodes);
+                continue;
+            }
+            if self.boundary.contains(&b) && !self.expanding.contains(&b) {
+                // A shared block: reach it by jumping to the copy that is
+                // emitted under its label at the end of the function.
+                if !self.goto_targets.contains(&b) {
+                    self.goto_targets.push(b);
+                }
+                nodes.push(Node::Goto(label(b)));
+                self.unstructured += 1;
+                break;
+            }
+            if !self.placed.insert(b) {
+                // Already emitted earlier: this is a join the structure could
+                // not express, so name it. The label is defined at the end of
+                // the function, where the block is emitted a second time — a
+                // jump to a label that is never defined is worse than no
+                // structure at all, because the reader cannot follow it.
+                if !self.goto_targets.contains(&b) {
+                    self.goto_targets.push(b);
+                }
+                nodes.push(Node::Goto(label(b)));
+                self.unstructured += 1;
+                break;
+            }
+            let block = &self.blocks[b];
+            nodes.extend(self.stmts_to_nodes(&block.stmts));
+            match block.term.clone() {
+                Term::Ret(value) => {
+                    nodes.push(Node::Return(value));
+                    break;
+                }
+                Term::Unreachable => break,
+                Term::Jump(t) => {
+                    if ctx.loop_header == Some(t) && ctx.stop != Some(t) {
+                        nodes.push(Node::Continue);
+                        break;
+                    }
+                    // Leaving the loop through its exit block is a `break`;
+                    // letting `cur` walk into the exit would emit the code
+                    // after the loop inside the loop body.
+                    if ctx.loop_header.is_some() && ctx.loop_exits.contains(&t) {
+                        nodes.push(Node::Break);
+                        break;
+                    }
+                    cur = Some(t);
+                }
+                Term::Branch {
+                    cond,
+                    then_bb,
+                    else_bb,
+                } => {
+                    cur = self.branch(b, cond, then_bb, else_bb, ctx, &mut nodes);
+                }
+                Term::Switch { index, targets } => {
+                    let (node, join) = self.switch(index, &targets, ctx);
+                    nodes.push(node);
+                    cur = join;
+                }
+            }
+        }
+        nodes
+    }
+
+    /// Structure a multi-way branch into a `switch`.
+    ///
+    /// Each case is structured on its own. When every case ends by jumping to
+    /// the same block, that block is the join the cases share: the cases stop
+    /// in front of it and it is emitted once after the switch, which is what
+    /// the compiler's layout means. Without that, the first case would consume
+    /// the join and the rest would fall back to `goto`.
+    fn switch(
+        &mut self,
+        index: Expr,
+        targets: &[BlockId],
+        ctx: &Region,
+    ) -> (Node, Option<BlockId>) {
+        let join = common_successor(self.blocks, targets);
+        let inner = Region {
+            stop: join,
+            loop_header: ctx.loop_header,
+            loop_exits: ctx.loop_exits.clone(),
+        };
+        let mut cases = Vec::with_capacity(targets.len());
+        for (i, t) in targets.iter().enumerate() {
+            let body = self.region(*t, &inner);
+            cases.push((i as u64, body));
+        }
+        (
+            Node::Switch {
+                expr: index,
+                cases,
+                default: Vec::new(),
+            },
+            join,
+        )
+    }
+
+    /// Structure the loop headed at `header` and return where control resumes
+    /// after it, when that is a single block.
+    ///
+    /// The header's own statements are placed *inside* the body: they are what
+    /// recomputes the loop condition on every iteration, so hoisting them out
+    /// would be wrong, not merely ugly.
+    fn structure_loop(&mut self, header: BlockId, nodes: &mut Vec<Node>) -> Option<BlockId> {
+        if !self.placed.insert(header) {
+            // The loop header was already emitted. The jump needs a target
+            // like any other, so the header goes on the list of blocks that
+            // are emitted again at the end.
+            if !self.goto_targets.contains(&header) {
+                self.goto_targets.push(header);
+            }
+            nodes.push(Node::Goto(label(header)));
+            self.unstructured += 1;
+            return None;
+        }
+        let body_blocks = self.graph.loops.get(&header).cloned().unwrap_or_default();
+        let exits = self.exit_blocks(&body_blocks);
+        let inner = Region {
+            stop: Some(header),
+            loop_header: Some(header),
+            loop_exits: exits.clone(),
+        };
+        let stmts = self.stmts_to_nodes(&self.blocks[header].stmts);
+        match self.blocks[header].term.clone() {
+            Term::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
+                let then_in = body_blocks.contains(&then_bb);
+                let else_in = body_blocks.contains(&else_bb);
+                if then_in == else_in {
+                    // Both edges stay inside, or both leave. Neither is a loop
+                    // test this structurer can express; treat the header as a
+                    // plain conditional so the body is still emitted.
+                    let mut local = stmts;
+                    local.extend(self.stmts_to_nodes(&[]));
+                    nodes.extend(local);
+                    return self.branch(header, cond, then_bb, else_bb, &inner, nodes);
+                }
+                let (body_entry, exit, body_cond) = if then_in {
+                    (then_bb, else_bb, cond)
+                } else {
+                    (else_bb, then_bb, negate(cond))
+                };
+                if body_entry == header {
+                    // The header branches to itself: the test runs after the
+                    // body, which is a `do`/`while`.
+                    nodes.push(Node::DoWhile {
+                        body: stmts,
+                        cond: body_cond,
+                    });
+                    return Some(exit);
+                }
+                let mut body = stmts;
+                body.extend(self.region(body_entry, &inner));
+                nodes.push(Node::While {
+                    cond: body_cond,
+                    body,
+                });
+                Some(exit)
+            }
+            Term::Switch { index, targets } => {
+                // A dispatch at the loop header: the cases are the body.
+                let mut body = stmts;
+                let (node, join) = self.switch(index, &targets, &inner);
+                body.push(node);
+                nodes.extend(body);
+                join
+            }
+            Term::Jump(t) => {
+                // No test at the header: an unconditional loop whose only exits
+                // are `break`s and returns.
+                let mut body = stmts;
+                if t != header {
+                    body.extend(self.region(t, &inner));
+                }
+                nodes.push(Node::While {
+                    cond: Expr::Const(1),
+                    body,
+                });
+                let mut outs: Vec<BlockId> = exits.iter().copied().collect();
+                outs.sort_unstable();
+                if outs.len() == 1 { Some(outs[0]) } else { None }
+            }
+            _ => {
+                nodes.extend(stmts);
+                None
+            }
+        }
+    }
+
+    /// Emit a conditional and return where control continues, if anywhere.
+    fn branch(
+        &mut self,
+        b: BlockId,
+        cond: Expr,
+        then_bb: BlockId,
+        else_bb: BlockId,
+        ctx: &Region,
+        nodes: &mut Vec<Node>,
+    ) -> Option<BlockId> {
+        // Back edge through a conditional: `if (cond) continue;`.
+        if let Some(h) = ctx.loop_header {
+            let then_back = then_bb == h;
+            let else_back = else_bb == h;
+            if then_back && !else_back {
+                nodes.push(Node::If {
+                    cond,
+                    then_body: vec![Node::Continue],
+                    else_body: Vec::new(),
+                });
+                return Some(else_bb);
+            }
+            if else_back && !then_back {
+                nodes.push(Node::If {
+                    cond: negate(cond),
+                    then_body: vec![Node::Continue],
+                    else_body: Vec::new(),
+                });
+                return Some(then_bb);
+            }
+        }
+
+        // Inside a loop: a branch to an exit block is a break.
+        if ctx.loop_header.is_some() {
+            let then_exit = ctx.loop_exits.contains(&then_bb);
+            let else_exit = ctx.loop_exits.contains(&else_bb);
+            if then_exit && !else_exit {
+                nodes.push(Node::If {
+                    cond,
+                    then_body: vec![Node::Break],
+                    else_body: Vec::new(),
+                });
+                return Some(else_bb);
+            }
+            if else_exit && !then_exit {
+                nodes.push(Node::If {
+                    cond: negate(cond),
+                    then_body: vec![Node::Break],
+                    else_body: Vec::new(),
+                });
+                return Some(then_bb);
+            }
+            if then_exit && else_exit {
+                nodes.push(Node::If {
+                    cond,
+                    then_body: vec![Node::Break],
+                    else_body: vec![Node::Break],
+                });
+                return None;
+            }
+        }
+
+        // Plain conditional: structure both arms up to their join point.
+        let join = self.graph.ipdom[b].filter(|j| Some(*j) != ctx.stop);
+        match join {
+            Some(j) if j == then_bb => {
+                // `if (!cond) { else }` then continue at the join.
+                let inner = Region {
+                    stop: Some(j),
+                    ..clone_ctx(ctx)
+                };
+                let body = self.region(else_bb, &inner);
+                nodes.push(Node::If {
+                    cond: negate(cond),
+                    then_body: body,
+                    else_body: Vec::new(),
+                });
+                Some(j)
+            }
+            Some(j) if j == else_bb => {
+                let inner = Region {
+                    stop: Some(j),
+                    ..clone_ctx(ctx)
+                };
+                let body = self.region(then_bb, &inner);
+                nodes.push(Node::If {
+                    cond,
+                    then_body: body,
+                    else_body: Vec::new(),
+                });
+                Some(j)
+            }
+            Some(j) => {
+                let inner = Region {
+                    stop: Some(j),
+                    ..clone_ctx(ctx)
+                };
+                let then_body = self.region(then_bb, &inner);
+                let else_body = self.region(else_bb, &inner);
+                nodes.push(Node::If {
+                    cond,
+                    then_body,
+                    else_body,
+                });
+                Some(j)
+            }
+            None => {
+                // No join: at most one arm continues, the other leaves.
+                let then_terminates = self.terminates(then_bb);
+                let else_terminates = self.terminates(else_bb);
+                if then_terminates && !else_terminates {
+                    // `then_bb` leaves the function, so only the other arm
+                    // survives: `if (!cond) { else_bb }`. Emitting the dead arm
+                    // as an `else` body reads as if it continued.
+                    let body = self.region(else_bb, &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    });
+                    nodes.push(Node::If {
+                        cond: negate(cond),
+                        then_body: body,
+                        else_body: Vec::new(),
+                    });
+                    // The arm ran to its own end; there is nothing left for the
+                    // enclosing region to walk into.
+                    return None;
+                }
+                if else_terminates && !then_terminates {
+                    let body = self.region(then_bb, &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    });
+                    nodes.push(Node::If {
+                        cond,
+                        then_body: body,
+                        else_body: Vec::new(),
+                    });
+                    return None;
+                }
+                nodes.push(Node::If {
+                    cond,
+                    then_body: self.region(then_bb, &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    }),
+                    else_body: self.region(else_bb, &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    }),
+                });
+                None
+            }
+        }
+    }
+
+    fn exit_blocks(&self, loop_blocks: &HashSet<BlockId>) -> HashSet<BlockId> {
+        let mut out = HashSet::new();
+        for b in loop_blocks {
+            for s in successors(&self.blocks[*b]) {
+                if !loop_blocks.contains(&s) {
+                    out.insert(s);
+                }
+            }
+        }
+        out
+    }
+
+    /// True when every path from `b` leaves the function without returning to
+    /// the caller's continuation.
+    ///
+    /// Post-dominance answers this in one lookup, and it has to be asked that
+    /// way: checking only the block's own terminator says "this arm continues"
+    /// for a `do { } while` whose exit is another `ret` block, and the arm that
+    /// does return then gets dropped from the output.
+    fn terminates(&self, b: BlockId) -> bool {
+        self.graph.ipdom.get(b).copied().flatten().is_none()
+    }
+
+    fn stmts_to_nodes(&self, stmts: &[Stmt]) -> Vec<Node> {
+        stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Assign { dest, value } => Node::Assign {
+                    dest: dest.clone(),
+                    value: value.clone(),
+                },
+                Stmt::Store { addr, value, size } => Node::Store {
+                    addr: addr.clone(),
+                    value: value.clone(),
+                    size: *size,
+                },
+                Stmt::Call {
+                    name, args, ret, ..
+                } => Node::Call {
+                    name: name.clone(),
+                    args: args.clone(),
+                    ret: ret.clone(),
+                },
+                Stmt::Comment(c) => Node::Comment(c.clone()),
+            })
+            .collect()
+    }
+}
+
+fn clone_ctx(ctx: &Region) -> Region {
+    Region {
+        stop: ctx.stop,
+        loop_header: ctx.loop_header,
+        loop_exits: ctx.loop_exits.clone(),
+    }
+}
+
+/// The block every one of `targets` jumps to, when there is exactly one.
+///
+/// A compiler lays a `switch` out as the case bodies followed by the code
+/// they all fall into. Recovering that shared block is what lets the cases be
+/// printed as a `switch` instead of a chain of `goto`s.
+fn common_successor(blocks: &[Block], targets: &[BlockId]) -> Option<BlockId> {
+    let mut it = targets.iter();
+    let first = *it.next()?;
+    let mut common = successors(&blocks[first]);
+    for t in it {
+        let succs = successors(&blocks[*t]);
+        common.retain(|c| succs.contains(c));
+    }
+    if common.len() == 1 {
+        Some(common[0])
+    } else {
+        None
+    }
+}
+
+fn label(b: BlockId) -> String {
+    format!("L{b}")
+}
+
+/// Logical negation of a condition, kept readable.
+pub fn negate(e: Expr) -> Expr {
+    match e {
+        Expr::Cond {
+            op,
+            lhs,
+            rhs,
+            bits,
+        } => Expr::Cond {
+            op: op.negated(),
+            lhs,
+            rhs,
+            bits,
+        },
+        Expr::Bool { op, args } => match op {
+            crate::ir::BoolOp::Not => args.into_iter().next().unwrap_or(Expr::Const(0)),
+            crate::ir::BoolOp::Eq => Expr::Bool {
+                op: crate::ir::BoolOp::Ne,
+                args,
+            },
+            crate::ir::BoolOp::Ne => Expr::Bool {
+                op: crate::ir::BoolOp::Eq,
+                args,
+            },
+            // The negation of a conjunction is a disjunction of negations.
+            crate::ir::BoolOp::And => Expr::Bool {
+                op: crate::ir::BoolOp::Or,
+                args: args.into_iter().map(negate).collect(),
+            },
+            crate::ir::BoolOp::Or => Expr::Bool {
+                op: crate::ir::BoolOp::And,
+                args: args.into_iter().map(negate).collect(),
+            },
+        },
+        Expr::FlagCond {
+            cond,
+            state,
+            bits,
+        } => Expr::FlagCond {
+            cond: cond.negated(),
+            state,
+            bits,
+        },
+        other => Expr::Un {
+            op: crate::ir::UnOp::LNot,
+            arg: Box::new(other),
+            bits: 1,
+        },
+    }
+}

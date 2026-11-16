@@ -1,0 +1,3761 @@
+//! x86-64 lifting: Intel-syntax text to [`Stmt`]s.
+//!
+//! The decoder renders every instruction to text; this module reads that text
+//! back. That sounds like a detour, and it is one, but it keeps a single source
+//! of truth for operand formatting and makes the lifter testable against the
+//! same strings a human sees.
+//!
+//! What is modelled: general-purpose registers at all four widths, the stack
+//! frame (so `[rbp-0x8]` becomes `local_8`), flags as a pending comparison,
+//! and the common integer instruction set. What is not: floating point and
+//! vector registers, and system instructions. Those become [`Stmt::Comment`]s,
+//! so the output shows exactly what was skipped instead of pretending.
+
+use occ_core::{Addr, FlowKind, Instruction};
+
+use super::{
+    Core, Lifted, Operand, Parsed, Reg, Target, VecClass, parse_int, split_operands,
+};
+use crate::ir::{
+    BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp, mask,
+};
+
+/// Registers by name: name, index, size, bit offset.
+const REG_TABLE: &[(&str, u8, u8, u8)] = &[
+    ("rax", 0, 8, 0),
+    ("eax", 0, 4, 0),
+    ("ax", 0, 2, 0),
+    ("al", 0, 1, 0),
+    ("ah", 0, 1, 8),
+    ("rcx", 1, 8, 0),
+    ("ecx", 1, 4, 0),
+    ("cx", 1, 2, 0),
+    ("cl", 1, 1, 0),
+    ("ch", 1, 1, 8),
+    ("rdx", 2, 8, 0),
+    ("edx", 2, 4, 0),
+    ("dx", 2, 2, 0),
+    ("dl", 2, 1, 0),
+    ("dh", 2, 1, 8),
+    ("rbx", 3, 8, 0),
+    ("ebx", 3, 4, 0),
+    ("bx", 3, 2, 0),
+    ("bl", 3, 1, 0),
+    ("bh", 3, 1, 8),
+    ("rsp", 4, 8, 0),
+    ("esp", 4, 4, 0),
+    ("sp", 4, 2, 0),
+    ("spl", 4, 1, 0),
+    ("rbp", 5, 8, 0),
+    ("ebp", 5, 4, 0),
+    ("bp", 5, 2, 0),
+    ("bpl", 5, 1, 0),
+    ("rsi", 6, 8, 0),
+    ("esi", 6, 4, 0),
+    ("si", 6, 2, 0),
+    ("sil", 6, 1, 0),
+    ("rdi", 7, 8, 0),
+    ("edi", 7, 4, 0),
+    ("di", 7, 2, 0),
+    ("dil", 7, 1, 0),
+    ("r8", 8, 8, 0),
+    ("r8d", 8, 4, 0),
+    ("r8w", 8, 2, 0),
+    ("r8b", 8, 1, 0),
+    ("r9", 9, 8, 0),
+    ("r9d", 9, 4, 0),
+    ("r9w", 9, 2, 0),
+    ("r9b", 9, 1, 0),
+    ("r10", 10, 8, 0),
+    ("r10d", 10, 4, 0),
+    ("r10w", 10, 2, 0),
+    ("r10b", 10, 1, 0),
+    ("r11", 11, 8, 0),
+    ("r11d", 11, 4, 0),
+    ("r11w", 11, 2, 0),
+    ("r11b", 11, 1, 0),
+    ("r12", 12, 8, 0),
+    ("r12d", 12, 4, 0),
+    ("r12w", 12, 2, 0),
+    ("r12b", 12, 1, 0),
+    ("r13", 13, 8, 0),
+    ("r13d", 13, 4, 0),
+    ("r13w", 13, 2, 0),
+    ("r13b", 13, 1, 0),
+    ("r14", 14, 8, 0),
+    ("r14d", 14, 4, 0),
+    ("r14w", 14, 2, 0),
+    ("r14b", 14, 1, 0),
+    ("r15", 15, 8, 0),
+    ("r15d", 15, 4, 0),
+    ("r15w", 15, 2, 0),
+    ("r15b", 15, 1, 0),
+    ("rip", 16, 8, 0),
+];
+
+/// Canonical 64-bit names by index.
+const REG64: [&str; 17] = [
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+    "r13", "r14", "r15", "rip",
+];
+
+const RSP: u8 = 4;
+const RBP: u8 = 5;
+const RAX: u8 = 0;
+const RCX: u8 = 1;
+const RIP: u8 = 16;
+
+/// Integer argument registers in System V order.
+pub const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
+
+/// The x86-64 target.
+pub struct X86Target;
+
+impl Target for X86Target {
+    fn lookup_reg(&self, name: &str) -> Option<Reg> {
+        REG_TABLE
+            .iter()
+            .find(|(n, _, _, _)| *n == name)
+            .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset))
+    }
+
+    fn reg_name(&self, idx: u8) -> String {
+        REG64.get(usize::from(idx)).copied().unwrap_or("rax").to_string()
+    }
+
+    fn reg_width(&self, _idx: u8) -> u8 {
+        8
+    }
+
+    fn arg_regs(&self) -> &[u8] {
+        &ARG_REGS
+    }
+
+    fn ret_reg(&self) -> u8 {
+        RAX
+    }
+
+    fn sp_reg(&self) -> u8 {
+        RSP
+    }
+
+    fn fp_reg(&self) -> Option<u8> {
+        Some(RBP)
+    }
+
+    fn is_pc(&self, idx: u8) -> bool {
+        idx == RIP
+    }
+
+    fn sp_alias(&self) -> &'static str {
+        "frame"
+    }
+
+    fn branch_cond(&self, mnemonic: &str) -> Option<FlagCond> {
+        cond_of_jcc(mnemonic)
+    }
+
+    fn setcc_cond(&self, suffix: &str) -> Option<FlagCond> {
+        cond_of_jcc(&format!("j{suffix}"))
+    }
+
+    fn cmov_cond(&self, suffix: &str) -> Option<FlagCond> {
+        cond_of_jcc(&format!("j{suffix}"))
+    }
+
+    fn float_branch_cond(
+        &self,
+        mnemonic: &str,
+        lhs: &Expr,
+        rhs: &Expr,
+        bits: u8,
+    ) -> Option<Expr> {
+        float_condition(mnemonic, lhs, rhs, bits)
+    }
+
+    fn parse(&self, text: &str) -> Option<Parsed> {
+        parse(text)
+    }
+}
+
+/// The condition a branch tests, when the flags come from a
+/// floating-point comparison.
+///
+/// The machine's compare sets three flags: below, equal, and unordered.
+/// A branch asks about them in combinations, and the combinations do not
+/// reduce to the integer conditions: "below" is *less than or unordered*,
+/// and no integer comparison says that.
+///
+/// The unordered case is what makes the difference. A comparison involving
+/// a not-a-number sets all three flags, so `ja` — "above", which needs
+/// neither below nor equal — is false for a not-a-number, while `jbe` is
+/// true.
+fn float_condition(mnemonic: &str, lhs: &Expr, rhs: &Expr, bits: u8) -> Option<Expr> {
+    let cmp = |op: BinOp| Expr::Bin {
+        op,
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(rhs.clone()),
+        bits,
+    };
+    // Two conditions that are each zero or one; the bitwise or of two
+    // booleans is their logical or.
+    let either = |a: Expr, b: Expr| Expr::Bin {
+        op: BinOp::Or,
+        lhs: Box::new(a),
+        rhs: Box::new(b),
+        bits: 1,
+    };
+    Some(match mnemonic {
+        // Equal is set for a not-a-number as well.
+        "je" | "jz" => either(cmp(BinOp::FEq), cmp(BinOp::FUnordered)),
+        "jne" | "jnz" => cmp(BinOp::FNe),
+        // Above needs neither below nor equal, which a not-a-number is not.
+        "ja" | "nbe" => cmp(BinOp::FGt),
+        "jae" | "nb" | "nc" => cmp(BinOp::FGe),
+        "jb" | "c" | "nae" => either(cmp(BinOp::FLt), cmp(BinOp::FUnordered)),
+        "jbe" | "na" => either(cmp(BinOp::FLe), cmp(BinOp::FUnordered)),
+        "jp" => cmp(BinOp::FUnordered),
+        "jnp" => either(cmp(BinOp::FLe), cmp(BinOp::FGe)),
+        _ => return None,
+    })
+}
+
+/// Condition for a conditional branch mnemonic.
+fn cond_of_jcc(mnemonic: &str) -> Option<FlagCond> {
+    let suffix = mnemonic.strip_prefix('j')?;
+    Some(match suffix {
+        // The overflow flag on its own.
+        "o" => FlagCond::O,
+        "no" => FlagCond::No,
+        // The carry flag on its own.
+        "b" | "c" | "nae" => FlagCond::C,
+        "ae" | "nb" | "nc" => FlagCond::Nc,
+        // The zero flag on its own.
+        "e" | "z" => FlagCond::Z,
+        "ne" | "nz" => FlagCond::Nz,
+        // The carry and the zero flag together.
+        "be" | "na" => FlagCond::Be,
+        "a" | "nbe" => FlagCond::A,
+        // The sign flag on its own.
+        "s" => FlagCond::S,
+        "ns" => FlagCond::Ns,
+        // The parity flag on its own.
+        "p" | "pe" => FlagCond::Po,
+        "np" | "pno" => FlagCond::Npo,
+        // The sign and the overflow flag together.
+        "l" | "nge" => FlagCond::L,
+        "ge" | "nl" => FlagCond::Nl,
+        "g" | "nle" => FlagCond::G,
+        "le" | "ng" => FlagCond::Le,
+        _ => return None,
+    })
+}
+
+/// The zero flag of a result.
+///
+/// The flag is set when the result is zero, which is a question about the
+/// result and not about the operands.
+fn zero_flag(result: &Expr, bits: u8) -> Expr {
+    Expr::Cond {
+        op: CondOp::Eq,
+        lhs: Box::new(result.clone()),
+        rhs: Box::new(Expr::Const(0)),
+        bits,
+    }
+}
+
+/// The sign flag of a result.
+///
+/// The flag is set when the result is negative, which is its top bit.
+fn sign_flag(result: &Expr, bits: u8) -> Expr {
+    Expr::Cond {
+        op: CondOp::Slt,
+        lhs: Box::new(result.clone()),
+        rhs: Box::new(Expr::Const(0)),
+        bits,
+    }
+}
+
+/// The parity flag of a result.
+///
+/// The flag is set when the low byte of the result has an even number of
+/// set bits.
+fn parity_flag(result: &Expr, bits: u8) -> Expr {
+    Expr::Intrinsic {
+        op: Intrinsic::ParityEven,
+        args: vec![result.clone()],
+        bits,
+    }
+}
+
+/// Parse the decoder's textual form.
+pub fn parse(text: &str) -> Option<Parsed> {
+    // The decoder appends resolved addresses as comments and branch deltas in
+    // parentheses; neither is part of the instruction.
+    let mut body = text;
+    let mut pc_target = None;
+    if let Some(idx) = body.find("  #") {
+        pc_target = parse_int(body[idx + 3..].trim());
+        body = &body[..idx];
+    }
+    if let Some(idx) = body.find(" (rel ") {
+        body = &body[..idx];
+    }
+    let body = body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    // A prefix changes what the instruction does: `lock` makes it atomic,
+    // `rep` makes it a loop. They are not decoration, so they are kept
+    // rather than dropped with the mnemonic.
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut body = body;
+    while let Some((head, rest)) = body.split_once(' ') {
+        let head = head.to_ascii_lowercase();
+        if !matches!(
+            head.as_str(),
+            "lock" | "rep" | "repe" | "repz" | "repne" | "repnz" | "bnd" | "notrack"
+        ) {
+            break;
+        }
+        prefixes.push(head);
+        body = rest.trim();
+    }
+    let (mnemonic, rest) = match body.split_once(' ') {
+        Some((m, r)) => (m, r.trim()),
+        None => (body, ""),
+    };
+    let mut ops = Vec::new();
+    if !rest.is_empty() {
+        for part in split_operands(rest) {
+            ops.push(parse_operand(part.trim())?);
+        }
+    }
+    Some(Parsed {
+        mnemonic: mnemonic.to_ascii_lowercase(),
+        ops,
+        pc_target,
+        prefixes,
+    })
+}
+
+fn parse_operand(s: &str) -> Option<Operand> {
+    let (size_hint, rest) = split_size_prefix(s);
+    let mut rest = rest.trim();
+    let mut seg = None;
+    for (prefix, name) in [("fs:", "fs"), ("gs:", "gs"), ("cs:", "cs"), ("ss:", "ss")] {
+        if let Some(r) = rest.strip_prefix(prefix) {
+            seg = Some(name);
+            rest = r.trim();
+            break;
+        }
+    }
+    if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        let mut op = parse_memory(inner, size_hint.unwrap_or(0))?;
+        if let Operand::Mem { seg: slot, .. } = &mut op {
+            *slot = seg;
+        }
+        return Some(op);
+    }
+    if let Some(reg) = X86Target.lookup_reg(rest) {
+        return Some(Operand::Reg(reg));
+    }
+    // A vector register is not a general-purpose register: it holds
+    // elements, and the lifter reads and writes them one at a time.
+    if let Some(n) = vector_index(rest, "xmm") {
+        return Some(Operand::Vec(VecClass::Xmm, n));
+    }
+    if let Some(n) = vector_index(rest, "ymm") {
+        return Some(Operand::Vec(VecClass::Ymm, n));
+    }
+    if let Some(n) = vector_index(rest, "mm") {
+        return Some(Operand::Vec(VecClass::Mm, n));
+    }
+    // An x87 stack slot, `st(0)` through `st(7)`.
+    if rest == "st" {
+        return Some(Operand::Fpu(0));
+    }
+    if let Some(inner) = rest.strip_prefix("st(").and_then(|r| r.strip_suffix(')'))
+        && let Some(n) = inner.parse::<u8>().ok()
+        && n < 8
+    {
+        return Some(Operand::Fpu(n));
+    }
+    parse_int(rest).map(Operand::Imm)
+}
+
+/// The register number in a vector register name, if the name is one.
+fn vector_index(name: &str, prefix: &str) -> Option<u8> {
+    let rest = name.strip_prefix(prefix)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let n: u8 = rest.parse().ok()?;
+    // `xmm` has sixteen registers, `mm` has eight.
+    if prefix == "mm" { (n < 8).then_some(n) } else { (n < 16).then_some(n) }
+}
+
+/// Size keywords the decoder emits before `ptr`.
+fn split_size_prefix(s: &str) -> (Option<u8>, &str) {
+    for (word, size) in [
+        ("byte ptr", 1u8),
+        ("word ptr", 2),
+        ("dword ptr", 4),
+        ("qword ptr", 8),
+        ("tbyte ptr", 10),
+        ("xmmword ptr", 16),
+    ] {
+        if let Some(rest) = s.strip_prefix(word) {
+            return (Some(size), rest);
+        }
+    }
+    (None, s)
+}
+
+fn parse_memory(inner: &str, size: u8) -> Option<Operand> {
+    let inner = inner.trim();
+    let mut base = None;
+    let mut index = None;
+    let mut scale = 1u64;
+    let mut disp = 0i64;
+    let mut absolute = false;
+
+    let mut sign = 1i64;
+    let mut token = String::new();
+    let mut terms: Vec<(i64, String)> = Vec::new();
+    for c in inner.chars() {
+        match c {
+            '+' => {
+                if !token.trim().is_empty() {
+                    terms.push((sign, token.trim().to_string()));
+                }
+                token.clear();
+                sign = 1;
+            }
+            '-' => {
+                if !token.trim().is_empty() {
+                    terms.push((sign, token.trim().to_string()));
+                }
+                token.clear();
+                sign = -1;
+            }
+            c => token.push(c),
+        }
+    }
+    if !token.trim().is_empty() {
+        terms.push((sign, token.trim().to_string()));
+    }
+
+    for (sign, term) in terms {
+        if let Some((r, s)) = term.split_once('*') {
+            let reg = X86Target.lookup_reg(r.trim())?;
+            index = Some(reg);
+            scale = parse_int(s).unwrap_or(1);
+            continue;
+        }
+        if let Some(reg) = X86Target.lookup_reg(&term) {
+            if base.is_none() {
+                base = Some(reg);
+            } else {
+                index = Some(reg);
+            }
+            continue;
+        }
+        if let Some(v) = parse_int(&term) {
+            disp = disp.wrapping_add(sign * v as i64);
+            continue;
+        }
+        // A bare address with no base register.
+        absolute = true;
+    }
+
+    Some(Operand::Mem {
+        size,
+        base,
+        index,
+        scale,
+        disp,
+        abs: if absolute { Some(disp as u64) } else { None },
+        seg: None,
+        base_update: None,
+    })
+}
+
+/// The x86 lifter.
+pub struct Lifter<'a> {
+    /// Shared state.
+    pub core: Core<'a>,
+    /// True once the prologue has been consumed.
+    pub prologue_seen: bool,
+    /// The x87 stack's top, as the physical slot it lives in.
+    ///
+    /// Eight means the stack is empty, which is the state every function
+    /// starts in: the ABI requires the x87 stack to be empty at a function
+    /// boundary, so a function that uses it pushes what it needs and pops
+    /// it again before it returns.
+    pub fpu_top: u8,
+    /// Counter for the temporary names the vector and x87 lifts need.
+    temps: u32,
+    /// True when the function wrote a vector register.
+    wrote_vector: bool,
+    /// True when the function wrote the x87 stack.
+    wrote_x87: bool,
+    /// The width of the last value written to `xmm0`.
+    float_width: u8,
+    /// The condition of a trailing loop instruction.
+    ///
+    /// The loop family is a conditional branch and a decrement in one
+    /// instruction, so the condition is not the machine's condition codes
+    /// but a question about the counter and, for two of them, about the
+    /// zero flag as well.
+    loop_condition: Option<Expr>,
+}
+
+impl<'a> Lifter<'a> {
+    /// Build a lifter.
+    pub fn new(
+        target: &'static dyn Target,
+        name_of: &'a dyn Fn(Addr) -> String,
+        symbols: &'a dyn Fn(&str) -> Option<u64>,
+    ) -> Self {
+        Lifter {
+            core: Core::new(target, name_of).with_symbols(symbols),
+            prologue_seen: false,
+            fpu_top: 8,
+            temps: 0,
+            wrote_vector: false,
+            wrote_x87: false,
+            float_width: 0,
+            loop_condition: None,
+        }
+    }
+
+    /// A name for a value that is computed once and used twice.
+    ///
+    /// A 64-bit vector element is two 32-bit elements, so writing it back
+    /// needs the value twice: once for its low half and once for its high
+    /// half. Naming it keeps the second use from reading the first use's
+    /// result.
+    fn new_temp(&mut self) -> String {
+        self.temps += 1;
+        format!("v{}", self.temps)
+    }
+
+    /// A name for a value that has to survive a write to where it came
+    /// from.
+    ///
+    /// The IR reads variables by name, so a value captured before the slot
+    /// it came from is written is read again afterwards would see the new
+    /// value. A register exchange, and a read-modify-write that keeps the
+    /// old value, both need the old value after the write, so they go
+    /// through one of these.
+    fn new_temp_named(&mut self, prefix: &str) -> String {
+        self.temps += 1;
+        format!("{prefix}{}", self.temps)
+    }
+
+    fn lift_insn(&mut self, insn: &Instruction, out: &mut Lifted) {
+        let Some(p) = self.core.target.parse(&insn.text) else {
+            out.stmts
+                .push(Stmt::Comment(format!("{} ; unparsed", insn.text)));
+            return;
+        };
+        self.core.pc_target = p
+            .pc_target
+            .or_else(|| insn.mem_reads.first().map(|a| a.0))
+            .or_else(|| insn.mem_writes.first().map(|a| a.0));
+        let m = p.mnemonic.as_str();
+        // The instructions whose shape the general-purpose path cannot
+        // describe: vector registers, the x87 stack, atomic
+        // read-modify-writes, and the string instructions with their
+        // implicit registers.
+        let repeated = p
+            .prefixes
+            .iter()
+            .any(|x| x == "rep" || x == "repe" || x == "repz");
+        if self.lift_vec(m, &p.ops, &mut out.stmts)
+            || self.lift_x87(m, &p.ops, &mut out.stmts)
+            || self.lift_atomic(m, &p.ops, &mut out.stmts)
+            || self.lift_string(m, &p.ops, repeated, insn.addr, &mut out.stmts)
+        {
+            return;
+        }
+        match m {
+            "nop" | "endbr64" | "endbr32" | "pause" | "hlt" | "ud2" => {}
+            "mov" | "movabs" => self.lift_mov(&p.ops, &mut out.stmts),
+            "movzx" => self.lift_widening(&p.ops, false, &mut out.stmts),
+            "movsx" | "movsxd" => self.lift_widening(&p.ops, true, &mut out.stmts),
+            "lea" => self.lift_lea(&p.ops, &mut out.stmts),
+            "add" => self.lift_alu(BinOp::Add, &p.ops, &mut out.stmts),
+            "sub" => self.lift_alu(BinOp::Sub, &p.ops, &mut out.stmts),
+            "and" => self.lift_alu(BinOp::And, &p.ops, &mut out.stmts),
+            "or" => self.lift_alu(BinOp::Or, &p.ops, &mut out.stmts),
+            "xor" => self.lift_alu(BinOp::Xor, &p.ops, &mut out.stmts),
+            "adc" => {
+                self.lift_alu(BinOp::Add, &p.ops, &mut out.stmts);
+                self.core
+                    .notes
+                    .push((insn.addr, "carry-in ignored".into()));
+            }
+            "sbb" => {
+                self.lift_alu(BinOp::Sub, &p.ops, &mut out.stmts);
+                self.core
+                    .notes
+                    .push((insn.addr, "borrow-in ignored".into()));
+            }
+            "inc" => self.lift_inc_dec(BinOp::Add, &with_imm(&p.ops, 1), &mut out.stmts),
+            "dec" => self.lift_inc_dec(BinOp::Sub, &with_imm(&p.ops, 1), &mut out.stmts),
+            "neg" => self.lift_unary(UnOp::Neg, &p.ops, &mut out.stmts),
+            "not" => self.lift_unary(UnOp::Not, &p.ops, &mut out.stmts),
+            "shl" | "sal" => self.lift_shift(BinOp::Shl, &p.ops, &mut out.stmts),
+            "shr" => self.lift_shift(BinOp::Shr, &p.ops, &mut out.stmts),
+            "sar" => self.lift_shift(BinOp::Sar, &p.ops, &mut out.stmts),
+            "imul" | "mul" => self.lift_imul(&p.ops, &mut out.stmts),
+            "loop" | "loope" | "loopne" | "jrcxz" | "jecxz" => {
+                self.lift_loop(m, &mut out.stmts)
+            }
+            "cmp" => self.lift_cmp(&p.ops, false),
+            "test" => self.lift_cmp(&p.ops, true),
+            "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge" | "setb"
+            | "setbe" | "seta" | "setae" | "sets" | "setns" => {
+                self.lift_setcc(m, &p.ops, &mut out.stmts)
+            }
+            "cmove" | "cmovz" | "cmovne" | "cmovnz" | "cmovl" | "cmovle" | "cmovg" | "cmovge"
+            | "cmovb" | "cmovbe" | "cmova" | "cmovae" | "cmovs" | "cmovns" => {
+                self.lift_cmov(m, &p.ops, &mut out.stmts)
+            }
+            "push" => self.lift_push(&p.ops, &mut out.stmts),
+            "pop" => self.lift_pop(&p.ops, &mut out.stmts),
+            "leave" => {
+                self.core.sp_off = -8;
+                self.core.fp_off = None;
+            }
+            "cdqe" => self.lift_cast(RAX, 4, 8, &mut out.stmts),
+            "cwde" => self.lift_cast(RAX, 2, 4, &mut out.stmts),
+            "cdq" | "cqo" | "cwd" => {
+                out.stmts
+                    .push(Stmt::Comment(format!("{m} ; sign extension of rax")));
+            }
+            "xchg" => self.lift_xchg(&p.ops, &mut out.stmts),
+            "rol" | "ror" => self.lift_rotate(m, &p.ops, &mut out.stmts),
+            "bswap" => self.lift_bswap(&p.ops, &mut out.stmts),
+            "bsr" | "bsf" | "tzcnt" | "lzcnt" => self.lift_bit_scan(m, &p.ops, &mut out.stmts),
+            "bt" | "bts" | "btr" | "btc" => self.lift_bit_test(m, &p.ops, &mut out.stmts),
+            "div" | "idiv" => self.lift_div(m, &p.ops, &mut out.stmts),
+            "shld" | "shrd" => self.lift_double_shift(m, &p.ops, &mut out.stmts),
+            "syscall" | "sysenter" => self.lift_syscall(insn.addr, &mut out.stmts),
+            "rdtsc" | "rdtscp" => self.lift_timestamp(insn.addr, m, &mut out.stmts),
+            "clc" | "stc" | "cmc" | "cld" | "std" | "sti" | "cli" => {
+                self.lift_flag_instruction(m, insn.addr, &mut out.stmts)
+            }
+            "call" => self.lift_call(insn, &p.ops, &mut out.stmts),
+            "jmp" => self.lift_jmp(&p.ops, &mut out.stmts),
+            "ret" => {}
+            other => {
+                if cond_of_jcc(other).is_some() {
+                    // Handled by take_condition once the block ends.
+                } else {
+                    out.stmts
+                        .push(Stmt::Comment(format!("{} ; not lifted", insn.text)));
+                }
+            }
+        }
+    }
+
+    fn lift_mov(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        // `mov rbp, rsp` anchors the frame instead of assigning a value.
+        if let (Operand::Reg(dst), Operand::Reg(src)) = (&ops[0], &ops[1])
+            && dst.idx == RBP
+            && src.idx == RSP
+        {
+            self.core.fp_off = Some(self.core.sp_off);
+            self.prologue_seen = true;
+            return;
+        }
+        let value = self.core.read(&ops[1], stmts);
+        self.core.write(&ops[0], value, stmts);
+    }
+
+    /// `movzx`/`movsx`: read the source at its own width, then widen.
+    fn lift_widening(&mut self, ops: &[Operand], signed: bool, stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let src = self.core.read(&ops[1], stmts);
+        let from = ops[1].size();
+        let to = ops[0].size().max(from);
+        let value = Expr::Cast {
+            kind: if signed { CastKind::Sext } else { CastKind::Zext },
+            arg: Box::new(src),
+            from,
+            to,
+        };
+        self.core.write(&ops[0], value, stmts);
+    }
+
+    fn lift_lea(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let Operand::Mem { base, index, disp, .. } = &ops[1] else {
+            return;
+        };
+        // `lea rsp, [rbp-0x8]` restores the stack pointer; keep the frame in
+        // sync instead of emitting an assignment.
+        if let Operand::Reg(dst) = &ops[0]
+            && dst.idx == RSP
+            && index.is_none()
+            && let Some(b) = base
+            && b.idx == RBP
+            && let Some(off) = self.core.fp_off
+        {
+            self.core.sp_off = off + disp;
+            return;
+        }
+        let addr = self.core.addr_of(&ops[1], stmts);
+        self.core.write(&ops[0], addr, stmts);
+    }
+
+    fn lift_alu(&mut self, op: BinOp, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        // Stack pointer arithmetic is frame bookkeeping, not a value.
+        if let Operand::Reg(dst) = &ops[0]
+            && dst.idx == RSP
+            && let Operand::Imm(v) = &ops[1]
+        {
+            match op {
+                BinOp::Sub => self.core.adjust_sp(-(*v as i64)),
+                BinOp::Add => self.core.adjust_sp(*v as i64),
+                _ => self.core.dynamic_sp = true,
+            }
+            return;
+        }
+        let bits = ops[0].size();
+        let operand = self.core.read(&ops[1], stmts);
+        // The carry and the overflow say things about the value that was
+        // there before the operation, so it is given a name of its own.
+        // The logical operations say nothing about the old value, and they
+        // are the common ones, so they do not pay for the name.
+        let previous = if matches!(op, BinOp::Add | BinOp::Sub) {
+            self.snapshot(&ops[0], stmts)
+        } else {
+            self.core.read(&ops[0], stmts)
+        };
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(previous.clone()),
+            rhs: Box::new(operand.clone()),
+            bits,
+        };
+        let result = self.core.dest_value(&ops[0]);
+        let flags = self.alu_flags(op, &previous, &operand, &result, bits);
+        self.core.write(&ops[0], value, stmts);
+        self.core.set_flags(flags, None);
+    }
+
+    /// The flags a binary arithmetic operation leaves behind.
+    ///
+    /// The carry and the overflow are the two the machine computes from the
+    /// operands rather than from the result. The logical operations clear
+    /// both, the addition sets the carry when the sum did not fit, and the
+    /// subtraction sets it when the difference did not.
+    fn alu_flags(
+        &self,
+        op: BinOp,
+        previous: &Expr,
+        operand: &Expr,
+        result: &Expr,
+        bits: u8,
+    ) -> FlagState {
+        let (cf, of) = match op {
+            BinOp::Add => (
+                Some(Expr::Intrinsic {
+                    op: Intrinsic::Carry,
+                    args: vec![result.clone(), previous.clone()],
+                    bits,
+                }),
+                Some(Expr::Intrinsic {
+                    op: Intrinsic::OverflowAdd,
+                    args: vec![previous.clone(), operand.clone(), result.clone()],
+                    bits,
+                }),
+            ),
+            BinOp::Sub => (
+                Some(Expr::Intrinsic {
+                    op: Intrinsic::Borrow,
+                    args: vec![previous.clone(), operand.clone()],
+                    bits,
+                }),
+                Some(Expr::Intrinsic {
+                    op: Intrinsic::OverflowSub,
+                    args: vec![previous.clone(), operand.clone(), result.clone()],
+                    bits,
+                }),
+            ),
+            // The logical operations clear the carry and the overflow.
+            BinOp::And | BinOp::Or | BinOp::Xor => {
+                (Some(Expr::Const(0)), Some(Expr::Const(0)))
+            }
+            // The division operations leave the flags alone, and the
+            // multiplication ones set them from a product that does not
+            // fit, which the caller works out.
+            _ => (None, None),
+        };
+        FlagState {
+            cf,
+            zf: Some(zero_flag(result, bits)),
+            sf: Some(sign_flag(result, bits)),
+            of,
+            pf: Some(parity_flag(result, bits)),
+        }
+    }
+
+    /// A name for the value an operand holds before this instruction writes
+    /// it.
+    ///
+    /// The IR reads variables by name, so a value captured before the
+    /// register it came from is written is read again afterwards would see
+    /// the new value. The carry of an addition is the sum that did not fit,
+    /// and the overflow of a subtraction is the difference that did not,
+    /// and both are about the value that was there before.
+    fn snapshot(&mut self, op: &Operand, stmts: &mut Vec<Stmt>) -> Expr {
+        let value = self.core.read(op, stmts);
+        match op {
+            Operand::Reg(_) => {
+                let name = self.new_temp_named("old_");
+                self.core.assign(&name, value, stmts);
+                Expr::var(name)
+            }
+            _ => value,
+        }
+    }
+
+    /// `inc` and `dec`: the same arithmetic, with the carry left alone.
+    ///
+    /// The machine keeps the carry flag through an increment and a
+    /// decrement, because a loop that counts does not want its carry
+    /// disturbed. The overflow is the one flag that changes, and it can be
+    /// read off the result: an increment overflows when the result is the
+    /// smallest value the width can hold, and a decrement overflows when
+    /// the result is the largest one.
+    fn lift_inc_dec(&mut self, op: BinOp, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let bits = ops[0].size();
+        let operand = self.core.read(&ops[1], stmts);
+        let previous = self.core.read(&ops[0], stmts);
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(previous),
+            rhs: Box::new(operand),
+            bits,
+        };
+        let result = self.core.dest_value(&ops[0]);
+        let limit = 1u64 << (u32::from(bits) * 8 - 1);
+        let of = if op == BinOp::Add {
+            // The smallest value of the width.
+            Expr::Cond {
+                op: CondOp::Eq,
+                lhs: Box::new(result.clone()),
+                rhs: Box::new(Expr::Const(limit)),
+                bits,
+            }
+        } else {
+            // The largest value of the width.
+            Expr::Cond {
+                op: CondOp::Eq,
+                lhs: Box::new(result.clone()),
+                rhs: Box::new(Expr::Const(limit - 1)),
+                bits,
+            }
+        };
+        let mut flags = self.alu_flags(op, &Expr::Const(0), &Expr::Const(1), &result, bits);
+        flags.of = Some(of);
+        // The carry is not the carry of the addition: the machine keeps it.
+        flags.cf = None;
+        self.core.write(&ops[0], value, stmts);
+        self.core.set_flags(flags, None);
+    }
+
+    fn lift_unary(&mut self, op: UnOp, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(op0) = ops.first() else { return };
+        let value = self.core.read(op0, stmts);
+        let size = op0.size();
+        let value = Expr::Un {
+            op,
+            arg: Box::new(value),
+            bits: size,
+        };
+        self.core.write(op0, value, stmts);
+        // `not` leaves the flags alone. `neg` sets them, and both of the
+        // flags it sets can be read off the result: the carry says the
+        // value was not zero, and the overflow says the value was the
+        // smallest one the width can hold, which is the only value whose
+        // negation is itself.
+        if op == UnOp::Neg {
+            let result = self.core.dest_value(op0);
+            let limit = 1u64 << (u32::from(size) * 8 - 1);
+            let flags = FlagState {
+                cf: Some(Expr::Cond {
+                    op: CondOp::Ne,
+                    lhs: Box::new(result.clone()),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: size,
+                }),
+                zf: Some(zero_flag(&result, size)),
+                sf: Some(sign_flag(&result, size)),
+                of: Some(Expr::Cond {
+                    op: CondOp::Eq,
+                    lhs: Box::new(result.clone()),
+                    rhs: Box::new(Expr::Const(limit)),
+                    bits: size,
+                }),
+                pf: Some(parity_flag(&result, size)),
+            };
+            self.core.set_flags(flags, None);
+        }
+    }
+
+    fn lift_shift(&mut self, op: BinOp, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let bits = ops[0].size();
+        // The carry is the bit that was shifted out, so the value before the
+        // shift has to survive it.
+        let previous = self.snapshot(&ops[0], stmts);
+        let count = self.core.read(&ops[1], stmts);
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(previous.clone()),
+            rhs: Box::new(count.clone()),
+            bits,
+        };
+        let result = self.core.dest_value(&ops[0]);
+        let flags = self.shift_flags(op, &previous, &count, &result, bits);
+        self.core.write(&ops[0], value, stmts);
+        if let Some(flags) = flags {
+            self.core.set_flags(flags, None);
+        }
+    }
+
+    /// The flags a shift leaves behind.
+    ///
+    /// The carry is the bit that was shifted out. The overflow depends on
+    /// the direction: a left shift sets it when the sign of the result
+    /// differs from the carry, a right shift sets it when the value was
+    /// negative to begin with, and an arithmetic right shift always clears
+    /// it.
+    ///
+    /// A count of zero leaves every flag alone, and the count the machine
+    /// uses is the count masked to the width of the operand.
+    fn shift_flags(
+        &self,
+        op: BinOp,
+        previous: &Expr,
+        count: &Expr,
+        result: &Expr,
+        bits: u8,
+    ) -> Option<FlagState> {
+        let width = u32::from(bits) * 8;
+        // A count that is known makes every flag exact, and the common
+        // shifts name their count.
+        if let Expr::Const(c) = count {
+            let n = c & u64::from(width - 1);
+            if n == 0 {
+                // The machine leaves every flag alone.
+                return None;
+            }
+            let carried = match op {
+                // A left shift moves the top bit out.
+                BinOp::Shl => Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(previous.clone()),
+                    rhs: Box::new(Expr::Const(u64::from(width) - n)),
+                    bits,
+                },
+                // A right shift moves the bottom bit out.
+                _ => Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(previous.clone()),
+                    rhs: Box::new(Expr::Const(n - 1)),
+                    bits,
+                },
+            };
+            let carried = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(carried),
+                rhs: Box::new(Expr::Const(1)),
+                bits,
+            };
+            let of = match op {
+                BinOp::Shl => Expr::Cond {
+                    op: CondOp::Ne,
+                    lhs: Box::new(sign_flag(result, bits)),
+                    rhs: Box::new(carried.clone()),
+                    bits,
+                },
+                BinOp::Shr => sign_flag(previous, bits),
+                _ => Expr::Const(0),
+            };
+            return Some(FlagState {
+                cf: Some(carried),
+                zf: Some(zero_flag(result, bits)),
+                sf: Some(sign_flag(result, bits)),
+                of: Some(of),
+                pf: Some(parity_flag(result, bits)),
+            });
+        }
+        // A count that is not known can be zero, and a shift of zero leaves
+        // every flag alone, so the flags that would change are guarded.
+        let masked = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(count.clone()),
+            rhs: Box::new(Expr::Const(u64::from(width - 1))),
+            bits,
+        };
+        let is_zero = Expr::Cond {
+            op: CondOp::Eq,
+            lhs: Box::new(masked.clone()),
+            rhs: Box::new(Expr::Const(0)),
+            bits,
+        };
+        let carried = match op {
+            // A left shift moves the top bit into the bottom one.
+            BinOp::Shl => Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(Expr::Bin {
+                    op: BinOp::Shl,
+                    lhs: Box::new(previous.clone()),
+                    rhs: Box::new(masked.clone()),
+                    bits,
+                }),
+                rhs: Box::new(Expr::Const(u64::from(width - 1))),
+                bits,
+            },
+            // A right shift moves the bottom bit into the top one.
+            _ => Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(previous.clone()),
+                rhs: Box::new(Expr::Bin {
+                    op: BinOp::Sub,
+                    lhs: Box::new(masked.clone()),
+                    rhs: Box::new(Expr::Const(1)),
+                    bits,
+                }),
+                bits,
+            },
+        };
+        let carried = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(carried),
+            rhs: Box::new(Expr::Const(1)),
+            bits,
+        };
+        let of = match op {
+            BinOp::Shl => Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(sign_flag(result, bits)),
+                rhs: Box::new(carried.clone()),
+                bits,
+            },
+            BinOp::Shr => sign_flag(previous, bits),
+            _ => Expr::Const(0),
+        };
+        let guarded = |value: Expr| Expr::Select {
+            cond: Box::new(is_zero.clone()),
+            yes: Box::new(Expr::Unknown("flags".into())),
+            no: Box::new(value),
+        };
+        Some(FlagState {
+            cf: Some(guarded(carried)),
+            zf: Some(guarded(zero_flag(result, bits))),
+            sf: Some(guarded(sign_flag(result, bits))),
+            of: Some(guarded(of)),
+            pf: Some(guarded(parity_flag(result, bits))),
+        })
+    }
+
+    fn lift_imul(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        match ops.len() {
+            1 => {
+                // One-operand form writes rdx:rax; only the low half is kept,
+                // which is exact for the low half.
+                let operand = self.core.read(&ops[0], stmts);
+                let size = ops[0].size();
+                // The product is the accumulator times the operand, and the
+                // flags say whether it fitted.
+                let accumulator = self.snapshot(&Operand::Reg(Reg::view(0, size, 0)), stmts);
+                let product = Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(accumulator.clone()),
+                    rhs: Box::new(operand.clone()),
+                    bits: size,
+                };
+                let (cf, of) = self.mul_flags(&accumulator, &operand, size);
+                self.core.assign("rax", product, stmts);
+                self.core.update_flags(FlagState {
+                    cf,
+                    zf: None,
+                    sf: None,
+                    of,
+                    pf: None,
+                });
+            }
+            2 => {
+                let previous = self.snapshot(&ops[0], stmts);
+                let operand = self.core.read(&ops[1], stmts);
+                let size = ops[0].size();
+                let product = Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(previous.clone()),
+                    rhs: Box::new(operand.clone()),
+                    bits: size,
+                };
+                let (cf, of) = self.mul_flags(&previous, &operand, size);
+                self.core.write(&ops[0], product, stmts);
+                self.core.update_flags(FlagState {
+                    cf,
+                    zf: None,
+                    sf: None,
+                    of,
+                    pf: None,
+                });
+            }
+            3 => {
+                let operand = self.core.read(&ops[1], stmts);
+                let rhs = self.core.read(&ops[2], stmts);
+                let size = ops[0].size();
+                let product = Expr::Bin {
+                    op: BinOp::Mul,
+                    lhs: Box::new(operand.clone()),
+                    rhs: Box::new(rhs.clone()),
+                    bits: size,
+                };
+                let (cf, of) = self.mul_flags(&operand, &rhs, size);
+                self.core.write(&ops[0], product, stmts);
+                self.core.update_flags(FlagState {
+                    cf,
+                    zf: None,
+                    sf: None,
+                    of,
+                    pf: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// The carry and the overflow of a multiplication.
+    ///
+    /// Both are set when the product did not fit in the width of the
+    /// operation, which is the only way the machine can tell. The product
+    /// has to be the full one, and the full product of two 64-bit values
+    /// does not fit in a word, so there the flags are not known.
+    fn mul_flags(&self, a: &Expr, b: &Expr, bits: u8) -> (Option<Expr>, Option<Expr>) {
+        if bits >= 8 {
+            return (None, None);
+        }
+        let wide = 8u8;
+        let x = Expr::Cast {
+            kind: CastKind::Sext,
+            arg: Box::new(a.clone()),
+            from: bits,
+            to: wide,
+        };
+        let y = Expr::Cast {
+            kind: CastKind::Sext,
+            arg: Box::new(b.clone()),
+            from: bits,
+            to: wide,
+        };
+        let product = Expr::Bin {
+            op: BinOp::Mul,
+            lhs: Box::new(x),
+            rhs: Box::new(y),
+            bits: wide,
+        };
+        // The high half of the product is zero when the product fitted.
+        let high = Expr::Bin {
+            op: BinOp::Shr,
+            lhs: Box::new(product),
+            rhs: Box::new(Expr::Const(u64::from(bits) * 8)),
+            bits: wide,
+        };
+        let overflow = Expr::Cond {
+            op: CondOp::Ne,
+            lhs: Box::new(high),
+            rhs: Box::new(Expr::Const(0)),
+            bits: wide,
+        };
+        (Some(overflow.clone()), Some(overflow))
+    }
+
+    /// The loop family: count down and branch on the counter.
+    ///
+    /// `loop` branches while the counter is not zero, `loope` also wants
+    /// the zero flag set and `loopne` wants it clear, and `jrcxz` branches
+    /// when the counter is zero and leaves it alone. The counter is
+    /// decremented before the test, and the flags are not touched at all.
+    fn lift_loop(&mut self, m: &str, stmts: &mut Vec<Stmt>) {
+        let counter = Operand::Reg(Reg::view(RCX, 8, 0));
+        let value = self.core.read(&counter, stmts);
+        let decremented = Expr::Bin {
+            op: BinOp::Sub,
+            lhs: Box::new(value.clone()),
+            rhs: Box::new(Expr::Const(1)),
+            bits: 8,
+        };
+        // The test is against the counter after the decrement. The
+        // counter's name is enough: the expression that computes the
+        // decrement mentions the value that was there before, and the
+        // branch asks about the value that is there now.
+        let not_zero = Expr::Cond {
+            op: CondOp::Ne,
+            lhs: Box::new(Expr::var("rcx")),
+            rhs: Box::new(Expr::Const(0)),
+            bits: 8,
+        };
+        let condition = match m {
+            "loop" => not_zero,
+            "loope" | "loopne" => {
+                let Some(zero) = self.core.flags.zf.clone() else {
+                    // The zero flag says nothing, and the machine's own
+                    // condition cannot be answered without it.
+                    self.core.write(&counter, decremented, stmts);
+                    self.loop_condition = Some(Expr::Unknown("flags".into()));
+                    return;
+                };
+                let zero = if m == "loope" {
+                    zero
+                } else {
+                    Expr::Bool {
+                        op: BoolOp::Not,
+                        args: vec![zero],
+                    }
+                };
+                Expr::Bool {
+                    op: BoolOp::And,
+                    args: vec![not_zero, zero],
+                }
+            }
+            _ => {
+                // `jrcxz` branches when the counter is zero, and leaves the
+                // counter alone.
+                Expr::Cond {
+                    op: CondOp::Eq,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: 8,
+                }
+            }
+        };
+        if m != "jrcxz" && m != "jecxz" {
+            self.core.write(&counter, decremented, stmts);
+        }
+        self.loop_condition = Some(condition);
+    }
+
+    /// `movmskps`/`movmskpd`: collect the sign bits of a vector into an
+    /// integer.
+    ///
+    /// The mask has one bit per element, and the bit is the element's
+    /// sign.
+    fn lift_movmsk(&mut self, ops: &[Operand], count: u8, elem: u8, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut mask = Expr::Const(0);
+        for index in 0..count {
+            let lane = self.vec_source(src, index, elem, stmts);
+            // The sign of an element is its top bit.
+            let sign = Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(lane),
+                rhs: Box::new(Expr::Const(u64::from(elem) * 8 - 1)),
+                bits: elem,
+            };
+            let sign = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(sign),
+                rhs: Box::new(Expr::Const(1)),
+                bits: elem,
+            };
+            let bit = Expr::Bin {
+                op: BinOp::Shl,
+                lhs: Box::new(sign),
+                rhs: Box::new(Expr::Const(u64::from(index))),
+                bits: 4,
+            };
+            mask = Expr::Bin {
+                op: BinOp::Or,
+                lhs: Box::new(mask),
+                rhs: Box::new(bit),
+                bits: 4,
+            };
+        }
+        self.core.write(dst, mask, stmts);
+    }
+
+    /// `pmovmskb`: collect the sign bits of every byte of a vector.
+    ///
+    /// The mask has one bit per byte, and the bit is the byte's top bit.
+    fn lift_pmovmskb(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut mask = Expr::Const(0);
+        for byte in 0..16u8 {
+            // The vector is kept in 32-bit elements, so a byte is part of
+            // one of them.
+            let word = self.vec_source(src, byte / 4, 4, stmts);
+            let sign = Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(word),
+                rhs: Box::new(Expr::Const(u64::from(byte % 4) * 8 + 7)),
+                bits: 4,
+            };
+            let sign = Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(sign),
+                rhs: Box::new(Expr::Const(1)),
+                bits: 4,
+            };
+            let bit = Expr::Bin {
+                op: BinOp::Shl,
+                lhs: Box::new(sign),
+                rhs: Box::new(Expr::Const(u64::from(byte))),
+                bits: 4,
+            };
+            mask = Expr::Bin {
+                op: BinOp::Or,
+                lhs: Box::new(mask),
+                rhs: Box::new(bit),
+                bits: 4,
+            };
+        }
+        self.core.write(dst, mask, stmts);
+    }
+
+    fn lift_cmp(&mut self, ops: &[Operand], is_test: bool) {
+        if ops.len() != 2 {
+            return;
+        }
+        let mut sink = Vec::new();
+        let lhs = self.core.read(&ops[0], &mut sink);
+        let rhs = self.core.read(&ops[1], &mut sink);
+        // `test a, b` sets flags from `a & b`, which is a comparison with zero.
+        let (lhs, rhs) = if is_test {
+            // `test x, x` is the zero test; writing it as `x & x` hides that.
+            let value = if lhs == rhs {
+                lhs
+            } else {
+                Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    bits: ops[0].size(),
+                }
+            };
+            (value, Expr::Const(0))
+        } else {
+            (lhs, rhs)
+        };
+        // A comparison is a subtraction that threw the difference away, and
+        // the flags are the ones that subtraction leaves.
+        let cmp = super::PendingCmp::int(lhs, rhs, ops[0].size());
+        self.core.set_flags(cmp.derived_flags(), Some(cmp));
+    }
+
+    fn lift_setcc(&mut self, mnem: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(op) = ops.first() else { return };
+        let Some(cond) = self.core.target.setcc_cond(&mnem[3..]) else {
+            return;
+        };
+        // A `setcc` reads the same flags a `jcc` does, so the condition it
+        // tests is the one the branch of the same name would test.
+        let jcc = format!("j{}", &mnem[3..]);
+        let value = self.core.condition_of(&jcc, cond);
+        let value = Expr::Cast {
+            kind: CastKind::Zext,
+            arg: Box::new(value),
+            from: 1,
+            to: op.size(),
+        };
+        self.core.write(op, value, stmts);
+    }
+
+    fn lift_cmov(&mut self, mnem: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let Some(cond) = self.core.target.cmov_cond(&mnem[4..]) else {
+            return;
+        };
+        let other = self.core.read(&ops[1], stmts);
+        let current = self.core.read(&ops[0], stmts);
+        let jcc = format!("j{}", &mnem[4..]);
+        let cond = self.core.condition_of(&jcc, cond);
+        self.core.write(
+            &ops[0],
+            Expr::Select {
+                cond: Box::new(cond),
+                yes: Box::new(other),
+                no: Box::new(current),
+            },
+            stmts,
+        );
+    }
+
+    fn lift_cast(&mut self, reg: u8, from: u8, to: u8, stmts: &mut Vec<Stmt>) {
+        let value = Expr::Cast {
+            kind: CastKind::Sext,
+            arg: Box::new(Expr::var(REG64[usize::from(reg)])),
+            from,
+            to,
+        };
+        self.core.assign(REG64[usize::from(reg)], value, stmts);
+    }
+
+    fn lift_push(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(op) = ops.first() else { return };
+        // Saving a callee-saved register is frame bookkeeping.
+        if let Operand::Reg(r) = op {
+            self.core.adjust_sp(-8);
+            if r.idx == RBP {
+                return;
+            }
+            let value = self.core.read(op, stmts);
+            stmts.push(Stmt::Comment(format!(
+                "push {} ; saved at frame{:+}",
+                REG64[usize::from(r.idx)],
+                self.core.sp_off
+            )));
+            let _ = value;
+        }
+    }
+
+    fn lift_pop(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(op) = ops.first() else { return };
+        self.core.adjust_sp(8);
+        if let Operand::Reg(r) = op {
+            if r.idx == RBP {
+                self.core.fp_off = None;
+                return;
+            }
+            // The value came from a matching push; keeping the register name is
+            // honest and avoids a fake load from an invented stack slot.
+            stmts.push(Stmt::Comment(format!(
+                "pop {} ; restored from the frame",
+                REG64[usize::from(r.idx)]
+            )));
+        }
+    }
+
+    fn lift_xchg(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        if ops.len() != 2 {
+            return;
+        }
+        let a = self.core.read(&ops[0], stmts);
+        let b = self.core.read(&ops[1], stmts);
+        self.core.write(&ops[0], b, stmts);
+        self.core.write(&ops[1], a, stmts);
+    }
+
+    /// `rol`/`ror`: rotate the destination by a count.
+    ///
+    /// The count is masked to the width of the operand before the
+    /// rotation, so a count of 64 on a 32-bit operand leaves it alone.
+    fn lift_rotate(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(count)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let width = dst.size();
+        let value = self.core.read(dst, stmts);
+        let raw_count = self.core.read(count, stmts);
+        let count = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(raw_count.clone()),
+            rhs: Box::new(Expr::Const(u64::from(width * 8 - 1))),
+            bits: width,
+        };
+        let value = Expr::Intrinsic {
+            op: if m == "rol" {
+                Intrinsic::Rol
+            } else {
+                Intrinsic::Ror
+            },
+            args: vec![value, count],
+            bits: width,
+        };
+        self.core.write(dst, value, stmts);
+        // A rotate sets the carry to the bit it rotated out, and the
+        // overflow when the count was one. The zero, sign and parity flags
+        // are left alone.
+        let result = self.core.dest_value(dst);
+        let carried = match m {
+            // A left rotation moves the top bit into the bottom one.
+            "rol" => Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(result.clone()),
+                rhs: Box::new(Expr::Const(1)),
+                bits: width,
+            },
+            // A right rotation moves the bottom bit into the top one.
+            _ => Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(result.clone()),
+                rhs: Box::new(Expr::Const(u64::from(width) * 8 - 1)),
+                bits: width,
+            },
+        };
+        let carried = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(carried),
+            rhs: Box::new(Expr::Const(1)),
+            bits: width,
+        };
+        // The overflow is only defined for a rotation of one bit.
+        let of = match &raw_count {
+            Expr::Const(c) if *c & u64::from(width * 8 - 1) == 1 => {
+                Some(Expr::Cond {
+                    op: CondOp::Ne,
+                    lhs: Box::new(sign_flag(&result, width)),
+                    rhs: Box::new(carried.clone()),
+                    bits: width,
+                })
+            }
+            _ => None,
+        };
+        self.core.update_flags(FlagState {
+            cf: Some(carried),
+            zf: None,
+            sf: None,
+            of,
+            pf: None,
+        });
+    }
+
+    /// `bswap`: reverse the bytes of the destination.
+    fn lift_bswap(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(dst) = ops.first() else { return };
+        let width = dst.size();
+        let value = self.core.read(dst, stmts);
+        let value = Expr::Intrinsic {
+            op: Intrinsic::Bswap,
+            args: vec![value],
+            bits: width,
+        };
+        self.core.write(dst, value, stmts);
+        // A byte swap leaves the flags alone.
+    }
+
+    /// `bsr`/`bsf`/`tzcnt`/`lzcnt`: find a bit.
+    ///
+    /// `bsf` and `bsr` leave the destination alone when there is no such
+    /// bit, and `tzcnt` and `lzcnt` count the zeros. All of them set the
+    /// zero flag to whether the source was zero.
+    fn lift_bit_scan(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let width = dst.size();
+        let value = self.core.read(src, stmts);
+        let op = match m {
+            "bsr" => Intrinsic::Bsr,
+            "bsf" => Intrinsic::Bsf,
+            "tzcnt" => Intrinsic::Tzcnt,
+            _ => Intrinsic::Lzcnt,
+        };
+        let result = Expr::Intrinsic {
+            op,
+            args: vec![value.clone()],
+            bits: width,
+        };
+        self.core.write(dst, result, stmts);
+        // The zero flag says whether the source was zero. The count
+        // operations also set the carry to the same thing; the bit scans
+        // leave the carry undefined.
+        let zero = Expr::Cond {
+            op: CondOp::Eq,
+            lhs: Box::new(value.clone()),
+            rhs: Box::new(Expr::Const(0)),
+            bits: width,
+        };
+        let cf = match m {
+            "tzcnt" | "lzcnt" => Some(zero.clone()),
+            _ => None,
+        };
+        self.core.update_flags(FlagState {
+            cf,
+            zf: Some(zero),
+            sf: None,
+            of: None,
+            pf: None,
+        });
+    }
+
+    /// `bt`/`bts`/`btr`/`btc`: read a bit, and for the three that write
+    /// one, change it.
+    ///
+    /// The carry flag holds the bit as it was before the write, and the
+    /// other flags are left alone: the machine does not define them, so
+    /// nothing after this instruction can be said about them.
+    fn lift_bit_test(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(index)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let width = dst.size();
+        let value = self.core.read(dst, stmts);
+        let index = self.core.read(index, stmts);
+        // The bit is the one the index names, counted from the low end.
+        let shifted = Expr::Bin {
+            op: BinOp::Shr,
+            lhs: Box::new(value.clone()),
+            rhs: Box::new(index.clone()),
+            bits: width,
+        };
+        let bit = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(shifted),
+            rhs: Box::new(Expr::Const(1)),
+            bits: width,
+        };
+        // The carry flag holds the bit as it was, so the branch that reads
+        // it asks whether the bit was set. The other flags are left alone.
+        self.core.update_flags(FlagState {
+            cf: Some(Expr::Cond {
+                op: CondOp::Ne,
+                lhs: Box::new(bit),
+                rhs: Box::new(Expr::Const(0)),
+                bits: width,
+            }),
+            zf: None,
+            sf: None,
+            of: None,
+            pf: None,
+        });
+        if m == "bt" {
+            return;
+        }
+        let one = Expr::Bin {
+            op: BinOp::Shl,
+            lhs: Box::new(Expr::Const(1)),
+            rhs: Box::new(index),
+            bits: width,
+        };
+        let updated = match m {
+            "bts" => Expr::Bin {
+                op: BinOp::Or,
+                lhs: Box::new(value),
+                rhs: Box::new(one),
+                bits: width,
+            },
+            "btr" => Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(value),
+                rhs: Box::new(Expr::Un {
+                    op: UnOp::Not,
+                    arg: Box::new(one),
+                    bits: width,
+                }),
+                bits: width,
+            },
+            _ => Expr::Bin {
+                op: BinOp::Xor,
+                lhs: Box::new(value),
+                rhs: Box::new(one),
+                bits: width,
+            },
+        };
+        self.core.write(dst, updated, stmts);
+    }
+
+    /// `div`/`idiv`: divide the two-word dividend by an operand.
+    ///
+    /// The dividend is the pair `rdx:rax`, the quotient comes back in
+    /// `rax` and the remainder in `rdx`. Every flag is left undefined, so
+    /// nothing can be said about the branch that follows.
+    fn lift_div(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(src) = ops.first() else { return };
+        let width = src.size();
+        // The dividend is the high word followed by the low one, each at
+        // the width the instruction works on.
+        let high = self
+            .core
+            .read(&Operand::Reg(Reg::view(2, width, 0)), stmts);
+        let low = self.core.read(&Operand::Reg(Reg::view(0, width, 0)), stmts);
+        let divisor = self.core.read(src, stmts);
+        let signed = m == "idiv";
+        let quotient = Expr::Intrinsic {
+            op: if signed {
+                Intrinsic::IDiv
+            } else {
+                Intrinsic::Div
+            },
+            args: vec![high.clone(), low.clone(), divisor.clone()],
+            bits: width,
+        };
+        let remainder = Expr::Intrinsic {
+            op: if signed {
+                Intrinsic::IDivRem
+            } else {
+                Intrinsic::DivRem
+            },
+            args: vec![high, low, divisor],
+            bits: width,
+        };
+        self.core
+            .write(&Operand::Reg(Reg::view(0, width, 0)), quotient, stmts);
+        self.core
+            .write(&Operand::Reg(Reg::view(2, width, 0)), remainder, stmts);
+        // A division leaves every flag undefined.
+        self.core.pending_cmp = Some(super::PendingCmp::with_flags(
+            Expr::Const(0),
+            Expr::Const(0),
+            width,
+            0,
+        ));
+    }
+
+    /// `shld`/`shrd`: shift a destination and fold a second value in.
+    ///
+    /// The result is the destination shifted one way with the bits of the
+    /// source shifted the other way filling in. The count is masked to the
+    /// width of the operand, and a count of zero leaves the destination
+    /// alone, which the same formula gives.
+    fn lift_double_shift(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src), Some(count)) = (ops.first(), ops.get(1), ops.get(2)) else {
+            return;
+        };
+        let width = dst.size();
+        let bits = u64::from(width * 8);
+        let value = self.core.read(dst, stmts);
+        let source = self.core.read(src, stmts);
+        let count = self.core.read(count, stmts);
+        let count = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(count),
+            rhs: Box::new(Expr::Const(bits - 1)),
+            bits: width,
+        };
+        let (first, second) = if m == "shld" {
+            (value.clone(), source)
+        } else {
+            (source, value.clone())
+        };
+        let up = Expr::Bin {
+            op: BinOp::Shl,
+            lhs: Box::new(first),
+            rhs: Box::new(count.clone()),
+            bits: width,
+        };
+        let down = Expr::Bin {
+            op: BinOp::Shr,
+            lhs: Box::new(second),
+            rhs: Box::new(Expr::Bin {
+                op: BinOp::Sub,
+                lhs: Box::new(Expr::Const(bits)),
+                rhs: Box::new(count),
+                bits: width,
+            }),
+            bits: width,
+        };
+        let result = Expr::Bin {
+            op: BinOp::Or,
+            lhs: Box::new(up),
+            rhs: Box::new(down),
+            bits: width,
+        };
+        self.core.write(dst, result, stmts);
+        // The carry flag holds a bit that came out of the shift, and the
+        // overflow flag is only defined for a count of one. Neither is
+        // describable here.
+        self.core.pending_cmp = Some(super::PendingCmp::with_flags(
+            Expr::Const(0),
+            Expr::Const(0),
+            width,
+            0,
+        ));
+    }
+
+    /// `syscall`: a call into the kernel.
+    ///
+    /// The number is in `rax` and the arguments are in the registers the
+    /// kernel reads them from. The result comes back in `rax`, and the
+    /// kernel chooses it, so there is nothing to say about its value.
+    fn lift_syscall(&mut self, addr: Addr, stmts: &mut Vec<Stmt>) {
+        let number = Expr::var("rax");
+        let args = vec![
+            number,
+            Expr::var("rdi"),
+            Expr::var("rsi"),
+            Expr::var("rdx"),
+            Expr::var("r10"),
+            Expr::var("r8"),
+            Expr::var("r9"),
+        ];
+        stmts.push(Stmt::Call {
+            name: "syscall".into(),
+            args,
+            ret: None,
+            addr,
+        });
+        self.core
+            .write(&Operand::Reg(Reg::full(RAX, 8)), Expr::Unknown("syscall".into()), stmts);
+    }
+
+    /// `rdtsc`: the time-stamp counter.
+    ///
+    /// The counter is the only thing that reads it, and it is read twice
+    /// for the two halves of the result, so the value is one unknown.
+    fn lift_timestamp(&mut self, addr: Addr, m: &str, stmts: &mut Vec<Stmt>) {
+        let value = Expr::Unknown("timestamp".into());
+        self.core
+            .write(&Operand::Reg(Reg::full(RAX, 8)), value.clone(), stmts);
+        if m == "rdtscp" {
+            self.core
+                .write(&Operand::Reg(Reg::full(2, 8)), value, stmts);
+        }
+        self.core.notes.push((
+            addr,
+            "the time-stamp counter reads the processor's clock".into(),
+        ));
+    }
+
+    /// The flag instructions.
+    ///
+    /// `clc`, `stc` and `cmc` change the carry flag and nothing else, so
+    /// only the carry is claimed. `cld` and `std` set the direction the
+    /// string instructions run in, and `sti` and `cli` enable and disable
+    /// interrupts; neither shows up in the data flow.
+    fn lift_flag_instruction(&mut self, m: &str, addr: Addr, stmts: &mut Vec<Stmt>) {
+        match m {
+            "clc" | "stc" | "cmc" => {
+                // The carry is a single bit, and the comparison model
+                // carries a pair. A carry of one is a pair of zero and
+                // one: the branch that reads it asks "is the carry
+                // smaller than one", which is the carry.
+                let (lhs, rhs) = match m {
+                    "stc" => (Expr::Const(0), Expr::Const(1)),
+                    "clc" => (Expr::Const(1), Expr::Const(0)),
+                    // A complemented carry is neither of those.
+                    _ => (Expr::Unknown("carry".into()), Expr::Unknown("carry".into())),
+                };
+                self.core.pending_cmp = Some(super::PendingCmp::with_flags(
+                    lhs,
+                    rhs,
+                    8,
+                    super::FLAG_CF,
+                ));
+            }
+            "cld" | "std" => {
+                self.core.notes.push((
+                    addr,
+                    if m == "std" {
+                        "the direction flag is set: the string instructions run backwards"
+                            .into()
+                    } else {
+                        "the direction flag is clear: the string instructions run forwards"
+                            .into()
+                    },
+                ));
+            }
+            "sti" | "cli" => {
+                self.core.notes.push((
+                    addr,
+                    if m == "sti" {
+                        "interrupts are enabled".into()
+                    } else {
+                        "interrupts are disabled".into()
+                    },
+                ));
+            }
+            _ => {}
+        }
+        let _ = stmts;
+    }
+
+    fn lift_call(&mut self, insn: &Instruction, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let name = match insn.target {
+            Some(occ_core::CallTarget::Direct { to }) => (self.core.name_of)(to),
+            _ => match ops.first() {
+                Some(o) => {
+                    let target = self.core.read(o, stmts);
+                    format!("(*{target})")
+                }
+                None => "(*?)".into(),
+            },
+        };
+        // Only pass the argument registers this function actually set: a call
+        // in the middle of a function has live values in earlier ones.
+        let args = self.core.call_args();
+        // The callee is free to write any flag.
+        self.core.pending_cmp = None;
+        if !matches!(insn.flow, FlowKind::Return) {
+            stmts.push(Stmt::Call {
+                name,
+                args,
+                ret: Some("rax".into()),
+                addr: insn.addr,
+            });
+            // Caller-saved registers are dead after the call; carrying them
+            // forward made every later call inherit the previous call's
+            // arguments.
+            self.core.written.clear();
+            self.core.written.insert(RAX);
+        } else {
+            stmts.push(Stmt::Call {
+                name,
+                args,
+                ret: None,
+                addr: insn.addr,
+            });
+        }
+    }
+
+    /// `jmp`: a jump through a register is a computed target, and the value
+    /// in that register is the target.
+    fn lift_jmp(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let Some(op) = ops.first() else { return };
+        if let Operand::Reg(r) = op {
+            let value = self.core.read_reg(*r);
+            stmts.push(Stmt::Comment(format!(
+                "jmp {} ; computed jump target",
+                REG64[usize::from(r.idx)]
+            )));
+            let _ = value;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Vector registers
+    // ------------------------------------------------------------------
+
+    /// Read one 32-bit element of a vector register.
+    fn vec_read(&self, class: VecClass, reg: u8, index: u8) -> Expr {
+        Expr::var(vec_element(class, reg, index))
+    }
+
+    /// Read one 64-bit element: the two 32-bit elements that hold it.
+    ///
+    /// The machine stores a double as eight bytes, little endian, so the
+    /// low half of the value is the low element and the high half is the
+    /// high one.
+    fn vec_read_wide(&self, class: VecClass, reg: u8, index: u8) -> Expr {
+        let low = Expr::var(vec_element(class, reg, index));
+        let high = Expr::var(vec_element(class, reg, index + 1));
+        Expr::Bin {
+            op: BinOp::Or,
+            lhs: Box::new(Expr::Bin {
+                op: BinOp::Shl,
+                lhs: Box::new(high),
+                rhs: Box::new(Expr::Const(32)),
+                bits: 8,
+            }),
+            rhs: Box::new(low),
+            bits: 8,
+        }
+    }
+
+    /// Write one 32-bit element of a vector register.
+    fn vec_write(
+        &mut self,
+        class: VecClass,
+        reg: u8,
+        index: u8,
+        value: Expr,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        self.note_vector_write(class, reg, 4);
+        self.core.assign(&vec_element(class, reg, index), value, stmts);
+    }
+
+    /// Write one 64-bit element: split it into the two 32-bit elements.
+    fn vec_write_wide(
+        &mut self,
+        class: VecClass,
+        reg: u8,
+        index: u8,
+        value: Expr,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        self.note_vector_write(class, reg, 8);
+        let tmp = self.new_temp();
+        self.core.assign(&tmp, value, stmts);
+        let low = Expr::Cast {
+            kind: CastKind::Trunc,
+            arg: Box::new(Expr::var(tmp.clone())),
+            from: 8,
+            to: 4,
+        };
+        let high = Expr::Cast {
+            kind: CastKind::Trunc,
+            arg: Box::new(Expr::Bin {
+                op: BinOp::Shr,
+                lhs: Box::new(Expr::var(tmp)),
+                rhs: Box::new(Expr::Const(32)),
+                bits: 8,
+            }),
+            from: 8,
+            to: 4,
+        };
+        self.core.assign(&vec_element(class, reg, index), low, stmts);
+        self.core.assign(&vec_element(class, reg, index + 1), high, stmts);
+    }
+
+    /// Record that the function wrote a vector register.
+    ///
+    /// Which register the return value is in depends on the function's
+    /// type, which the code does not carry. What the code does say is
+    /// where the function left its last value, and `xmm0` is where the
+    /// ABI puts a floating-point result.
+    fn note_vector_write(&mut self, class: VecClass, reg: u8, elem: u8) {
+        self.wrote_vector = true;
+        if class == VecClass::Xmm && reg == 0 {
+            self.float_width = elem;
+        }
+    }
+
+    /// The address of one element of a memory operand.
+    fn elem_address(&mut self, op: &Operand, offset: u64, stmts: &mut Vec<Stmt>) -> Expr {
+        let base = self.core.addr_of(op, stmts);
+        if offset == 0 {
+            return base;
+        }
+        Expr::Bin {
+            op: BinOp::Add,
+            lhs: Box::new(base),
+            rhs: Box::new(Expr::Const(offset)),
+            bits: 8,
+        }
+    }
+
+    /// One element of the source operand.
+    fn vec_source(&mut self, src: &Operand, index: u8, elem: u8, stmts: &mut Vec<Stmt>) -> Expr {
+        match src {
+            Operand::Vec(class, reg) => {
+                if elem == 8 {
+                    self.vec_read_wide(*class, *reg, index * 2)
+                } else {
+                    self.vec_read(*class, *reg, index)
+                }
+            }
+            Operand::Mem { .. } => {
+                if let Some(slot) = self.core.stack_slot(src) {
+                    return Expr::var(super::slot_name(slot, elem));
+                }
+                let addr = self.elem_address(src, u64::from(index) * u64::from(elem), stmts);
+                Expr::Load {
+                    addr: Box::new(addr),
+                    size: elem,
+                    signed: false,
+                }
+            }
+            // A general-purpose register is the source of a `movd` or a
+            // `movq`, and of a conversion from an integer.
+            other => self.core.read(other, stmts),
+        }
+    }
+
+    /// One element of the destination operand, as it was before the write.
+    fn vec_old(&mut self, dst: &Operand, index: u8, elem: u8, stmts: &mut Vec<Stmt>) -> Expr {
+        match dst {
+            Operand::Vec(class, reg) => {
+                if elem == 8 {
+                    self.vec_read_wide(*class, *reg, index * 2)
+                } else {
+                    self.vec_read(*class, *reg, index)
+                }
+            }
+            Operand::Mem { .. } => {
+                if let Some(slot) = self.core.stack_slot(dst) {
+                    return Expr::var(super::slot_name(slot, elem));
+                }
+                let addr = self.elem_address(dst, u64::from(index) * u64::from(elem), stmts);
+                Expr::Load {
+                    addr: Box::new(addr),
+                    size: elem,
+                    signed: false,
+                }
+            }
+            other => self.core.read(other, stmts),
+        }
+    }
+
+    /// Write one element of the destination operand.
+    fn vec_store(
+        &mut self,
+        dst: &Operand,
+        index: u8,
+        elem: u8,
+        value: Expr,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        match dst {
+            Operand::Vec(class, reg) => {
+                if elem == 8 {
+                    self.vec_write_wide(*class, *reg, index * 2, value, stmts);
+                } else {
+                    self.vec_write(*class, *reg, index, value, stmts);
+                }
+            }
+            Operand::Mem { .. } => {
+                if let Some(slot) = self.core.stack_slot(dst) {
+                    self.core.assign(&super::slot_name(slot, elem), value, stmts);
+                    return;
+                }
+                let addr = self.elem_address(dst, u64::from(index) * u64::from(elem), stmts);
+                stmts.push(Stmt::Store {
+                    addr,
+                    value,
+                    size: elem,
+                });
+            }
+            // A general-purpose register is the destination of a `movd` or
+            // a `movq`.
+            other => self.core.write(other, value, stmts),
+        }
+    }
+
+    /// Apply an operation to every element of the destination.
+    ///
+    /// `count` counts elements of `elem` bytes; an element of eight bytes
+    /// spans two of the 32-bit elements the register is modelled as.
+    ///
+    /// Every value is read before any of them is written, because an
+    /// instruction may use its own destination as its source: `addps xmm0,
+    /// xmm0` doubles the register, and reading it after the first write
+    /// would double half of it twice.
+    fn vec_each(
+        &mut self,
+        ops: &[Operand],
+        count: u8,
+        elem: u8,
+        op: Option<BinOp>,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let source = self.vec_source(src, index, elem, stmts);
+            let value = match op {
+                None => source,
+                Some(op) => {
+                    let old = self.vec_old(dst, index, elem, stmts);
+                    Expr::Bin {
+                        op,
+                        lhs: Box::new(old),
+                        rhs: Box::new(source),
+                        bits: elem,
+                    }
+                }
+            };
+            values.push(value);
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, elem, value, stmts);
+        }
+    }
+
+    /// Apply an operation to every element of the destination, with one
+    /// operand: the square root and the conversions that keep the width.
+    fn vec_each_unary(
+        &mut self,
+        ops: &[Operand],
+        count: u8,
+        elem: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let source = self.vec_source(src, index, elem, stmts);
+            values.push(Expr::Bin {
+                op,
+                lhs: Box::new(source),
+                rhs: Box::new(Expr::Const(0)),
+                bits: elem,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, elem, value, stmts);
+        }
+    }
+
+    /// Compare every element of the destination with the source.
+    ///
+    /// The machine writes a mask, not a flag: every bit of an element is
+    /// set where the comparison holds. A comparison that holds is one, and
+    /// multiplying by the mask turns it into the bits the machine writes.
+    fn vec_each_compare(
+        &mut self,
+        ops: &[Operand],
+        count: u8,
+        elem: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let source = self.vec_source(src, index, elem, stmts);
+            let old = self.vec_old(dst, index, elem, stmts);
+            let cmp = Expr::Bin {
+                op,
+                lhs: Box::new(old),
+                rhs: Box::new(source),
+                bits: elem,
+            };
+            values.push(Expr::Bin {
+                op: BinOp::Mul,
+                lhs: Box::new(cmp),
+                rhs: Box::new(Expr::Const(mask(elem))),
+                bits: elem,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, elem, value, stmts);
+        }
+    }
+
+    /// Compare every element of the destination with the source, as an
+    /// integer comparison.
+    fn vec_each_compare_int(
+        &mut self,
+        ops: &[Operand],
+        count: u8,
+        elem: u8,
+        cond: CondOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let source = self.vec_source(src, index, elem, stmts);
+            let old = self.vec_old(dst, index, elem, stmts);
+            let cmp = Expr::Cond {
+                op: cond,
+                lhs: Box::new(old),
+                rhs: Box::new(source),
+                bits: elem,
+            };
+            values.push(Expr::Bin {
+                op: BinOp::Mul,
+                lhs: Box::new(cmp),
+                rhs: Box::new(Expr::Const(mask(elem))),
+                bits: elem,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, elem, value, stmts);
+        }
+    }
+
+    /// Lift a vector instruction.
+    ///
+    /// The families are named by what they do, because the machine's own
+    /// names say only the width: `addps` adds four single-precision
+    /// elements, `addpd` two double-precision ones, and `addss` one.
+    fn lift_vec(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) -> bool {
+        match m {
+            // Sixteen bytes: four 32-bit elements.
+            "movups" | "movupd" | "movaps" | "movapd" | "movdqa" | "movdqu" => {
+                self.vec_each(ops, 4, 4, None, stmts);
+            }
+            // The sign bits of the elements, collected into an integer.
+            "movmskps" => self.lift_movmsk(ops, 4, 4, stmts),
+            "movmskpd" => self.lift_movmsk(ops, 2, 8, stmts),
+            "pmovmskb" => self.lift_pmovmskb(ops, stmts),
+            // One 32-bit element.
+            "movss" => self.vec_each(ops, 1, 4, None, stmts),
+            // One 64-bit element: two 32-bit elements.
+            "movsd" => self.vec_each(ops, 1, 8, None, stmts),
+            // The low 64 bits of the source into the low element, or the
+            // high 64 bits into the high element.
+            "movlps" | "movlpd" => self.vec_each(ops, 1, 8, None, stmts),
+            "movhps" | "movhpd" => self.vec_each_high(ops, stmts),
+            // Packed single precision: four 32-bit elements.
+            "addps" => self.vec_each(ops, 4, 4, Some(BinOp::FAdd), stmts),
+            "subps" => self.vec_each(ops, 4, 4, Some(BinOp::FSub), stmts),
+            "mulps" => self.vec_each(ops, 4, 4, Some(BinOp::FMul), stmts),
+            "divps" => self.vec_each(ops, 4, 4, Some(BinOp::FDiv), stmts),
+            "minps" => self.vec_each(ops, 4, 4, Some(BinOp::FMin), stmts),
+            "maxps" => self.vec_each(ops, 4, 4, Some(BinOp::FMax), stmts),
+            "sqrtps" => self.vec_each_unary(ops, 4, 4, BinOp::FSqrt, stmts),
+            "andps" => self.vec_each(ops, 4, 4, Some(BinOp::And), stmts),
+            "orps" => self.vec_each(ops, 4, 4, Some(BinOp::Or), stmts),
+            "xorps" => self.vec_each(ops, 4, 4, Some(BinOp::Xor), stmts),
+            // Packed double precision: two 64-bit elements.
+            "addpd" => self.vec_each(ops, 2, 8, Some(BinOp::FAdd), stmts),
+            "subpd" => self.vec_each(ops, 2, 8, Some(BinOp::FSub), stmts),
+            "mulpd" => self.vec_each(ops, 2, 8, Some(BinOp::FMul), stmts),
+            "divpd" => self.vec_each(ops, 2, 8, Some(BinOp::FDiv), stmts),
+            "minpd" => self.vec_each(ops, 2, 8, Some(BinOp::FMin), stmts),
+            "maxpd" => self.vec_each(ops, 2, 8, Some(BinOp::FMax), stmts),
+            "sqrtpd" => self.vec_each_unary(ops, 2, 8, BinOp::FSqrt, stmts),
+            "andpd" => self.vec_each(ops, 4, 4, Some(BinOp::And), stmts),
+            "orpd" => self.vec_each(ops, 4, 4, Some(BinOp::Or), stmts),
+            "xorpd" => self.vec_each(ops, 4, 4, Some(BinOp::Xor), stmts),
+            // Scalar single precision: one 32-bit element.
+            "addss" => self.vec_each(ops, 1, 4, Some(BinOp::FAdd), stmts),
+            "subss" => self.vec_each(ops, 1, 4, Some(BinOp::FSub), stmts),
+            "mulss" => self.vec_each(ops, 1, 4, Some(BinOp::FMul), stmts),
+            "divss" => self.vec_each(ops, 1, 4, Some(BinOp::FDiv), stmts),
+            "minss" => self.vec_each(ops, 1, 4, Some(BinOp::FMin), stmts),
+            "maxss" => self.vec_each(ops, 1, 4, Some(BinOp::FMax), stmts),
+            "sqrtss" => self.vec_each_unary(ops, 1, 4, BinOp::FSqrt, stmts),
+            // Scalar double precision: one 64-bit element.
+            "addsd" => self.vec_each(ops, 1, 8, Some(BinOp::FAdd), stmts),
+            "subsd" => self.vec_each(ops, 1, 8, Some(BinOp::FSub), stmts),
+            "mulsd" => self.vec_each(ops, 1, 8, Some(BinOp::FMul), stmts),
+            "divsd" => self.vec_each(ops, 1, 8, Some(BinOp::FDiv), stmts),
+            "minsd" => self.vec_each(ops, 1, 8, Some(BinOp::FMin), stmts),
+            "maxsd" => self.vec_each(ops, 1, 8, Some(BinOp::FMax), stmts),
+            "sqrtsd" => self.vec_each_unary(ops, 1, 8, BinOp::FSqrt, stmts),
+            // The integer set: four 32-bit elements.
+            "pand" => self.vec_each(ops, 4, 4, Some(BinOp::And), stmts),
+            "por" => self.vec_each(ops, 4, 4, Some(BinOp::Or), stmts),
+            "pxor" => self.vec_each(ops, 4, 4, Some(BinOp::Xor), stmts),
+            "pandn" => self.vec_each_not_and(ops, stmts),
+            "paddd" => self.vec_each(ops, 4, 4, Some(BinOp::Add), stmts),
+            "psubd" => self.vec_each(ops, 4, 4, Some(BinOp::Sub), stmts),
+            "paddq" => self.vec_each(ops, 2, 8, Some(BinOp::Add), stmts),
+            "psubq" => self.vec_each(ops, 2, 8, Some(BinOp::Sub), stmts),
+            "pcmpeqd" => self.vec_each_compare_int(ops, 4, 4, CondOp::Eq, stmts),
+            "pcmpgtd" => self.vec_each_compare_int(ops, 4, 4, CondOp::Sgt, stmts),
+            "pslld" => self.vec_each_shift(ops, 4, 4, BinOp::Shl, stmts),
+            "psrld" => self.vec_each_shift(ops, 4, 4, BinOp::Shr, stmts),
+            "psrad" => self.vec_each_shift(ops, 4, 4, BinOp::Sar, stmts),
+            "psllq" => self.vec_each_shift(ops, 2, 8, BinOp::Shl, stmts),
+            "psrlq" => self.vec_each_shift(ops, 2, 8, BinOp::Shr, stmts),
+            // The byte and word sets work on narrower elements than the
+            // model keeps. The ones that are element-wise are lifted at the
+            // model's width, and the narrowing is said out loud; the ones
+            // that move elements around are not modelled at all.
+            "paddb" | "paddw" => {
+                self.vec_each(ops, 4, 4, Some(BinOp::Add), stmts);
+                self.vec_narrow_note();
+            }
+            "psubb" | "psubw" => {
+                self.vec_each(ops, 4, 4, Some(BinOp::Sub), stmts);
+                self.vec_narrow_note();
+            }
+            "pmullw" => {
+                self.vec_each(ops, 4, 4, Some(BinOp::Mul), stmts);
+                self.vec_narrow_note();
+            }
+            "pcmpeqb" | "pcmpeqw" => {
+                self.vec_each_compare_int(ops, 4, 4, CondOp::Eq, stmts);
+                self.vec_narrow_note();
+            }
+            "pcmpgtb" | "pcmpgtw" => {
+                self.vec_each_compare_int(ops, 4, 4, CondOp::Sgt, stmts);
+                self.vec_narrow_note();
+            }
+            "psllw" => {
+                self.vec_each_shift(ops, 4, 4, BinOp::Shl, stmts);
+                self.vec_narrow_note();
+            }
+            "psrlw" => {
+                self.vec_each_shift(ops, 4, 4, BinOp::Shr, stmts);
+                self.vec_narrow_note();
+            }
+            "psraw" => {
+                self.vec_each_shift(ops, 4, 4, BinOp::Sar, stmts);
+                self.vec_narrow_note();
+            }
+            "pminub" | "pmaxub" | "packsswb" | "packuswb" | "packssdw"
+            | "punpcklbw" | "punpcklwd" | "punpckhbw" | "punpckhwd" | "pslldq"
+            | "psrldq" => {
+                stmts.push(Stmt::Comment(format!("{m} ; not modelled")));
+                self.vec_narrow_note();
+            }
+            // The shuffles.
+            "shufps" => self.vec_shufps(ops, stmts),
+            "shufpd" => self.vec_shufpd(ops, stmts),
+            "unpcklps" => self.vec_unpack(ops, false, stmts),
+            "unpckhps" => self.vec_unpack(ops, true, stmts),
+            "unpcklpd" => self.vec_unpack_wide(ops, false, stmts),
+            "unpckhpd" => self.vec_unpack_wide(ops, true, stmts),
+            "punpcklqdq" => self.vec_unpack_wide(ops, false, stmts),
+            "punpckhqdq" => self.vec_unpack_wide(ops, true, stmts),
+            "pshufd" => self.vec_pshufd(ops, stmts),
+            "movsldup" => self.vec_dup(ops, 1, stmts),
+            "movddup" => self.vec_dup(ops, 2, stmts),
+            "movshdup" => self.vec_dup_high(ops, stmts),
+            // The conversions.
+            "cvtsi2ss" => self.vec_cvtsi(ops, 4, BinOp::I2F32, stmts),
+            "cvtsi2sd" => self.vec_cvtsi(ops, 8, BinOp::I2F64, stmts),
+            "cvttss2si" | "cvtss2si" => self.vec_cvt_to_int(ops, 4, BinOp::F2I32, stmts),
+            "cvttsd2si" | "cvtsd2si" => self.vec_cvt_to_int(ops, 8, BinOp::F2I64, stmts),
+            "cvtss2sd" => self.vec_cast(ops, 4, 8, BinOp::F2F64, stmts),
+            "cvtsd2ss" => self.vec_cast(ops, 8, 4, BinOp::F2F32, stmts),
+            "cvtps2pd" => self.vec_widen(ops, 4, 8, BinOp::F2F64, stmts),
+            "cvtpd2ps" => self.vec_narrow_floats(ops, 8, 4, BinOp::F2F32, stmts),
+            "cvtdq2ps" => self.vec_cast(ops, 4, 4, BinOp::F2F32, stmts),
+            "cvtps2dq" | "cvttps2dq" => self.vec_cast(ops, 4, 4, BinOp::F2I32, stmts),
+            // A move between a vector register and a general-purpose one.
+            "movd" => self.vec_mov_gp(ops, 4, stmts),
+            "movq" => self.vec_mov_gp(ops, 8, stmts),
+            // The comparisons that set flags instead of writing a mask.
+            "ucomiss" | "comiss" => self.vec_set_flags(ops, 4, stmts),
+            "ucomisd" | "comisd" => self.vec_set_flags(ops, 8, stmts),
+            "cmpss" => self.vec_each_compare(ops, 1, 4, BinOp::FEq, stmts),
+            "cmpsd" => self.vec_each_compare(ops, 1, 8, BinOp::FEq, stmts),
+            "cmpps" => self.vec_each_compare(ops, 4, 4, BinOp::FEq, stmts),
+            "cmppd" => self.vec_each_compare(ops, 2, 8, BinOp::FEq, stmts),
+            "emms" => {}
+            _ => return false,
+        }
+        true
+    }
+
+    /// `movhps`/`movhpd`: the low 64 bits of the source into the high
+    /// element of the destination.
+    fn vec_each_high(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let Operand::Vec(class, reg) = dst else {
+            return;
+        };
+        let source = self.vec_source(src, 0, 8, stmts);
+        self.vec_write_wide(*class, *reg, 2, source, stmts);
+    }
+
+    /// `pandn`: the destination's complement and the source.
+    fn vec_each_not_and(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..4 {
+            let old = self.vec_old(dst, index, 4, stmts);
+            let source = self.vec_source(src, index, 4, stmts);
+            values.push(Expr::Bin {
+                op: BinOp::And,
+                lhs: Box::new(Expr::Un {
+                    op: UnOp::Not,
+                    arg: Box::new(old),
+                    bits: 4,
+                }),
+                rhs: Box::new(source),
+                bits: 4,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, 4, value, stmts);
+        }
+    }
+
+    /// A shift of every element by the same count.
+    fn vec_each_shift(
+        &mut self,
+        ops: &[Operand],
+        count: u8,
+        elem: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        // The count is either an immediate or the low element of a register.
+        let amount = match src {
+            Operand::Imm(v) => Expr::Const(*v),
+            other => self.vec_source(other, 0, 4, stmts),
+        };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let old = self.vec_old(dst, index, elem, stmts);
+            values.push(Expr::Bin {
+                op,
+                lhs: Box::new(old),
+                rhs: Box::new(amount.clone()),
+                bits: elem,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, elem, value, stmts);
+        }
+    }
+
+    /// `shufps`: the destination's elements are picked from the source and
+    /// from the destination by an immediate.
+    fn vec_shufps(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let Some(imm) = ops.get(2).and_then(|o| match o {
+            Operand::Imm(v) => Some(*v as u8),
+            _ => None,
+        }) else {
+            return;
+        };
+        let source: Vec<Expr> = (0..4).map(|i| self.vec_source(src, i, 4, stmts)).collect();
+        let old: Vec<Expr> = (0..4).map(|i| self.vec_old(dst, i, 4, stmts)).collect();
+        let picks = [
+            source[(imm & 3) as usize].clone(),
+            source[((imm >> 2) & 3) as usize].clone(),
+            old[((imm >> 4) & 3) as usize].clone(),
+            old[((imm >> 6) & 3) as usize].clone(),
+        ];
+        for (index, value) in picks.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, 4, value, stmts);
+        }
+    }
+
+    /// `shufpd`: the destination's 64-bit elements are picked from the
+    /// source's by an immediate.
+    fn vec_shufpd(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let Some(imm) = ops.get(2).and_then(|o| match o {
+            Operand::Imm(v) => Some(*v as u8),
+            _ => None,
+        }) else {
+            return;
+        };
+        let first = self.vec_source(src, imm & 1, 8, stmts);
+        let second = self.vec_source(src, (imm >> 1) & 1, 8, stmts);
+        self.vec_store(dst, 0, 8, first, stmts);
+        self.vec_store(dst, 1, 8, second, stmts);
+    }
+
+    /// `unpcklps`/`unpckhps`: the source's elements are interleaved with
+    /// the destination's.
+    fn vec_unpack(&mut self, ops: &[Operand], high: bool, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let base = if high { 2 } else { 0 };
+        let source: Vec<Expr> = (0..2).map(|i| self.vec_source(src, base + i, 4, stmts)).collect();
+        let old: Vec<Expr> = (0..2).map(|i| self.vec_old(dst, base + i, 4, stmts)).collect();
+        let picks = [
+            source[0].clone(),
+            old[0].clone(),
+            source[1].clone(),
+            old[1].clone(),
+        ];
+        for (index, value) in picks.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, 4, value, stmts);
+        }
+    }
+
+    /// `unpcklpd`/`unpckhpd`/`punpcklqdq`/`punpckhqdq`: the 64-bit
+    /// elements are interleaved.
+    fn vec_unpack_wide(&mut self, ops: &[Operand], high: bool, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let base = if high { 1 } else { 0 };
+        let source = self.vec_source(src, base, 8, stmts);
+        let old = self.vec_old(dst, base, 8, stmts);
+        self.vec_store(dst, base, 8, source, stmts);
+        self.vec_store(dst, base + 1, 8, old, stmts);
+    }
+
+    /// `pshufd`: the destination's elements are picked from the source's
+    /// by an immediate.
+    fn vec_pshufd(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let Some(imm) = ops.get(2).and_then(|o| match o {
+            Operand::Imm(v) => Some(*v as u8),
+            _ => None,
+        }) else {
+            return;
+        };
+        let source: Vec<Expr> = (0..4).map(|i| self.vec_source(src, i, 4, stmts)).collect();
+        for index in 0..4 {
+            let pick = ((imm >> (2 * index)) & 3) as usize;
+            self.vec_store(dst, index, 4, source[pick].clone(), stmts);
+        }
+    }
+
+    /// `movsldup`/`movddup`: every element is a copy of another one.
+    fn vec_dup(&mut self, ops: &[Operand], step: u8, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..4 {
+            values.push(self.vec_source(src, index / step, 4, stmts));
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, 4, value, stmts);
+        }
+    }
+
+    /// `movshdup`: every element is a copy of the one above it.
+    fn vec_dup_high(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..4 {
+            values.push(self.vec_source(src, index / 2 * 2 + 1, 4, stmts));
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, 4, value, stmts);
+        }
+    }
+
+    /// A conversion from an integer register to a float element.
+    fn vec_cvtsi(&mut self, ops: &[Operand], elem: u8, op: BinOp, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let value = self.core.read(src, stmts);
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(value),
+            rhs: Box::new(Expr::Const(0)),
+            bits: src.size(),
+        };
+        self.vec_store(dst, 0, elem, value, stmts);
+    }
+
+    /// A conversion from a float element to an integer register.
+    fn vec_cvt_to_int(
+        &mut self,
+        ops: &[Operand],
+        elem: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let value = self.vec_source(src, 0, elem, stmts);
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(value),
+            rhs: Box::new(Expr::Const(0)),
+            bits: elem,
+        };
+        self.core.write(dst, value, stmts);
+    }
+
+    /// A conversion that keeps the number of elements and changes their
+    /// width.
+    fn vec_cast(
+        &mut self,
+        ops: &[Operand],
+        from: u8,
+        to: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let count = if from == 8 { 2 } else { 4 };
+        let mut values = Vec::new();
+        for index in 0..count {
+            let source = self.vec_source(src, index, from, stmts);
+            values.push(Expr::Bin {
+                op,
+                lhs: Box::new(source),
+                rhs: Box::new(Expr::Const(0)),
+                bits: from,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, to, value, stmts);
+        }
+    }
+
+    /// `cvtps2pd`: two single-precision elements become one double.
+    fn vec_widen(&mut self, ops: &[Operand], from: u8, to: u8, op: BinOp, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let mut values = Vec::new();
+        for index in 0..2 {
+            let source = self.vec_source(src, index, from, stmts);
+            values.push(Expr::Bin {
+                op,
+                lhs: Box::new(source),
+                rhs: Box::new(Expr::Const(0)),
+                bits: from,
+            });
+        }
+        for (index, value) in values.into_iter().enumerate() {
+            self.vec_store(dst, index as u8, to, value, stmts);
+        }
+    }
+
+    /// `cvtpd2ps`: one double becomes two single-precision elements.
+    fn vec_narrow_floats(
+        &mut self,
+        ops: &[Operand],
+        from: u8,
+        to: u8,
+        op: BinOp,
+        stmts: &mut Vec<Stmt>,
+    ) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let source = self.vec_source(src, 0, from, stmts);
+        let value = Expr::Bin {
+            op,
+            lhs: Box::new(source),
+            rhs: Box::new(Expr::Const(0)),
+            bits: from,
+        };
+        self.vec_store(dst, 0, to, value.clone(), stmts);
+        self.vec_store(dst, 1, to, value, stmts);
+    }
+
+    /// `movd`/`movq`: a move between a vector register and a
+    /// general-purpose one.
+    fn vec_mov_gp(&mut self, ops: &[Operand], elem: u8, stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        match (dst, src) {
+            (Operand::Vec(..), Operand::Reg(..)) => {
+                let value = self.core.read(src, stmts);
+                self.vec_store(dst, 0, elem, value, stmts);
+            }
+            (Operand::Reg(..), Operand::Vec(..)) => {
+                let value = self.vec_source(src, 0, elem, stmts);
+                self.core.write(dst, value, stmts);
+            }
+            _ => {}
+        }
+    }
+
+    /// `ucomiss`/`ucomisd`: the comparison sets flags instead of writing
+    /// a mask.
+    fn vec_set_flags(&mut self, ops: &[Operand], elem: u8, stmts: &mut Vec<Stmt>) {
+        let (Some(lhs), Some(rhs)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let left = self.vec_source(lhs, 0, elem, stmts);
+        let right = self.vec_source(rhs, 0, elem, stmts);
+        self.core.pending_cmp = Some(super::PendingCmp::float(left, right, elem));
+    }
+
+    /// A vector instruction whose elements are narrower than the model
+    /// keeps.
+    ///
+    /// The operation is still lifted, at the model's width, and the
+    /// narrowing is recorded as a note: the output then says what was
+    /// approximated instead of pretending the width was right.
+    fn vec_narrow_note(&mut self) {
+        self.core.notes.push((
+            Addr::NULL,
+            "a vector instruction on 8- or 16-bit elements is modelled at 32-bit width".into(),
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // The x87 stack
+    // ------------------------------------------------------------------
+
+    /// The physical slot a logical stack slot lives in.
+    fn fpu_physical(&self, slot: u8) -> u8 {
+        (self.fpu_top + slot) & 7
+    }
+
+    /// The value in a logical stack slot.
+    fn fpu_read(&self, slot: u8) -> Expr {
+        Expr::var(fpu_slot_name(self.fpu_physical(slot)))
+    }
+
+    /// Push a value onto the x87 stack.
+    fn fpu_push(&mut self, value: Expr, stmts: &mut Vec<Stmt>) {
+        if self.fpu_top == 0 {
+            self.core.notes.push((
+                Addr::NULL,
+                "the x87 stack overflowed: the pushed value is lost".into(),
+            ));
+            return;
+        }
+        self.fpu_top -= 1;
+        self.fpu_assign(self.fpu_top, value, stmts);
+    }
+
+    /// Write a value into a slot of the x87 stack.
+    ///
+    /// The write is recorded, because a function that leaves a value on
+    /// the x87 stack returns it from there.
+    fn fpu_assign(&mut self, slot: u8, value: Expr, stmts: &mut Vec<Stmt>) {
+        self.wrote_x87 = true;
+        self.core.assign(&fpu_slot_name(slot), value, stmts);
+    }
+
+    /// Pop a value off the x87 stack.
+    fn fpu_pop(&mut self) {
+        if self.fpu_top >= 7 {
+            self.core.notes.push((
+                Addr::NULL,
+                "the x87 stack underflowed: there was nothing to pop".into(),
+            ));
+            return;
+        }
+        self.fpu_top += 1;
+    }
+
+    /// Lift an x87 instruction.
+    ///
+    /// The three arithmetic groups differ in where the result lands and
+    /// not in what it computes: `D8` writes the top of the stack, `DC`
+    /// writes the slot it names, and `DE` writes that slot and pops. The
+    /// arithmetic is the same in all three, so the mnemonic says which
+    /// operation it is and the operands say where the result goes.
+    fn lift_x87(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) -> bool {
+        match m {
+            "fld" => {
+                let Some(src) = ops.first() else { return true };
+                match src {
+                    Operand::Fpu(slot) => {
+                        let value = self.fpu_read(*slot);
+                        self.fpu_push(value, stmts);
+                    }
+                    other => {
+                        // The width is the operand's own: `fld tbyte` reads
+                        // ten bytes of extended precision, and reading
+                        // eight of them would name the wrong slot.
+                        let width = other.size();
+                        let value = self.core.read_load(
+                            other,
+                            super::Access {
+                                width,
+                                signed: false,
+                            },
+                            stmts,
+                        );
+                        self.fpu_push(value, stmts);
+                    }
+                }
+            }
+            "fst" | "fstp" => {
+                let Some(dst) = ops.first() else { return true };
+                let value = self.fpu_read(0);
+                match dst {
+                    Operand::Fpu(slot) => {
+                        let physical = self.fpu_physical(*slot);
+                        self.fpu_assign(physical, value, stmts);
+                    }
+                    other => {
+                        let width = other.size();
+                        self.core.store(
+                            other,
+                            value,
+                            super::Access {
+                                width,
+                                signed: false,
+                            },
+                            stmts,
+                        );
+                    }
+                }
+                if m == "fstp" {
+                    self.fpu_pop();
+                }
+            }
+            "fxch" => {
+                let Some(Operand::Fpu(slot)) = ops.first() else {
+                    return true;
+                };
+                // The two slots trade places. The value that leaves the
+                // top has to be held somewhere first: reading it by name
+                // after the other slot has been written would read the
+                // new value, not the old one.
+                let top = self.fpu_read(0);
+                let other = self.fpu_read(*slot);
+                let held = self.new_temp_named("x87_");
+                self.core.assign(&held, top, stmts);
+                self.fpu_assign(self.fpu_top, other, stmts);
+                self.fpu_assign(self.fpu_physical(*slot), Expr::var(held), stmts);
+            }
+            "fadd" | "fmul" | "fsub" | "fsubr" | "fdiv" | "fdivr" | "faddp" | "fmulp"
+            | "fsubp" | "fsubrp" | "fdivp" | "fdivrp" => {
+                let (Some(Operand::Fpu(first)), Some(Operand::Fpu(second))) =
+                    (ops.first(), ops.get(1))
+                else {
+                    return true;
+                };
+                // All three groups compute the same thing: the top of the
+                // stack is the left operand and the slot the instruction
+                // names is the right one. The groups differ in where the
+                // result lands, not in what it computes. That is what the
+                // hardware says, and it is not what the manual says: the
+                // manual writes the subtraction the other way round.
+                //
+                // The decoder prints the destination first, so the two
+                // operands arrive in the order the group puts them: `D8`
+                // names `st(0)` first, `DC` and `DE` name the other slot
+                // first. Whichever operand names `st(0)` is therefore the
+                // left one.
+                let (top_slot, other_slot) = if *first == 0 {
+                    (*first, *second)
+                } else {
+                    (*second, *first)
+                };
+                let top = self.fpu_read(top_slot);
+                let other = self.fpu_read(other_slot);
+                // The `r` forms compute the other way round: `fsubr` is
+                // `b - a`, not `a - b`. The `p` suffix belongs to the
+                // operation, so the name is stripped before it is read.
+                let base = m.strip_suffix('p').unwrap_or(m);
+                let reversed = base.ends_with('r');
+                let (lhs, rhs) = if reversed { (other, top) } else { (top, other) };
+                let op = match base {
+                    "fadd" => BinOp::FAdd,
+                    "fmul" => BinOp::FMul,
+                    "fsub" | "fsubr" => BinOp::FSub,
+                    "fdiv" | "fdivr" => BinOp::FDiv,
+                    _ => BinOp::FAdd,
+                };
+                let value = Expr::Bin {
+                    op,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                    bits: 10,
+                };
+                // The destination is the slot the instruction names: the
+                // top when it names the top, the other slot otherwise.
+                let dest = if *first == 0 {
+                    self.fpu_top
+                } else {
+                    self.fpu_physical(*first)
+                };
+                self.fpu_assign(dest, value, stmts);
+                if m.ends_with('p') {
+                    self.fpu_pop();
+                }
+            }
+            "fcom" | "fcomi" | "fucomi" | "fcomip" | "fucomip" => {
+                let other = match ops.first() {
+                    Some(Operand::Fpu(slot)) => *slot,
+                    _ => 1,
+                };
+                let left = self.fpu_read(0);
+                let right = self.fpu_read(other);
+                self.core.pending_cmp = Some(super::PendingCmp::float(left, right, 10));
+                if matches!(m, "fcomip" | "fucomip") {
+                    self.fpu_pop();
+                }
+            }
+            "fcomp" | "fcompp" => {
+                let other = match ops.first() {
+                    Some(Operand::Fpu(slot)) => *slot,
+                    _ => 1,
+                };
+                let left = self.fpu_read(0);
+                let right = self.fpu_read(other);
+                self.core.pending_cmp = Some(super::PendingCmp::float(left, right, 10));
+                self.fpu_pop();
+                if m == "fcompp" {
+                    self.fpu_pop();
+                }
+            }
+            "fchs" => {
+                let value = self.fpu_read(0);
+                let value = Expr::Bin {
+                    op: BinOp::FNeg,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: 10,
+                };
+                self.fpu_assign(self.fpu_top, value, stmts);
+            }
+            "fabs" => {
+                let value = self.fpu_read(0);
+                let value = Expr::Bin {
+                    op: BinOp::FAbs,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: 10,
+                };
+                self.fpu_assign(self.fpu_top, value, stmts);
+            }
+            "fsqrt" => {
+                let value = self.fpu_read(0);
+                let value = Expr::Bin {
+                    op: BinOp::FSqrt,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: 10,
+                };
+                self.fpu_assign(self.fpu_top, value, stmts);
+            }
+            "fldz" => self.fpu_push(Expr::Const(0), stmts),
+            "fld1" => self.fpu_push(Expr::Unknown("1.0L".into()), stmts),
+            "fldpi" => self.fpu_push(Expr::Unknown("3.14159265358979323846L".into()), stmts),
+            "fldl2e" => self.fpu_push(Expr::Unknown("1.44269504088896340736L".into()), stmts),
+            "fldlg2" => self.fpu_push(Expr::Unknown("0.30102999566398119521L".into()), stmts),
+            "fldln2" => self.fpu_push(Expr::Unknown("0.69314718055994530942L".into()), stmts),
+            "fild" => {
+                let Some(src) = ops.first() else { return true };
+                let width = src.size();
+                let value = self.core.read_load(
+                    src,
+                    super::Access {
+                        width,
+                        signed: false,
+                    },
+                    stmts,
+                );
+                let value = Expr::Bin {
+                    op: BinOp::I2F80,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: width,
+                };
+                self.fpu_push(value, stmts);
+            }
+            "fistp" | "fisttp" | "fist" => {
+                let Some(dst) = ops.first() else { return true };
+                let width = dst.size();
+                let value = self.fpu_read(0);
+                let value = Expr::Bin {
+                    op: if width == 8 {
+                        BinOp::F2I64
+                    } else {
+                        BinOp::F2I32
+                    },
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: 10,
+                };
+                self.core.store(
+                    dst,
+                    value,
+                    super::Access {
+                        width,
+                        signed: false,
+                    },
+                    stmts,
+                );
+                if m != "fist" {
+                    self.fpu_pop();
+                }
+            }
+            "fnstsw" | "fnstcw" | "fldcw" | "fnstenv" | "fldenv" | "frstor"
+            | "fnsave" | "finit" | "fnclex" => {
+                // The control and status words have no place in the
+                // decompiler's world; saying so is better than dropping
+                // them.
+                stmts.push(Stmt::Comment(format!("{m} ; not modelled")));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------
+    // Atomic instructions
+    // ------------------------------------------------------------------
+
+    /// Lift an atomic read-modify-write.
+    fn lift_atomic(&mut self, m: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) -> bool {
+        // The mnemonic decides first. An instruction with one operand is
+        // not an atomic read-modify-write, and claiming it was would
+        // swallow the call, the jump and the push.
+        if m != "xadd" && m != "cmpxchg" {
+            return false;
+        }
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return true;
+        };
+        match m {
+            "xadd" => {
+                let width = dst.size();
+                let old = self.core.read(dst, stmts);
+                let addend = self.core.read(src, stmts);
+                // The old value is needed twice: in the sum that goes back
+                // into memory and in the source register. Reading it twice
+                // would read it after the store, which is the new value.
+                let held = self.new_temp_named("old_");
+                self.core.assign(&held, old, stmts);
+                let sum = Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::var(held.clone())),
+                    rhs: Box::new(addend),
+                    bits: width,
+                };
+                self.core.write(dst, sum, stmts);
+                // The old value goes back to the source register.
+                self.core.write(src, Expr::var(held), stmts);
+                self.core.notes.push((
+                    Addr::NULL,
+                    "xadd: an atomic read-modify-write; no other thread sees the half state"
+                        .into(),
+                ));
+            }
+            "cmpxchg" => {
+                let width = dst.size();
+                let value = self.core.read(dst, stmts);
+                // The memory's old value is read once and used twice: for
+                // the comparison and for the value the accumulator keeps
+                // when the comparison fails. Reading it twice would read it
+                // after the store, which is the new value.
+                let held_memory = self.new_temp_named("old_");
+                self.core.assign(&held_memory, value, stmts);
+                // The comparison is against the accumulator, which is the
+                // register the instruction's width selects.
+                let accumulator = Operand::Reg(Reg::view(0, width, 0));
+                let held = self.core.read(&accumulator, stmts);
+                let same = Expr::Cond {
+                    op: CondOp::Eq,
+                    lhs: Box::new(Expr::var(held_memory.clone())),
+                    rhs: Box::new(held.clone()),
+                    bits: width,
+                };
+                self.core.pending_cmp = Some(super::PendingCmp::int(
+                    Expr::var(held_memory.clone()),
+                    held.clone(),
+                    width,
+                ));
+                let wanted = self.core.read(src, stmts);
+                // The exchange happens only when the two are equal; the
+                // accumulator takes the old value when they are not.
+                self.core.write(
+                    dst,
+                    Expr::Select {
+                        cond: Box::new(same.clone()),
+                        yes: Box::new(wanted),
+                        no: Box::new(Expr::var(held_memory.clone())),
+                    },
+                    stmts,
+                );
+                self.core.write(
+                    &accumulator,
+                    Expr::Select {
+                        cond: Box::new(same),
+                        yes: Box::new(Expr::var(held_memory)),
+                        no: Box::new(held),
+                    },
+                    stmts,
+                );
+                self.core.notes.push((
+                    Addr::NULL,
+                    "cmpxchg: an atomic compare-and-exchange".into(),
+                ));
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // ------------------------------------------------------------------
+    // String instructions
+    // ------------------------------------------------------------------
+
+    /// Lift a string instruction.
+    ///
+    /// The source, the destination and the count are the registers the
+    /// instruction names implicitly: `rsi`, `rdi` and `rcx`. With `rep` the
+    /// instruction is a loop, and a loop is not unrolled: the output says
+    /// how many elements move and leaves the copying itself alone.
+    fn lift_string(
+        &mut self,
+        m: &str,
+        ops: &[Operand],
+        repeated: bool,
+        addr: Addr,
+        stmts: &mut Vec<Stmt>,
+    ) -> bool {
+        let Some(Operand::Mem { size, .. }) = ops.first() else {
+            return false;
+        };
+        let width = if *size == 0 { 1 } else { *size };
+        match m {
+            "movsb" | "movs" => {
+                let Some(Operand::Mem { .. }) = ops.get(1) else {
+                    return true;
+                };
+                if repeated {
+                    // The instruction is a loop, and the IR has no loop and
+                    // no bulk copy. The copy is therefore written as the one
+                    // operation it is: the whole count, moved at once. The
+                    // pointers and the count are then what the machine
+                    // leaves behind.
+                    let source = self.elem_address(&ops[0], 0, stmts);
+                    let destination = self.elem_address(&ops[1], 0, stmts);
+                    let count = count_times(width);
+                    stmts.push(Stmt::Call {
+                        name: "memcpy".into(),
+                        args: vec![destination, source, count.clone()],
+                        ret: None,
+                        addr,
+                    });
+                    self.core.assign("rsi", add_to("rsi", count.clone()), stmts);
+                    self.core.assign("rdi", add_to("rdi", count), stmts);
+                    self.core.assign("rcx", Expr::Const(0), stmts);
+                } else {
+                    let source = self.elem_address(&ops[0], 0, stmts);
+                    let destination = self.elem_address(&ops[1], 0, stmts);
+                    stmts.push(Stmt::Store {
+                        addr: destination,
+                        value: Expr::Load {
+                            addr: Box::new(source),
+                            size: width,
+                            signed: false,
+                        },
+                        size: width,
+                    });
+                    let step = Expr::Const(u64::from(width));
+                    self.core.assign("rsi", add_to("rsi", step.clone()), stmts);
+                    self.core.assign("rdi", add_to("rdi", step), stmts);
+                }
+                self.core.notes.push((
+                    addr,
+                    if repeated {
+                        format!("{m}: a loop of {width}-byte copies, written as one memcpy")
+                    } else {
+                        format!("{m}: one {width}-byte copy")
+                    },
+                ));
+            }
+            "stosb" | "stos" => {
+                let destination = self.elem_address(&ops[0], 0, stmts);
+                // The value stored is the accumulator, whose width the
+                // instruction's operand size selects.
+                let accumulator = match width {
+                    1 => "al",
+                    2 => "ax",
+                    8 => "rax",
+                    _ => "eax",
+                };
+                if repeated {
+                    let count = count_times(width);
+                    stmts.push(Stmt::Call {
+                        name: "memset".into(),
+                        args: vec![
+                            destination,
+                            Expr::var(accumulator),
+                            count.clone(),
+                        ],
+                        ret: None,
+                        addr,
+                    });
+                    self.core.assign("rdi", add_to("rdi", count), stmts);
+                    self.core.assign("rcx", Expr::Const(0), stmts);
+                } else {
+                    stmts.push(Stmt::Store {
+                        addr: destination,
+                        value: Expr::var(accumulator),
+                        size: width,
+                    });
+                    self.core.assign(
+                        "rdi",
+                        add_to("rdi", Expr::Const(u64::from(width))),
+                        stmts,
+                    );
+                }
+                self.core.notes.push((
+                    addr,
+                    if repeated {
+                        format!("{m}: a loop of {width}-byte stores, written as one memset")
+                    } else {
+                        format!("{m}: one {width}-byte store")
+                    },
+                ));
+            }
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// A register's value plus something.
+fn add_to(reg: &str, value: Expr) -> Expr {
+    Expr::Bin {
+        op: BinOp::Add,
+        lhs: Box::new(Expr::var(reg)),
+        rhs: Box::new(value),
+        bits: 8,
+    }
+}
+
+/// The count register times an element width.
+fn count_times(width: u8) -> Expr {
+    if width == 1 {
+        // A byte count is the count. Multiplying it by one says the same
+        // thing more slowly.
+        return Expr::var("rcx");
+    }
+    Expr::Bin {
+        op: BinOp::Mul,
+        lhs: Box::new(Expr::var("rcx")),
+        rhs: Box::new(Expr::Const(u64::from(width))),
+        bits: 8,
+    }
+}
+
+/// The name of one element of a vector register.
+///
+/// A vector register is modelled as the 32-bit elements it holds. That is
+/// the width most of the machine's vector instructions work on — the
+/// packed single-precision and the integer sets both use it — and the
+/// 64-bit float operations read two adjacent elements as one value.
+fn vec_element(class: VecClass, reg: u8, index: u8) -> String {
+    let prefix = match class {
+        VecClass::Xmm => "xmm",
+        VecClass::Ymm => "ymm",
+        VecClass::Mm => "mm",
+    };
+    format!("{prefix}{reg}_{index}")
+}
+
+/// The name of one physical slot of the x87 stack.
+///
+/// The slots are numbered by the hardware, and the hardware's numbering
+/// runs downwards: the first value a function pushes is in the highest
+/// numbered slot. Naming them the way a reader counts them — the top is
+/// the first — keeps the output's names in the order the stack holds.
+fn fpu_slot_name(physical: u8) -> String {
+    format!("st_{}", 7u8.saturating_sub(physical))
+}
+
+impl super::Lifter for Lifter<'_> {
+    fn lift_block(&mut self, insns: &[Instruction]) -> Lifted {
+        let mut out = Lifted::default();
+        // The register state is per block, not per function. A block that
+        // prepares a call's arguments is a different block from the one that
+        // dispatched to it, and the second must not inherit the first's
+        // registers: that made `puts(leaked, spilled)` where the callee
+        // takes one argument.
+        self.core.written.clear();
+        for insn in insns {
+            self.lift_insn(insn, &mut out);
+        }
+        let last = insns.last();
+        if let Some(insn) = last {
+            // The loop family carries its own condition: it is a question
+            // about the counter and not one of the machine's condition
+            // codes.
+            if let Some(condition) = self.loop_condition.take() {
+                out.branch = Some(condition);
+            } else if matches!(insn.flow, FlowKind::ConditionalBranch) {
+                let parsed = self.core.target.parse(&insn.text);
+                out.branch = Some(match parsed {
+                    Some(p) => self.core.take_condition(&p),
+                    None => Expr::Unknown("condition".into()),
+                });
+            } else if matches!(insn.flow, FlowKind::UnconditionalBranch)
+                && insn.target.is_none()
+            {
+                out.indirect = Some(Expr::Unknown("indirect target".into()));
+            }
+        }
+        out
+    }
+
+    fn call_args(&self) -> Vec<Expr> {
+        self.core.call_args()
+    }
+
+    fn ret_reg(&self) -> String {
+        // The x86-64 ABI returns an integer or a pointer in `rax`, a
+        // floating-point value in `xmm0`, and an extended-precision one on
+        // the x87 stack. Which of the three a function returns is a fact
+        // about its type, and the type is not in the code. What the code
+        // does say is where the function left its last value, so that is
+        // what decides.
+        if self.core.ever_written.contains(&RAX) {
+            return REG64[usize::from(RAX)].to_string();
+        }
+        if self.wrote_vector {
+            return "xmm0_0".to_string();
+        }
+        // A value left on the x87 stack is in the top slot, and the top
+        // slot is where the ABI says the return value is. An empty stack
+        // means the function returned something else.
+        if self.wrote_x87 && self.fpu_top < 8 {
+            return fpu_slot_name(self.fpu_top);
+        }
+        REG64[usize::from(RAX)].to_string()
+    }
+
+    fn ret_type(&self) -> Option<&'static str> {
+        if self.core.ever_written.contains(&RAX) {
+            return Some("u64");
+        }
+        if self.wrote_vector {
+            return Some(match self.float_width {
+                4 => "float",
+                _ => "double",
+            });
+        }
+        if self.wrote_x87 && self.fpu_top < 8 {
+            return Some("long double");
+        }
+        None
+    }
+
+    fn ret_defined(&self) -> bool {
+        // The function returned a value only if it wrote the place the
+        // value comes from.
+        self.core.ever_written.contains(&RAX)
+            || self.wrote_vector
+            || (self.wrote_x87 && self.fpu_top < 8)
+    }
+
+    fn arg_reg_names(&self) -> Vec<String> {
+        ARG_REGS
+            .iter()
+            .map(|r| REG64[usize::from(*r)].to_string())
+            .collect()
+    }
+    fn sp_alias(&self) -> &'static str {
+        self.core.target.sp_alias()
+    }
+
+    fn sp_reg_name(&self) -> String {
+        REG64[usize::from(RSP)].to_string()
+    }
+
+    fn notes(&mut self) -> Vec<(Addr, String)> {
+        std::mem::take(&mut self.core.notes)
+    }
+}
+
+/// Append an immediate operand, for `inc`/`dec`.
+fn with_imm(ops: &[Operand], value: u64) -> Vec<Operand> {
+    let mut v = ops.to_vec();
+    if v.len() == 1 {
+        v.push(Operand::Imm(value));
+    }
+    v
+}
+
+/// Register name by index.
+pub fn reg_name(idx: u8) -> &'static str {
+    REG64.get(usize::from(idx)).copied().unwrap_or("rax")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::type_name;
+    use crate::lift::Lifter as LifterTrait;
+    use occ_core::MAX_INSN_LEN;
+
+    /// Lift a sequence of instructions and render the statements.
+    ///
+    /// The lifter reads the same text a reader sees, so a test can name the
+    /// instructions it means without encoding them by hand.
+    fn lift_branch(texts: &[&str]) -> (Vec<String>, Option<String>) {
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        let mut lifter = Lifter::new(&X86Target, &name_of, &symbols);
+        let last = texts.len().saturating_sub(1);
+        let insns: Vec<Instruction> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Instruction {
+                addr: Addr((i as u64) * 8),
+                len: 8,
+                bytes: [0; MAX_INSN_LEN],
+                text: (*text).to_string(),
+                mnemonic: text.split_whitespace().next().unwrap_or("").into(),
+                flow: if i == last {
+                    FlowKind::ConditionalBranch
+                } else {
+                    FlowKind::Next
+                },
+                target: None,
+                mem_reads: Vec::new(),
+                mem_writes: Vec::new(),
+            })
+            .collect();
+        let lifted = LifterTrait::lift_block(&mut lifter, &insns);
+        let stmts = lifted
+            .stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Assign { dest, value } => format!("{dest} = {}", crate::render::expr(value)),
+                Stmt::Store {
+                    addr,
+                    value,
+                    size,
+                } => format!(
+                    "*({}*) {} = {}",
+                    type_name(*size, false),
+                    crate::render::expr(addr),
+                    crate::render::expr(value)
+                ),
+                Stmt::Call { name, args, .. } => {
+                    let args: Vec<String> =
+                        args.iter().map(crate::render::expr).collect();
+                    format!("{name}({})", args.join(", "))
+                }
+                Stmt::Comment(c) => format!("// {c}"),
+            })
+            .collect();
+        let branch = lifted.branch.as_ref().map(crate::render::expr);
+        (stmts, branch)
+    }
+
+    fn lift_texts(texts: &[&str]) -> Vec<String> {
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        let mut lifter = Lifter::new(&X86Target, &name_of, &symbols);
+        let insns: Vec<Instruction> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Instruction {
+                addr: Addr((i as u64) * 8),
+                len: 8,
+                bytes: [0; MAX_INSN_LEN],
+                text: (*text).to_string(),
+                mnemonic: text.split_whitespace().next().unwrap_or("").into(),
+                flow: FlowKind::Next,
+                target: None,
+                mem_reads: Vec::new(),
+                mem_writes: Vec::new(),
+            })
+            .collect();
+        LifterTrait::lift_block(&mut lifter, &insns)
+            .stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Assign { dest, value } => format!("{dest} = {}", crate::render::expr(value)),
+                Stmt::Store {
+                    addr,
+                    value,
+                    size,
+                } => format!(
+                    "*({}*) {} = {}",
+                    type_name(*size, false),
+                    crate::render::expr(addr),
+                    crate::render::expr(value)
+                ),
+                Stmt::Call { name, args, .. } => {
+                    let args: Vec<String> =
+                        args.iter().map(crate::render::expr).collect();
+                    format!("{name}({})", args.join(", "))
+                }
+                Stmt::Comment(c) => format!("// {c}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parses_the_decoders_operand_forms() {
+        let p = parse("mov rax, qword ptr [rip+0x1efb9]  # 0x22fc8").unwrap();
+        assert_eq!(p.mnemonic, "mov");
+        assert_eq!(p.ops.len(), 2);
+        // The resolved address travels beside the operand, not inside it: the
+        // operand itself is still `[rip+disp]`, which is what the instruction
+        // encodes.
+        assert_eq!(p.pc_target, Some(0x22fc8));
+        match &p.ops[1] {
+            Operand::Mem { base, .. } => assert_eq!(base.unwrap().idx, RIP),
+            other => panic!("{other:?}"),
+        }
+
+        let p = parse("mov dword ptr [rbp - 0x18], edi").unwrap();
+        match &p.ops[0] {
+            Operand::Mem {
+                size,
+                base,
+                disp,
+                ..
+            } => {
+                assert_eq!(*size, 4);
+                assert_eq!(base.unwrap().idx, RBP);
+                assert_eq!(*disp, -0x18);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let p = parse("lea rdx, [rax + rax*4]").unwrap();
+        match &p.ops[1] {
+            Operand::Mem { index, scale, .. } => {
+                assert_eq!(index.unwrap().idx, RAX);
+                assert_eq!(*scale, 4);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let p = parse("je 0x4014 (rel +0x2)").unwrap();
+        assert_eq!(p.ops, vec![Operand::Imm(0x4014)]);
+    }
+
+    #[test]
+    fn high_byte_registers_carry_their_offset() {
+        let r = X86Target.lookup_reg("ah").unwrap();
+        assert_eq!(r.idx, RAX);
+        assert_eq!(r.size, 1);
+        assert_eq!(r.offset, 8);
+    }
+
+    #[test]
+    fn the_x87_stack_computes_the_hardware_arithmetic() {
+        // The sequence gcc emits for `a * b + a / b`, with the long
+        // doubles passed on the stack.
+        let stmts = lift_texts(&[
+            "fld tbyte ptr [rsp + 0x8]",
+            "fld tbyte ptr [rsp + 0x18]",
+            "fld st(1)",
+            "fmul st(0), st(1)",
+            "fxch st(2)",
+            "fdivp st(1), st(0)",
+            "faddp st(1), st(0)",
+        ]);
+        for s in &stmts {
+            println!("{s}");
+        }
+        // The two arguments are read as ten-byte extended-precision slots.
+        assert!(
+            stmts.iter().any(|s| s.contains("arg_8_f80")),
+            "{stmts:#?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("arg_18_f80")),
+            "{stmts:#?}"
+        );
+        // The multiplication is `a * b` and the division is `a / b`, in that
+        // order, and the sum is the two of them.
+        assert!(
+            stmts.iter().any(|s| s.contains("f80_mul(")),
+            "{stmts:#?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("f80_div(")),
+            "{stmts:#?}"
+        );
+        assert!(
+            stmts.iter().any(|s| s.contains("f80_add(")),
+            "{stmts:#?}"
+        );
+    }
+
+    /// The condition a branch tests, as it is printed.
+    fn branch_of(texts: &[&str]) -> String {
+        let (_, branch) = lift_branch(texts);
+        branch.unwrap_or_else(|| "none".to_string())
+    }
+
+    #[test]
+    fn a_comparison_says_how_its_operands_are_read() {
+        // The same two registers are two different numbers, and the
+        // branch that consumes the comparison has to say which one it
+        // asked about.
+        assert_eq!(
+            branch_of(&["cmp edi, esi", "jl 0x40"]),
+            "(i32)rdi < (i32)rsi"
+        );
+        assert_eq!(
+            branch_of(&["cmp edi, esi", "jb 0x40"]),
+            "(u32)rdi < (u32)rsi"
+        );
+        assert_eq!(
+            branch_of(&["cmp edi, esi", "je 0x40"]),
+            "(u32)rdi == (u32)rsi"
+        );
+    }
+
+    #[test]
+    fn the_sign_flag_is_the_sign_of_the_difference() {
+        // `cmp 0, 0x80000000` leaves the sign flag set, because the
+        // difference is negative, even though the first operand is not.
+        // Reading the sign of the operands would answer a different
+        // question.
+        assert_eq!(
+            branch_of(&["cmp edi, esi", "js 0x40"]),
+            "(i32)((u32)rdi - (u32)rsi) < 0"
+        );
+    }
+
+    #[test]
+    fn the_carry_of_an_addition_is_the_sum_that_did_not_fit() {
+        // The carry says the sum did not fit, and the sum did not fit
+        // when the result is smaller than the value that was there
+        // before.
+        assert_eq!(
+            branch_of(&["add edi, esi", "jb 0x40"]),
+            "carry((u32)rdi, old_1)"
+        );
+    }
+
+    #[test]
+    fn the_borrow_of_a_subtraction_is_the_difference_that_did_not_fit() {
+        // The borrow says the minuend was smaller than the subtrahend.
+        assert_eq!(
+            branch_of(&["sub edi, esi", "jb 0x40"]),
+            "borrow(old_1, (u32)rsi)"
+        );
+    }
+
+    #[test]
+    fn the_overflow_of_a_negation_is_the_smallest_value_of_the_width() {
+        // The negation of the smallest value is itself, and that is the
+        // only value whose negation overflows.
+        assert_eq!(
+            branch_of(&["neg edi", "jo 0x40"]),
+            "(u32)rdi == 0x80000000"
+        );
+    }
+
+    #[test]
+    fn the_zero_flag_of_a_logical_operation_is_the_result() {
+        // The logical operations clear the carry and the overflow, and
+        // their zero flag is the result.
+        assert_eq!(
+            branch_of(&["and edi, esi", "je 0x40"]),
+            "(u32)rdi == 0"
+        );
+        assert_eq!(
+            branch_of(&["test edi, esi", "jz 0x40"]),
+            "(u32)((u32)rdi & (u32)rsi) == 0"
+        );
+    }
+
+    #[test]
+    fn the_loop_family_counts_down_and_branches_on_the_counter() {
+        // `loop` decrements the counter and branches while it is not
+        // zero. The branch asks about the counter after the decrement.
+        let (stmts, branch) = lift_branch(&["loop 0x40"]);
+        assert_eq!(branch.as_deref(), Some("rcx != 0"));
+        assert!(stmts.iter().any(|s| s.contains("rcx = rcx - 1")));
+        // `jrcxz` branches when the counter is zero, and leaves it alone.
+        let (stmts, branch) = lift_branch(&["jrcxz 0x40"]);
+        assert_eq!(branch.as_deref(), Some("rcx == 0"));
+        assert!(!stmts.iter().any(|s| s.contains("rcx = ")));
+    }
+
+    #[test]
+    fn a_loop_that_wants_the_zero_flag_says_so_when_there_is_none() {
+        // `loope` wants the zero flag, and without a comparison before it
+        // there is no zero flag to read.
+        let (_, branch) = lift_branch(&["loope 0x40"]);
+        assert_eq!(branch.as_deref(), Some("<flags>"));
+    }
+
+    #[test]
+    fn the_mask_of_a_vector_is_the_sign_of_its_elements() {
+        let (stmts, _) = lift_branch(&["movmskps eax, xmm0"]);
+        let line = stmts.first().expect("a statement");
+        // Four elements, four bits, and each bit is the element's sign.
+        assert!(line.contains("xmm0_0 >> 0x1f & 1"), "{line}");
+        assert!(line.contains("(xmm0_3 >> 0x1f & 1) << 3"), "{line}");
+    }
+}

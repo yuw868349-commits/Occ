@@ -1,0 +1,573 @@
+# occ
+
+Binary analysis over MCP, built for a model to drive.
+
+Not a CLI with a JSON mode bolted on. The unit of exchange is a **handle**, every
+answer carries its **evidence**, and the session remembers what has been
+established so far. A file goes in; a chain of checkable conclusions comes out.
+
+```
+$ occ                # speaks MCP over stdio
+$ occ --http :8787   # same tools over POST /mcp
+```
+
+## The problem this solves
+
+A model analysing a binary through a normal tool loop spends its context on
+transport. Ask `objdump` about a function, get 4 KB of disassembly, ask about the
+caller, get the same function again from a different angle. By the third turn the
+transcript is mostly repetition, and by the tenth the model is reasoning about its
+own earlier output instead of about the binary.
+
+Three concrete failures follow, and each one has a design answer here:
+
+| Failure | Answer in this codebase |
+| --- | --- |
+| Payload re-sending | Addresses are handles. `fn:0x6d30` is 10 bytes on the wire; the function stays on the server. |
+| Confident nonsense | Every conclusion is a set of weighted observations, combined into a confidence, with the counter-evidence and the gaps kept next to it. |
+| Amnesia between turns | A session holds images, names, notes, hypotheses, traces and snapshots. `fn:0x6d30` means the same thing in turn 40 as in turn 1. |
+
+## Five rules the code follows
+
+**1. Handles, not payloads.** Fourteen kinds — `img:`, `sec:`, `sym:`, `fn:`,
+`bb:`, `insn:`, `str:`, `blob:`, `imp:`, `exp:`, `rel:`, `hyp:`, `xref:`,
+`trace:` — all resolved by one argument type. A caller that holds a handle never
+re-sends what it refers to. Blob handles are content-addressed, so identical bytes
+in two images get the same handle.
+
+**2. Every answer is checkable.** The envelope carries `evidence[]` (kind, source,
+address, detail, signed weight), `confidence`, `alternatives`, `caveats`, and
+`truncated`. A model can tell "I verified this" from "I inferred this" from "I
+could not see this", which is the distinction that stops a plausible story from
+becoming a reported finding.
+
+**3. The session is the unit of work.** `session.save`/`session.restore` persist
+images, names, notes and hypotheses without caching analyses — they are
+recomputed, because a cached disassembly is a stale disassembly. Hypotheses carry
+sequence numbers, so a reply can distinguish a prediction made before the evidence
+from one made after.
+
+**4. Tools are intents, not command mirrors.** There is no `disassemble(start,
+end)`. There is `code.function target=<handle>`, `code.explore`, `code.taint`,
+`trace.run`. The engine decides how much to decode, how far to follow control
+flow, and how much to render; the caller says how much it wants to read.
+
+**5. Zero dependencies.** `Cargo.lock` contains twelve path crates and no
+registry source. JSON, SHA-256, demangling, ELF/PE/Mach-O/WASM parsing, x86 and
+AArch64 and RISC-V decoding, DWARF, and the MCP transport are all implemented
+here. The only external symbols are the Linux system calls in `occ-sys`.
+
+## One exchange, asked and answered
+
+Trimmed output from a real session against `/bin/ls`.
+
+```jsonc
+// binary.open path="/bin/ls"
+{
+  "ok": true,
+  "handle": "img:0",
+  "summary": "elf x86_64 64-bit pie (/bin/ls) — 300 functions, 700 strings, 98.1% of code decoded",
+  "data": {
+    "identity": { "format": "elf", "arch": "x86_64", "bits": 64, "entry": "0x6d30",
+                  "image_base": "0x0", "linkage": "pie", "imports": 120,
+                  "interpreter": "/lib64/ld-linux-x86-64.so.2",
+                  "sha256": "0148f5ab3062a905281d8deb9645363da5131011c9e7b6dcaa38b504e41b68ea" },
+    "fingerprint": { "compiler": "unknown", "language": "c", "linkage": "pie",
+                     "runtime": "glibc", "stripped": false, "has_dwarf": false },
+    "coverage": { "code_bytes": 85818, "decoded_bytes": 84197, "fraction": 0.9811 }
+  },
+  "next": ["code.functions with image=0, sort=insns, limit=20", "binary.strings ..."]
+}
+```
+
+```jsonc
+// code.function target="0x6d30"
+{
+  "ok": true,
+  "handle": "fn:0x6d30",
+  "summary": "_start at 0x6d30: 13 insns, 1 blocks, complexity 2, 0 callers",
+  "data": { "function": { "size": 38, "import_calls": ["__libc_start_main"] } },
+  "evidence": [
+    { "kind": "format", "source": "loader", "weight": 0.8,
+      "detail": "the image header names this address as the entry point" },
+    { "kind": "cfg", "source": "heuristic", "weight": 0.2,
+      "detail": "entry matches a compiler prologue" }
+  ],
+  "confidence": 0.84,
+  "caveats": []
+}
+```
+
+```jsonc
+// hypothesis.create target="fn:0x6d30" statement="calls __libc_start_main"
+{ "ok": true, "handle": "hyp:1", "summary": "hypothesis 1 recorded",
+  "next": ["hypothesis.evidence id=1 detail=... support=true weight=0.6"] }
+```
+
+The same weight scale that makes `0.84` mean something is what makes a refutation
+usable: `hypothesis.evidence` with `support=false` recomputes the verdict, and a
+statement the binary contradicts comes back `refuted`, not `inconclusive`.
+
+## Tools
+
+Thirty-seven, in seven groups. The names carry the intent.
+
+**Session — what state exists**
+
+| Tool | Answers |
+| --- | --- |
+| `session.info` | Open images, hypotheses, notes. First call when resuming a conversation. |
+| `session.save` | Write paths, names, notes and hypotheses to a file for a later process. |
+| `session.restore` | Reopen those images; analyses are recomputed, not restored. |
+
+**Binary — what is in the file**
+
+| Tool | Answers |
+| --- | --- |
+| `binary.open` | Load, analyse and fingerprint a file. Every other tool takes the returned image id. |
+| `binary.info` | Headers, segments, sections, fingerprint, coverage. |
+| `binary.sections` | Section map, filterable by name or kind. |
+| `binary.imports` | Imports, with the GOT/IAT slot each occupies when the container records it. |
+| `binary.exports` | Exported symbols and their addresses. |
+| `binary.symbols` | Symbol search; says whether the image is stripped, which changes how far the names can be trusted. |
+| `binary.relocations` | Relocations with target, kind and addend — where function pointers live. |
+| `binary.strings` | ASCII and UTF-16 strings with addresses, addressable as `str:<addr>`. |
+| `binary.hexdump` | Hex and ASCII, up to 4096 bytes. |
+| `binary.entropy` | Per-section entropy or a sliding window, with the threshold used. |
+| `binary.fingerprint` | Compiler, language, linkage, runtime, packer suspicion, each with its evidence. |
+
+**Code — what it does**
+
+| Tool | Answers |
+| --- | --- |
+| `code.functions` | Recovered functions with size, block count and call degree; sortable. |
+| `code.function` | One function: blocks, edges, callers, callees, imports called, strings referenced, complexity, boundary evidence. |
+| `code.disasm` | Instructions from an address, each with flow kind and resolved target. |
+| `code.blocks` | Control-flow graph with typed edges — loop and branch structure without reading instructions. |
+| `code.decompile` | Pseudo-C: lifting, SSA, structuring, rendering. Unmodelled statements stay as comments and the `goto` count is reported. |
+| `code.explore` | Execute one function along its paths; each path reports the inputs that reach it and the value it returns. |
+| `code.taint` | Propagate sources through a function and report which argument of which call they arrive at, with a block path. |
+| `code.xrefs` | Who refers to this, and what this refers to. |
+| `code.callgraph` | Breadth-first callers or callees, bounded by depth and node count. |
+| `code.search` | Instructions by mnemonic, text, or immediate value; each hit names its function. |
+
+**Debug — what the compiler recorded**
+
+| Tool | Answers |
+| --- | --- |
+| `debug.info` | Compilation units, producer, language, source files; whether DWARF exists at all. |
+| `debug.line` | Address to `file:line:column`, and the enclosing debug function. |
+| `debug.functions` | Functions as the compiler declared them, not as recovery guessed them. |
+| `debug.function` | Parameters and locals with resolved types and the location valid at an address. |
+| `debug.types` | Types with sizes, member offsets and pointees. |
+| `debug.variables` | Every variable placed at an address, with type and location expression. |
+
+**Hypotheses — what has been established**
+
+| Tool | Answers |
+| --- | --- |
+| `hypothesis.create` | Record a falsifiable statement about a handle. |
+| `hypothesis.evidence` | Attach an observation; returns the recomputed verdict: confirmed, refuted, or inconclusive. |
+| `hypothesis.list` | Every hypothesis with its verdict and evidence count. |
+
+**Diff and scan — comparing and matching**
+
+| Tool | Answers |
+| --- | --- |
+| `diff.functions` | Identical, modified, rewritten, added, removed — matched by name, then by structural hash. |
+| `scan.pattern` | YARA-shaped rules: text with `nocase`/`wide`, hex with `??` and `[n-m]`, `and`/`or`/`not`, `N of them`, `at`, `in`. |
+
+**Trace — what it actually does**
+
+| Tool | Answers |
+| --- | --- |
+| `trace.run` | Run under `ptrace` and record the instruction path, every call edge including indirect ones, syscalls with path arguments, signals. Compares the run against the recovered functions. |
+| `trace.get` | Query a recorded run: coverage per function, block-by-block hits, without running anything again. |
+
+## The reply envelope
+
+Every tool returns the same shape. A caller that has read one reply has read all
+of them.
+
+```jsonc
+{
+  "ok": true,               // branch on this, never on prose
+  "handle": "fn:0x6d30",    // what to ask about next
+  "summary": "...",         // one line, enough to decide whether to read on
+  "data": { },              // structure, already trimmed to the depth asked for
+  "evidence": [ ],          // why the engine believes it
+  "confidence": 0.84,       // noisy-OR over the evidence
+  "alternatives": [ ],      // explanations weighed and set aside
+  "caveats": [ ],           // what this answer does not cover
+  "next": [ ],              // concrete follow-up calls
+  "tokens_estimate": 120,   // what this reply cost
+  "truncated": false        // was it cut to fit the depth budget
+}
+```
+
+Failures use the same envelope with `ok: false`, a `summary` that names the cause,
+and `next` entries that are valid calls:
+
+```jsonc
+// code.function target="nope"
+{ "ok": false,
+  "summary": "\"nope\" is not an address; expected 0x401000 or 4198400",
+  "next": ["binary.sections — find an addressable region", ...] }
+```
+
+`depth=summary|detail|raw` (default `detail`) caps items, bytes, instructions and
+evidence entries per reply. `summary` answers "what is this", `detail` answers "how
+is it built", `raw` gives the full listing with original instruction bytes so the
+caller can re-decode independently.
+
+## What it reads
+
+| Container | Depth |
+| --- | --- |
+| ELF | Both classes, both byte orders, `ET_REL`/`ET_EXEC`/`ET_DYN`/core. Section and program headers, `.symtab` and `.dynsym` merged and de-duplicated, relocations, PLT/GOT binding, interpreter and `DT_NEEDED`. |
+| PE/COFF | PE32 and PE32+, imports with IAT slots, exports, base relocations, Rich header detection, and raw `COFF` objects. |
+| Mach-O | Thin and fat, `MH_EXECUTE`/`DYLIB`/`BUNDLE`/`OBJECT`, load commands, `LC_SYMTAB`, `__DWARF` sections. |
+| WASM | Sections, imports, exports, function bodies decoded from bytecode. |
+
+Architectures: x86 and x86-64 (full decode, decompile, symbolic execution),
+AArch64 and RISC-V 32/64 (full instruction decode, decompile, symbolic
+execution, taint), WebAssembly bytecode.
+
+Loading does what a loader does: mapped segments and permissions, symbol tables,
+import/export resolution, **PLT/GOT and IAT binding** so `call [rip+0x2f4a]`
+becomes `call puts`, section classification, entropy profiling, string extraction
+over mapped sections.
+
+Analysis is recursive descent from entry points, with symbol sizes authoritative
+when present, tail calls distinguished from intra-function jumps, and basic
+blocks plus cyclomatic complexity per function.
+
+A `switch` that the compiler turned into a table is recovered rather than lost.
+Recursive descent stops at the indirect jump that performs the dispatch, and the
+case bodies behind it are unreachable from there, so a recovery that does not
+read the table ends the function at the jump and reports a body three quarters
+short. The dispatch is resolved in the two shapes compilers actually emit — the
+table built by `lea` / `movsxd` / `add` before a `jmp` through a register, and
+the absolute-pointer table read by `jmp [base + index*8]` — and the entries
+become real edges, so the case bodies are decoded, belong to the function, and
+decompile as a `switch` with one case per entry.
+
+## Decompilation, execution and taint
+
+`code.decompile` runs four passes over the same IR that `code.explore` and
+`code.taint` consume, so an answer from one can be read against the other without
+a translation step: lift to statements over named values, convert to SSA with phi
+nodes at joins, propagate copies and drop dead assignments, then structure with
+dominators and post-dominators.
+
+Only the first pass knows the architecture. The register file, the condition
+codes, the stack frame and the widths live in a per-architecture `Target` and
+`Lifter`; SSA, structuring, rendering, path exploration and taint see one
+architecture-independent IR. That split is not cosmetic: x86 compares through a
+flags register that survives any number of instructions, while AArch64's
+condition flags are set by the instruction that computes them and consumed by
+the branch that tests them, and RISC-V has no flags at all — its branch names
+the two registers it compares. A single `match image.arch` inside the lifter
+would have had to hold all three at once.
+
+The width travels with the comparison. `cmp %edi,%edi` compares 32-bit values,
+and a `js` after it asks whether the low half of the register is negative, so
+the branch condition sign-extends what the comparison read. A lifter that
+compared the whole 64-bit register would answer a different question, and the
+solver would look for an input in a range the machine never examined.
+
+Two numbers keep the output honest. `unstructured` counts the constructs that
+needed `goto`, and every instruction the lifter could not model is emitted as a
+comment in place. A body with `unstructured: 0` can be read as written; a body
+with `unstructured: 17` is a partial rendering and says so.
+
+Every `goto` in the output has a label to land on. A block the structure has
+to reach from two places is emitted once, under a label at the end of the
+function, and every path that reaches it jumps there — not once inline and
+once again at the end, which leaves the reader working out that the two
+copies are the same code. A jump to a label that is never defined is worse
+than no structure at all, because the reader cannot follow it.
+
+`libc.so.6` is the honest test of all this: it is hand-written, heavily
+optimised code with shapes no compiler emits. `cargo run -p occ-decompile
+--example decompile_symbol -- /lib/x86_64-linux-gnu/libc.so.6 warn` decompiles
+one symbol from it, and the whole library can be walked the same way without
+running out of stack.
+
+`code.explore` forks the state at branch conditions that depend on an argument,
+accumulates constraints along each path, solves them for the inputs that reach it,
+and reports the returned value. A path that hits a bound is reported as `truncated`
+— never as dead code, which is the failure mode that makes a model conclude a
+branch is unreachable when the tool merely gave up.
+
+## Dynamic tracing
+
+`trace.run` is the part static analysis cannot do. It runs the program under
+`ptrace`, single-steps it, and records what happened: the executed address path,
+every call edge with its call site and target, indirect calls with the slot they
+came through, syscalls with their path arguments and return values, and signals
+with fault addresses.
+
+It is a debugger, not a sandbox: the program runs natively with the caller's
+privileges and its effects are real. It is bounded by a step count and a wall
+clock, and a cut run reports `truncated` with the reason.
+
+```
+trace.run image=0 steps=20000
+→ "ran /tmp/t for 1566 step(s) in 13 ms: exited 4; 11 of 14 recovered function(s)
+   executed, 3 never did, 0 executed address(es) belong to no function,
+   3 indirect call site(s), 2 syscall kind(s)"
+```
+
+That last part is the point. A static view says "these 14 functions exist"; the
+trace says which 3 never ran, which executed bytes belong to no recovered
+function, and where each indirect call actually went. `trace.get` then answers
+per-branch questions — *did this block ever execute* — against the same run
+without running anything again.
+
+Three details that only show up when the tracer is real:
+
+- **Single-stepping, not breakpoints.** A breakpoint can only confirm what the
+  static view already predicted. A step-by-step path can contradict it, which is
+  the useful direction. The cost is ~5 system calls per instruction, which is why
+  the step and time budgets exist and why a cut run says so.
+- **Every thread is resumed per stop.** `waitpid` reports one stop at a time; if
+  the other threads are left suspended, `pthread_join` deadlocks. Each stop
+  resumes all parked threads for one instruction.
+- **Image addresses are distinguished from external ones.** An address is "in the
+  image" only if `addr - load_base` falls inside a mapped section. Otherwise it is
+  counted in `external_steps` and kept out of the call-edge table, so a libc
+  address never masquerades as a low file offset.
+
+## Zero dependencies
+
+`Cargo.lock` has twelve packages, all of them workspace members, and not one
+`source = "registry"` line. That is checkable in one command:
+
+```bash
+grep -c 'source = "registry' Cargo.lock                                   # 0
+cargo tree --workspace --edges normal --prefix none | grep -v '^occ' \
+  | grep -c ' v'                                                          # 0
+```
+
+What a dependency would have been, and what replaced it:
+
+| Would be | Replacement | Where |
+| --- | --- | --- |
+| `serde` + `serde_json` | Value tree, parser, writer, schema | `occ-json` |
+| `thiserror` | Hand-written `Display` and `Error` | `occ-core/src/error.rs` |
+| `object` | ELF, PE/COFF, Mach-O, WASM parsers | `occ-bin` |
+| `cpp_demangle` + `rustc-demangle` | Itanium demangler and Rust hash stripping | `occ-bin/src/demangle.rs` |
+| `sha2` | SHA-256 | `occ-bin/src/sha256.rs` |
+| `memmap2` | `mmap` declared directly, with an owned lifetime | `occ-sys/src/mem.rs` |
+| `libc` / `nix` | `extern "C"` declarations for the nine symbols used | `occ-sys` |
+| `iced-x86` | Table-driven x86 decoder | `occ-decode/src/x86.rs` |
+| `gimli` | DWARF 2–5 reader, line program, location lists | `occ-dwarf` |
+| `rmcp` / `tokio` | JSON-RPC 2.0 over stdio and a hand-rolled HTTP loop | `occ-mcp` |
+
+The trade is deliberate and has a cost: the decoders cover what this tool needs
+to answer questions about real binaries, not every encoding in the vendor manual.
+Where coverage stops, the answer says so rather than guessing.
+
+## Install
+
+```bash
+cargo build --release          # Rust 1.85+, edition 2024
+./target/release/occ        # MCP over stdio
+```
+
+Register it with a client:
+
+```json
+{
+  "mcpServers": {
+    "occ": {
+      "command": "/absolute/path/to/occ",
+      "args": []
+    }
+  }
+}
+```
+
+Then: *"Load /usr/bin/curl, find what it does with the `-x` argument, and show me
+the evidence."*
+
+## Layout
+
+| Crate | Responsibility | Lines |
+| --- | --- | --- |
+| `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 2.9k |
+| `occ-json` | JSON value, parser, writer, schema validation. | 2.0k |
+| `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid` as `extern "C"`. | 1.3k |
+| `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, demangling, SHA-256. | 4.4k |
+| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.0k |
+| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 3.9k |
+| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.4k |
+| `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 13.2k |
+| `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.5k |
+| `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 2.0k |
+| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.6k |
+| `occ-mcp` | The 37 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.4k |
+
+52.7k lines of Rust, 387 tests, 82 end-to-end MCP checks.
+
+## Verification
+
+Unit tests are necessary and not sufficient: most of the serious bugs found while
+building this were invisible to them and obvious against a real file.
+
+```bash
+cargo test --workspace                                         # 387 tests
+cargo clippy --workspace --all-targets -- -D warnings          # clean
+python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
+```
+
+One test compiles the same C source for three architectures and asks each one
+the same questions. The decompiler has to recover the same parameters, the same
+control flow and the same global address; the symbolic executor has to reach
+the same four answers for the same five inputs, explore all four paths, and
+carry the taint to the same three branches. A lifter that treats a signed
+comparison as an unsigned one still produces paths — just the wrong ones — and
+the answers say so.
+
+`scripts/mcp_smoke.py` is a real MCP client: JSON-RPC handshake, `tools/list`,
+schema validation, then every tool against `/bin/ls`, a cross-compiled PE, a
+Mach-O object, a COFF object, a WASM module and a compiled trace fixture. It
+asserts on things like *the entry point reaches `__libc_start_main`*, *string
+addresses are not zero*, *the tracee's stdout does not corrupt the protocol
+stream*, *a PIE breakpoint actually hits*, and *changing argv changes block
+coverage by exactly one block*.
+
+### The opcode tables are measured, not written down
+
+A disassembler is a table of several thousand facts, and a table typed from
+memory is a table with several thousand chances to be wrong in a way no unit
+test looks at. Every x86 table in `occ-decode` is therefore built by
+construction: the script lays an encoding into a sixteen-byte slot, hands the
+buffer to two independent disassemblers, and records what they agree on.
+
+| Script | Produces | Cross-checked against |
+| --- | --- | --- |
+| `scripts/vector_tables.py` | `vector_tables.rs` (VEX) | GNU objdump 2.42 + LLVM 23 |
+| `scripts/evex_tables.py` | `evex_ops.rs` (EVEX) | LLVM 23 (GNU lacks the 128/256-bit forms) |
+| `scripts/vsib_tables.py` | `vsib_tables.rs` (gather/scatter) | GNU objdump 2.42 + LLVM 23 |
+| `scripts/compare_tables.py` | `cmp_ops.rs` (comparisons) | GNU objdump 2.42 + LLVM 23 |
+
+The agreement rule is what makes this usable: an encoding the two channels
+describe differently is dropped, not guessed. A few hundred encodings are
+dropped that way, and the table says nothing about them rather than something
+wrong.
+
+The check that matters is the one over real code. `scripts/diff_all.py` runs
+`objdump -d` and the decoder over every executable on the machine and compares
+instruction boundaries, not text:
+
+```
+$ python3 scripts/diff_all.py
+checked 2793 binaries, 0 with differences
+```
+
+An instruction boundary is the load-bearing claim: get one length wrong and
+every following instruction is compared at the wrong address. Text is compared
+too, and the differences that remain are aliases — the same instruction under
+another name, `vcmpeqps` for `vcmpps` — which the report counts separately
+rather than hiding.
+
+Bugs this discipline caught, each of which had passing unit tests at the time:
+
+- **dynsym index off by one** — `__libc_start_main` resolved as `__mempcpy_chk`,
+  because ELF symbol indices count the reserved null symbol. Found by diffing
+  against `readelf -rW`.
+- **Function recovery running into the next function** — a 5-instruction `_start`
+  absorbed 125 instructions from a neighbour. Fixed with symbol-size bounds plus
+  tail-call classification.
+- **PIE image base reported as `0x4000`** — zero was filtered out of the segment
+  minimum, so every runtime address landed a segment short and no PIE breakpoint
+  could ever be armed.
+- **Strings at address `0x0`** — non-allocated sections have no load address, and
+  reporting one handle for hundreds of different strings silently aliased them.
+- **Relocatable objects with every section at `0x0`** — `.o`/`.obj` files have no
+  load address and their symbol values are section-relative, so every function
+  landed at zero. Found by compiling the same source to ELF, COFF and Mach-O
+  objects and requiring two distinct functions from each.
+- **Prologue predicates that were always false** — the AArch64 and RISC-V bit
+  masks cleared the bits they then compared, so those two architectures had no
+  prologue recognition at all. `clippy::bad_bit_mask` found it; the fix is pinned
+  by tests over real instruction encodings.
+- **One file, two answers about linkage** — the header said `pie`, the fingerprint
+  said `linkage?`, because the analyzer re-derived the load model from section
+  names instead of reading `e_type`. Linkage now comes from the container only.
+- **Syscall names that were all `sys_18446744073709551615`** — single-stepping
+  produces no syscall-stop, so `orig_rax` is empty; the tracer reads `rax`.
+- **Every `goto` pointing at a label that did not exist** — the structurer
+  jumped to a block it had already emitted but never defined the label. Across
+  2000 functions of glibc that was 16359 jumps into nothing. The structure is
+  now built twice: the first pass finds the shared blocks, the second treats
+  them as boundaries and emits each one once, under a label.
+- **A stack overflow that killed the server** — a block with one predecessor
+  forwards a variable read to it, and the blocks of a loop form a ring, so the
+  forwarding never ended. One function of glibc was enough to abort the
+  process. A read now tracks what is in flight; a value in a ring has no first
+  definition and is reported as unknown.
+- **A switch that vanished from the decompiled output** — a `switch` compiled
+  to a table is reached through an indirect jump, which recursive descent stops
+  at, so the case bodies were never decoded. The table is now resolved and its
+  entries become real edges.
+- **A fixture that never ran and the suite was green anyway** — the jump-table
+  test had no `main`, so it never linked, so the test skipped itself and
+  reported success. A compiler that is present but fails is now a failure.
+- **A 32-bit comparison answered with a 64-bit value** — `cmp %edi,%edi` compares
+  the low half of the register, but the branch condition read the whole thing, so
+  `js` asked whether the upper half was negative. The width now travels with the
+  comparison, and the solver looks for an answer in the range the machine
+  actually examined.
+- **Every RISC-V global at address zero** — `__global_pointer$` is an absolute
+  symbol, and the loader treated it as undefined and dropped its address. Every
+  access through `gp` was then off by the whole data segment.
+- **A branch against an unknown** — RISC-V's `x0` is hardwired to zero: reads
+  return zero and writes are discarded. Lifted as an ordinary register, `beq a0,
+  zero` compared against a value nothing had ever set, and the solver had no
+  constant to work from.
+
+## Limits
+
+Stated because the tool is supposed to state them, not because they are temporary.
+
+- **Decompilation, path exploration and taint cover x86-64, AArch64 and
+  RISC-V.** WASM decodes and recovers control flow, but `code.decompile` returns
+  an outline for it rather than a made-up body.
+- **AVX-512 coverage is uneven by construction.** The EVEX table holds the
+  encodings both disassemblers agreed on, which is most of the set but not all of
+  it: `vpshldw`, `vdbpsadbw`, `vrsqrt14ps` and a few dozen others are missing,
+  and the sweep over the family reports them as gaps rather than as guesses. On
+  the binaries that ship with a Linux system the gap never fires — the sweep over
+  all 2793 of them finds no length mismatch — because compilers do not emit those
+  forms below 512-bit vectors, and the code that does use them is hand-written
+  intrinsics.
+- **Tracing is x86-64 Linux only.** It requires a Linux host and an x86 or x86-64
+  image; PE and Mach-O can be loaded and analysed, not executed here.
+- **Static analysis cannot see** runtime-resolved function pointers, `dlopen`'d
+  symbols, direct syscalls, or anything a packer decrypts in memory. Hypothesis
+  replies list these as unchecked rather than implying absence. `trace.run` is the
+  answer for the cases where the program can be run.
+- **Indirect calls** resolve to `CallTarget::Indirect { via }` when the slot is
+  known and stay unresolved otherwise; there is no points-to analysis.
+- **DWARF** covers versions 2 to 5, without split DWARF or compressed
+  `.zdebug_*` sections. A variable whose location cannot be determined is reported
+  as such, not guessed.
+- **No decompilation of hand-written assembly idioms** beyond the patterns the
+  lifter models; those instructions appear as comments with their bytes intact.
+- **Only two dispatch shapes are resolved.** A table built by `lea` / `movsxd` /
+  `add` before a `jmp` through a register, and an absolute-pointer table read by
+  `jmp [base + index*8]`. A jump through a slot the program computed at runtime,
+  or a table whose entries are values rather than targets — which is what a
+  compiler emits for a small switch — is not a dispatch and is not treated as
+  one.
+- **Case numbers are table indices.** When the compiler normalises the
+  discriminant before dispatching (`sub edi, 'a'`), that offset is kept in the
+  instruction stream, so the recovered `case` values are `0, 1, 2, …` rather
+  than the source's `'a', 'b', 'c'`. The offset is visible in the disassembly.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

@@ -1,0 +1,12 @@
+[package]
+name = "occ-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ELF, PE, COFF, Mach-O and WASM container parsing."
+
+[dependencies]
+occ-core.workspace = true
+occ-sys.workspace = true
