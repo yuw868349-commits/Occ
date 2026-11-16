@@ -21,6 +21,7 @@ pub mod macho;
 pub mod pe;
 pub mod wasm;
 pub mod reader;
+pub mod reloc;
 pub mod sha256;
 
 use occ_core::{CoreError, Format, Image, ImageId, Result};

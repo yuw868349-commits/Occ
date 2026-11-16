@@ -569,19 +569,15 @@ fn read_relocations(r: &Reader<'_>, l: &Layout, data: &[u8]) -> Vec<Relocation> 
                 continue;
             }
             let target = u64::from(page) + u64::from(delta);
-            out.push(Relocation {
-                offset: Addr(l.image_base + target),
-                kind: match kind {
-                    3 => RelocKind::Absolute,       // HIGHLOW
-                    10 => RelocKind::ImageRelative, // DIR64
-                    1 => RelocKind::Other,          // HIGH
-                    2 => RelocKind::Other,          // LOW
-                    4 => RelocKind::Other,          // HIGHADJ
-                    _ => RelocKind::Other,
-                },
-                symbol: None,
-                addend: None,
-            });
+            let kind = match kind {
+                3 => RelocKind::Absolute,       // HIGHLOW
+                10 => RelocKind::ImageRelative, // DIR64
+                1 => RelocKind::Other,          // HIGH
+                2 => RelocKind::Other,          // LOW
+                4 => RelocKind::Other,          // HIGHADJ
+                _ => RelocKind::Other,
+            };
+            out.push(Relocation::bare(Addr(l.image_base + target), kind, None));
         }
         off += block_size;
         blocks += 1;

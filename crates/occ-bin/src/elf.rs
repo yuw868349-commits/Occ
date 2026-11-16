@@ -817,11 +817,22 @@ fn read_relocations(
                 .get(sym_idx)
                 .map(|sym| sym.name.clone())
                 .filter(|n| !n.is_empty());
+            // The target section is what turns `offset` from a number into a
+            // place. `sh_info == 0` means the table applies to the image as a
+            // whole (`.rela.dyn`), which only happens in a linked image.
+            let section = (s.info != 0).then_some(s.info as usize);
+            let symbol_addr = symbols
+                .get(sym_idx)
+                .filter(|sym| sym.defined)
+                .map(|sym| sym.addr);
             out.push(Relocation {
                 offset: Addr(offset),
                 kind: reloc_kind(arch, r_type),
                 symbol,
                 addend: if rela { Some(addend) } else { None },
+                raw_type: r_type,
+                section,
+                symbol_addr,
             });
         }
         let _ = i;

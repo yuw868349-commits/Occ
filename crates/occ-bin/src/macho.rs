@@ -372,12 +372,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         // one entry per section keeps the count honest without pretending to
         // know each target.
         if s.kind == SectionKind::Code {
-            relocations.push(Relocation {
-                offset: s.addr,
-                kind: RelocKind::Other,
-                symbol: None,
-                addend: None,
-            });
+            relocations.push(Relocation::bare(s.addr, RelocKind::Other, None));
         }
     }
     if !dylibs.is_empty() {

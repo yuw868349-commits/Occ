@@ -426,13 +426,51 @@ pub enum RelocKind {
 #[derive(Debug, Clone)]
 pub struct Relocation {
     /// Where the relocation applies.
+    ///
+    /// In a relocatable object this counts from the start of [`Self::section`],
+    /// not from the start of the image: the linker has not assigned an address
+    /// yet, so there is nothing else for it to count from.
     pub offset: Addr,
     /// Flavour.
     pub kind: RelocKind,
     /// Target symbol name, when the format records one.
     pub symbol: Option<String>,
     /// Addend, when the format records one.
+    ///
+    /// `None` means the addend lives in the bytes being relocated, which is
+    /// what `SHT_REL` and COFF use.
     pub addend: Option<i64>,
+    /// Container-specific type number.
+    ///
+    /// [`Self::kind`] is a coarse summary for display; applying a relocation
+    /// needs the exact type, because `CALL26` and `LDST32_ABS_LO12_NC` both
+    /// summarise as "absolute-ish" and patch completely different bits.
+    pub raw_type: u32,
+    /// Index of the section whose bytes the relocation patches.
+    ///
+    /// `None` for a table that applies to the image as a whole (ELF
+    /// `.rela.dyn`), and for formats that do not record a target section.
+    pub section: Option<usize>,
+    /// Address the target symbol resolves to inside this image.
+    ///
+    /// `None` for an undefined symbol: the value is the linker's to choose, and
+    /// until then the only honest answer is that it is unknown.
+    pub symbol_addr: Option<Addr>,
+}
+
+impl Relocation {
+    /// A relocation with no container-specific detail.
+    pub fn bare(offset: Addr, kind: RelocKind, symbol: Option<String>) -> Relocation {
+        Relocation {
+            offset,
+            kind,
+            symbol,
+            addend: None,
+            raw_type: 0,
+            section: None,
+            symbol_addr: None,
+        }
+    }
 }
 
 /// Compiler family inferred from build artefacts.
