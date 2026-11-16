@@ -20,7 +20,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
-repository = "https://example.invalid/occ"
+repository = "https://github.com/yuw868349-commits/Occ"
 
 [workspace.dependencies]
 occ-sys = { path = "crates/occ-sys" }

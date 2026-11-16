@@ -397,19 +397,19 @@ the evidence."*
 | Crate | Responsibility | Lines |
 | --- | --- | --- |
 | `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 2.9k |
-| `occ-json` | JSON value, parser, writer, schema validation. | 2.0k |
+| `occ-json` | JSON value, parser, writer, schema validation. | 1.9k |
 | `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid` as `extern "C"`. | 1.3k |
 | `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, demangling, SHA-256. | 4.4k |
-| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.0k |
-| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 3.9k |
-| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.4k |
+| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.2k |
+| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 3.8k |
+| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.3k |
 | `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 13.2k |
 | `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.5k |
 | `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 2.0k |
-| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.6k |
+| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.5k |
 | `occ-mcp` | The 37 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.4k |
 
-52.7k lines of Rust, 387 tests, 82 end-to-end MCP checks.
+52.9k lines of Rust, 393 tests, 82 end-to-end MCP checks.
 
 ## Verification
 
@@ -417,7 +417,7 @@ Unit tests are necessary and not sufficient: most of the serious bugs found whil
 building this were invisible to them and obvious against a real file.
 
 ```bash
-cargo test --workspace                                         # 387 tests
+cargo test --workspace                                         # 393 tests
 cargo clippy --workspace --all-targets -- -D warnings          # clean
 python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
 ```
