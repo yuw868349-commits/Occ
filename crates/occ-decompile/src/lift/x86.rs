@@ -106,18 +106,62 @@ const RAX: u8 = 0;
 const RCX: u8 = 1;
 const RIP: u8 = 16;
 
-/// Integer argument registers in System V order.
+/// Registers a call may overwrite: every general-purpose register that is
+/// neither callee-saved nor the stack or frame pointer.
+const CALLER_SAVED: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11];
+
+/// Integer argument registers in System V order: `rdi`, `rsi`, `rdx`,
+/// `rcx`, `r8`, `r9`.
 pub const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
 
+/// Integer argument registers in Windows x64 order: `rcx`, `rdx`, `r8`,
+/// `r9`.
+///
+/// The Windows convention shares the register file with System V but not the
+/// order, so a program read with the wrong one has its arguments shuffled:
+/// the second argument arrives as the first, the fourth as the second, and
+/// the fifth and sixth are not passed in registers at all.
+pub const WIN64_ARG_REGS: [u8; 4] = [1, 2, 8, 9];
+
+/// Which calling convention a binary's functions follow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Abi {
+    /// System V, used by Linux, the BSDs and macOS.
+    SysV,
+    /// The Windows x64 convention.
+    Win64,
+}
+
 /// The x86-64 target.
-pub struct X86Target;
+#[derive(Clone, Copy)]
+pub struct X86Target {
+    /// Which convention its argument registers follow.
+    abi: Abi,
+}
+
+impl X86Target {
+    /// The System V target.
+    pub const fn sysv() -> Self {
+        X86Target { abi: Abi::SysV }
+    }
+
+    /// The Windows x64 target.
+    pub const fn win64() -> Self {
+        X86Target { abi: Abi::Win64 }
+    }
+}
+
+/// The register a name refers to, independent of the calling convention.
+fn lookup_reg(name: &str) -> Option<Reg> {
+    REG_TABLE
+        .iter()
+        .find(|(n, _, _, _)| *n == name)
+        .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset))
+}
 
 impl Target for X86Target {
     fn lookup_reg(&self, name: &str) -> Option<Reg> {
-        REG_TABLE
-            .iter()
-            .find(|(n, _, _, _)| *n == name)
-            .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset))
+        lookup_reg(name)
     }
 
     fn reg_name(&self, idx: u8) -> String {
@@ -129,7 +173,10 @@ impl Target for X86Target {
     }
 
     fn arg_regs(&self) -> &[u8] {
-        &ARG_REGS
+        match self.abi {
+            Abi::SysV => &ARG_REGS,
+            Abi::Win64 => &WIN64_ARG_REGS,
+        }
     }
 
     fn ret_reg(&self) -> u8 {
@@ -390,7 +437,7 @@ fn parse_operand(s: &str) -> Option<Operand> {
         }
         return Some(op);
     }
-    if let Some(reg) = X86Target.lookup_reg(rest) {
+    if let Some(reg) = lookup_reg(rest) {
         return Some(Operand::Reg(reg));
     }
     // A vector register is not a general-purpose register: it holds
@@ -481,12 +528,12 @@ fn parse_memory(inner: &str, size: u8) -> Option<Operand> {
 
     for (sign, term) in terms {
         if let Some((r, s)) = term.split_once('*') {
-            let reg = X86Target.lookup_reg(r.trim())?;
+            let reg = lookup_reg(r.trim())?;
             index = Some(reg);
             scale = parse_int(s).unwrap_or(1);
             continue;
         }
-        if let Some(reg) = X86Target.lookup_reg(&term) {
+        if let Some(reg) = lookup_reg(&term) {
             if base.is_none() {
                 base = Some(reg);
             } else {
@@ -2313,9 +2360,16 @@ impl<'a> Lifter<'a> {
             });
             // Caller-saved registers are dead after the call; carrying them
             // forward made every later call inherit the previous call's
-            // arguments.
+            // arguments. A read of one of them before the function writes it
+            // again is the callee's leftovers, not the value from before the
+            // call.
             self.core.written.clear();
             self.core.written.insert(RAX);
+            // The call defines the return register, and a function whose only
+            // value is a call's result has to return it: without this the
+            // body printed `return;` and the caller's argument disappeared.
+            self.core.ever_written.insert(RAX);
+            self.core.clobber(CALLER_SAVED, RAX);
         } else {
             stmts.push(Stmt::Call {
                 name,
@@ -3851,7 +3905,13 @@ impl super::Lifter for Lifter<'_> {
     }
 
     fn arg_reg_names(&self) -> Vec<String> {
-        ARG_REGS
+        // The order comes from the target, not from the table: a Windows
+        // binary names its arguments in `rcx`, `rdx`, `r8`, `r9` order, and
+        // taking the System V order here put every argument in the wrong
+        // place while the calls themselves looked right.
+        self.core
+            .target
+            .arg_regs()
             .iter()
             .map(|r| REG64[usize::from(*r)].to_string())
             .collect()
@@ -3897,7 +3957,8 @@ mod tests {
     fn lift_branch(texts: &[&str]) -> (Vec<String>, Option<String>) {
         let name_of = |_: Addr| "f".to_string();
         let symbols = |_: &str| None;
-        let mut lifter = Lifter::new(&X86Target, &name_of, &symbols);
+        static SYSV: X86Target = X86Target::sysv();
+        let mut lifter = Lifter::new(&SYSV, &name_of, &symbols);
         let last = texts.len().saturating_sub(1);
         let insns: Vec<Instruction> = texts
             .iter()
@@ -3949,7 +4010,8 @@ mod tests {
     fn lift_texts(texts: &[&str]) -> Vec<String> {
         let name_of = |_: Addr| "f".to_string();
         let symbols = |_: &str| None;
-        let mut lifter = Lifter::new(&X86Target, &name_of, &symbols);
+        static SYSV: X86Target = X86Target::sysv();
+        let mut lifter = Lifter::new(&SYSV, &name_of, &symbols);
         let insns: Vec<Instruction> = texts
             .iter()
             .enumerate()
@@ -4034,7 +4096,7 @@ mod tests {
 
     #[test]
     fn high_byte_registers_carry_their_offset() {
-        let r = X86Target.lookup_reg("ah").unwrap();
+        let r = X86Target::sysv().lookup_reg("ah").unwrap();
         assert_eq!(r.idx, RAX);
         assert_eq!(r.size, 1);
         assert_eq!(r.offset, 8);

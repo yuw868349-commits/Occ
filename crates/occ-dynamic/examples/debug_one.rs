@@ -15,7 +15,7 @@ use occ_decompile::lift::x86::{Lifter, X86Target};
 use occ_dynamic::probe::Probe;
 use occ_sys::ptrace::Registers;
 
-static TARGET: X86Target = X86Target;
+static TARGET: X86Target = X86Target::sysv();
 
 const GP: [&str; 16] = [
     "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13",

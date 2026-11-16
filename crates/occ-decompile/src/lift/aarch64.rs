@@ -13,16 +13,29 @@
 
 use occ_core::{Addr, FlowKind, Instruction};
 
-use super::{Access, Core, Lifted, Operand, Parsed, Reg, Target, parse_int, split_operands};
-use crate::ir::{BinOp, CastKind, Expr, FlagCond, Stmt, UnOp};
+use super::{
+    Access, Core, Lifted, ModKind, Operand, Parsed, Reg, Target, parse_int, split_operands,
+};
+use crate::ir::{BinOp, CastKind, CondOp, Expr, FlagCond, Stmt, UnOp};
 
-/// Register number of the zero register and the stack pointer.
+/// Register number of the stack pointer.
 ///
-/// AArch64 encodes both as register 31, and which one it means depends on the
-/// instruction. The decoder prints `xzr`/`wzr` for the zero register and
-/// `sp`/`wsp` for the stack pointer, and this module keeps them apart: the
-/// zero register reads as a constant, and the stack pointer moves the frame.
+/// AArch64 encodes the zero register and the stack pointer as the same number,
+/// 31, and which one it means depends on the instruction. The decoder prints
+/// `xzr`/`wzr` for the zero register and `sp`/`wsp` for the stack pointer, so
+/// this module keeps them apart: the stack pointer moves the frame, and the
+/// zero register reads as a constant.
 const SP: u8 = 31;
+
+/// The zero register's pseudo-index.
+///
+/// It is not a register the architecture numbers — 31 already belongs to the
+/// stack pointer — so it gets an index past the end of the real file. Writing
+/// there is discarded and reading it yields zero, which is what the hardware
+/// does; giving it the stack pointer's number instead made `csel ..., wzr`
+/// print as `... : sp`, and turned every comparison against `xzr` into a
+/// comparison against an unknown.
+const XZR: u8 = 32;
 
 /// Full-width names, by register index.
 const X_NAMES: [&str; 32] = [
@@ -54,18 +67,26 @@ impl Target for Aarch64Target {
         match name {
             "sp" => Some(Reg::full(SP, 8)),
             "wsp" => Some(Reg::view(SP, 4, 0)),
-            "xzr" => Some(Reg::full(SP, 8)),
-            "wzr" => Some(Reg::view(SP, 4, 0)),
+            // The zero register shares the encoding, not the meaning.
+            "xzr" => Some(Reg::full(XZR, 8)),
+            "wzr" => Some(Reg::view(XZR, 4, 0)),
             _ => None,
         }
     }
 
     fn reg_name(&self, idx: u8) -> String {
+        if idx == XZR {
+            return "xzr".to_string();
+        }
         X_NAMES.get(usize::from(idx)).copied().unwrap_or("x0").to_string()
     }
 
     fn reg_width(&self, _idx: u8) -> u8 {
         8
+    }
+
+    fn zero_reg(&self) -> Option<u8> {
+        Some(XZR)
     }
 
     fn arg_regs(&self) -> &[u8] {
@@ -174,13 +195,45 @@ fn parse_aarch64(text: &str) -> Option<Parsed> {
         Some((m, r)) => (m, r),
         None => (body, ""),
     };
-    let mut ops = Vec::new();
+    let mut ops: Vec<Operand> = Vec::new();
     for part in split_operands(rest.trim()) {
         let part = part.trim();
         if part.is_empty() {
             continue;
         }
+        // A shift or an extension modifies the operand before it rather
+        // than standing on its own, so it never becomes a fourth operand.
+        if let Some((kind, amount)) = parse_modifier(part) {
+            match ops.pop() {
+                Some(Operand::Reg(reg)) => ops.push(Operand::Modified { reg, kind, amount }),
+                Some(other) => {
+                    ops.push(other);
+                    return None;
+                }
+                None => return None,
+            }
+            continue;
+        }
         ops.push(parse_aarch64_operand(part)?);
+    }
+    // The post-indexed form puts the write-back outside the brackets —
+    // `ldr w1, [x2], #4` — so the comma splitter saw it as an operand of its
+    // own. It belongs to the memory operand: leaving it out dropped the load
+    // entirely, because `ldr` then had three operands where it takes two.
+    let delta = match ops.last() {
+        Some(Operand::Imm(v)) => Some(*v),
+        _ => None,
+    };
+    if let Some(delta) = delta
+        && ops.len() >= 2
+    {
+        let at = ops.len() - 2;
+        if let Some(Operand::Mem { base_update, .. }) = ops.get_mut(at)
+            && base_update.is_none()
+        {
+            *base_update = Some(delta as i64);
+            ops.pop();
+        }
     }
     Some(Parsed {
         mnemonic: mnemonic.to_ascii_lowercase(),
@@ -188,6 +241,21 @@ fn parse_aarch64(text: &str) -> Option<Parsed> {
         pc_target: None,
         prefixes: Vec::new(),
     })
+}
+
+/// Parse the modifier AArch64 writes after a register: `lsl #2`, `sxtw #2`,
+/// or a bare `uxtb`.
+fn parse_modifier(text: &str) -> Option<(ModKind, u8)> {
+    let mut parts = text.split_whitespace();
+    let kind = ModKind::of_name(parts.next()?)?;
+    let amount = match parts.next() {
+        Some(t) => parse_int(t.strip_prefix('#')?)? as u8,
+        None => 0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((kind, amount))
 }
 
 /// One AArch64 operand.
@@ -257,6 +325,13 @@ fn parse_aarch64_memory(inner: &str) -> Option<Operand> {
         let part = part.trim();
         if let Some(rest) = part.strip_prefix('#') {
             disp = disp.wrapping_add(parse_int(rest)? as i64);
+            continue;
+        }
+        // A shift or an extension on the index: `[x1, w2, sxtw #2]`.
+        if let Some((kind, amount)) = parse_modifier(part) {
+            index?;
+            let _ = kind;
+            scale = 1u64 << amount;
             continue;
         }
         // A shifted register index: `x2, lsl #3`.
@@ -353,7 +428,7 @@ impl<'a> Lifter<'a> {
             "cmp" => self.lift_cmp(&p.ops, &mut out.stmts),
             "cmn" => self.lift_cmn(&p.ops, &mut out.stmts),
             "tst" => self.lift_tst(&p.ops, &mut out.stmts),
-            "csel" | "csinc" | "csinv" | "csneg" => self.lift_csel(&p.ops, &mut out.stmts),
+            "csel" | "csinc" | "csinv" | "csneg" => self.lift_csel(m, &p.ops, &mut out.stmts),
             "cset" | "csetm" => self.lift_cset(&p.ops, &mut out.stmts),
             "sxtb" => self.lift_extend(true, 1, &p.ops, &mut out.stmts),
             "sxth" => self.lift_extend(true, 2, &p.ops, &mut out.stmts),
@@ -369,8 +444,12 @@ impl<'a> Lifter<'a> {
             "str" | "stur" | "strb" | "strh" | "sturb" | "sturh" => {
                 self.lift_store(m, &p.ops, &mut out.stmts)
             }
-            "bl" => self.lift_call(insn, &p.ops, &mut out.stmts),
-            "b" | "br" | "blr" => {}
+            "bl" | "blr" => self.lift_call(insn, &p.ops, &mut out.stmts),
+            "b" | "br" => {}
+            // The compare-and-branch forms test a register, not the flags.
+            // The condition is built where the block's terminator is, so
+            // nothing is lifted here.
+            "cbz" | "cbnz" | "tbz" | "tbnz" => {}
             other => {
                 if self.core.target.branch_cond(other).is_some() {
                     // Handled by take_condition once the block ends.
@@ -757,7 +836,13 @@ impl<'a> Lifter<'a> {
     }
 
     /// `csel` and its variants: choose between two values on a condition.
-    fn lift_csel(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+    ///
+    /// The three variants differ in what they do to the value they choose
+    /// when the condition is false, and the difference is the whole point of
+    /// having them: `csinc` adds one, `csinv` complements, and `csneg`
+    /// negates. Lifting all four as `csel` printed `wzr` as a plain zero
+    /// where the machine produced all ones.
+    fn lift_csel(&mut self, mnemonic: &str, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         if ops.len() != 4 {
             return;
         }
@@ -767,7 +852,33 @@ impl<'a> Lifter<'a> {
         };
         let condition = self.core.condition_of("", cond);
         let yes = self.core.read(&ops[1], stmts);
-        let no = self.core.read(&ops[2], stmts);
+        let mut no = self.core.read(&ops[2], stmts);
+        let size = ops[0].size();
+        match mnemonic {
+            "csinc" => {
+                no = Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(no),
+                    rhs: Box::new(Expr::Const(1)),
+                    bits: size,
+                }
+            }
+            "csinv" => {
+                no = Expr::Un {
+                    op: UnOp::Not,
+                    arg: Box::new(no),
+                    bits: size,
+                }
+            }
+            "csneg" => {
+                no = Expr::Un {
+                    op: UnOp::Neg,
+                    arg: Box::new(no),
+                    bits: size,
+                }
+            }
+            _ => {}
+        }
         self.core.write(
             &ops[0],
             Expr::Select {
@@ -884,11 +995,8 @@ impl<'a> Lifter<'a> {
             self.core.write(second, v2, stmts);
         }
         // The write-back moves the base register, and with it the frame.
-        if let (Some(update), Some(base)) = (base_update, base)
-            && base.idx == SP
-        {
-            self.core.adjust_sp(*update);
-        }
+        let _ = base_update;
+        self.apply_writeback(&ops[2], stmts);
     }
 
     /// A load: the destination takes the value at the address.
@@ -903,7 +1011,7 @@ impl<'a> Lifter<'a> {
         let access = self.core.access_of(mnemonic, &ops[1], ops[0].size());
         let value = self.core.read_load(&ops[1], access, stmts);
         self.core.write(&ops[0], value, stmts);
-        self.apply_writeback(&ops[1]);
+        self.apply_writeback(&ops[1], stmts);
     }
 
     /// A store: the address receives the value.
@@ -914,11 +1022,17 @@ impl<'a> Lifter<'a> {
         let access = self.core.access_of(mnemonic, &ops[1], ops[0].size());
         let value = self.core.read(&ops[0], stmts);
         self.core.store(&ops[1], value, access, stmts);
-        self.apply_writeback(&ops[1]);
+        self.apply_writeback(&ops[1], stmts);
     }
 
     /// Apply the write-back of a pre-indexed or post-indexed access.
-    fn apply_writeback(&mut self, op: &Operand) {
+    ///
+    /// The base register is part of what the instruction does: `ldr w1,
+    /// [x2], #4` walks a pointer, and dropping the walk turns a loop that
+    /// advances into one that spins forever on the same address. A stack
+    /// pointer base moves the frame instead, because the frame is what the
+    /// tool names rather than a value.
+    fn apply_writeback(&mut self, op: &Operand, stmts: &mut Vec<Stmt>) {
         let Operand::Mem {
             base,
             base_update: Some(update),
@@ -932,7 +1046,26 @@ impl<'a> Lifter<'a> {
         };
         if base.idx == SP {
             self.core.adjust_sp(*update);
+            return;
         }
+        let dest = self.core.name(base.idx);
+        let old = self.core.read_reg(*base);
+        let value = if *update < 0 {
+            Expr::Bin {
+                op: BinOp::Sub,
+                lhs: Box::new(old),
+                rhs: Box::new(Expr::Const(update.unsigned_abs())),
+                bits: 8,
+            }
+        } else {
+            Expr::Bin {
+                op: BinOp::Add,
+                lhs: Box::new(old),
+                rhs: Box::new(Expr::Const(*update as u64)),
+                bits: 8,
+            }
+        };
+        self.core.assign(&dest, value, stmts);
     }
 
     fn lift_call(&mut self, insn: &Instruction, ops: &[Operand], stmts: &mut Vec<Stmt>) {
@@ -957,6 +1090,85 @@ impl<'a> Lifter<'a> {
         });
         self.core.written.clear();
         self.core.written.insert(self.core.target.ret_reg());
+        self.core.ever_written.insert(self.core.target.ret_reg());
+        // AAPCS64 keeps x19..x29; the rest are the callee's to overwrite.
+        let caller_saved: Vec<u8> = (0..=18u8).collect();
+        self.core.clobber(&caller_saved, self.core.target.ret_reg());
+    }
+
+    /// The condition a block-ending branch tests.
+    ///
+    /// Three of AArch64's branches do not read the condition flags at all.
+    /// `cbz`/`cbnz` test one register against zero and `tbz`/`tbnz` test one
+    /// bit of it, and the flags may be arbitrarily stale when they run. They
+    /// are also the branches a compiler emits far more often than `b.eq`,
+    /// because they need no separate `cmp`: leaving them out dropped whole
+    /// arms of a switch into `if (<condition>)`.
+    fn branch_condition(&mut self, insn: &Instruction) -> Expr {
+        let Some(p) = self.core.target.parse(&insn.text) else {
+            return Expr::Unknown("condition".into());
+        };
+        match p.mnemonic.as_str() {
+            "cbz" | "cbnz" => {
+                let Some(Operand::Reg(r)) = p.ops.first().cloned() else {
+                    return Expr::Unknown("condition".into());
+                };
+                let lhs = self.core.read_reg(r);
+                Expr::Cond {
+                    op: if p.mnemonic == "cbz" {
+                        CondOp::Eq
+                    } else {
+                        CondOp::Ne
+                    },
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: r.size,
+                }
+            }
+            "tbz" | "tbnz" => {
+                // `tbz x0, #5, target` branches when bit 5 of x0 is clear.
+                let (Some(Operand::Reg(r)), Some(Operand::Imm(bit))) =
+                    (p.ops.first().cloned(), p.ops.get(1))
+                else {
+                    return Expr::Unknown("condition".into());
+                };
+                let shifted = Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(self.core.read_reg(r)),
+                    rhs: Box::new(Expr::Const(*bit)),
+                    bits: r.size,
+                };
+                let masked = Expr::Bin {
+                    op: BinOp::And,
+                    lhs: Box::new(shifted),
+                    rhs: Box::new(Expr::Const(1)),
+                    bits: r.size,
+                };
+                Expr::Cond {
+                    op: if p.mnemonic == "tbz" {
+                        CondOp::Eq
+                    } else {
+                        CondOp::Ne
+                    },
+                    lhs: Box::new(masked),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: r.size,
+                }
+            }
+            _ => self.core.take_condition(&p),
+        }
+    }
+
+    /// The register a `br` jumps through.
+    fn indirect_target(&mut self, insn: &Instruction) -> Expr {
+        let Some(p) = self.core.target.parse(&insn.text) else {
+            return Expr::Unknown("indirect target".into());
+        };
+        let mut scratch: Vec<Stmt> = Vec::new();
+        match p.ops.first() {
+            Some(o) => self.core.read(o, &mut scratch),
+            None => Expr::Unknown("indirect target".into()),
+        }
     }
 }
 
@@ -969,16 +1181,17 @@ impl super::Lifter for Lifter<'_> {
         }
         let last = insns.last();
         if let Some(insn) = last {
-            if matches!(insn.flow, FlowKind::ConditionalBranch) {
-                let parsed = self.core.target.parse(&insn.text);
-                out.branch = Some(match parsed {
-                    Some(p) => self.core.take_condition(&p),
-                    None => Expr::Unknown("condition".into()),
-                });
-            } else if matches!(insn.flow, FlowKind::UnconditionalBranch)
-                && insn.target.is_none()
-            {
-                out.indirect = Some(Expr::Unknown("indirect target".into()));
+            match insn.flow {
+                FlowKind::ConditionalBranch => out.branch = Some(self.branch_condition(insn)),
+                // `br x8` leaves the block through a register. The register
+                // is the one thing a reader needs to see: without it the
+                // jump reads as "somewhere".
+                FlowKind::UnconditionalBranch | FlowKind::IndirectBranch
+                    if insn.target.is_none() =>
+                {
+                    out.indirect = Some(self.indirect_target(insn));
+                }
+                _ => {}
             }
         }
         out

@@ -764,19 +764,24 @@ fn dp_register(_origin: Addr, word: u32) -> Option<R> {
         let op2 = bits(word, 11, 10);
         let rn = bits(word, 9, 5);
         let rd = bits(word, 4, 0);
-        let mn = match op2 {
-            0 => "csel",
-            1 => "csinc",
-            2 => "csinv",
-            _ => "csneg",
+        // Bit 30 picks the pair. Without it `csinv` decodes as `csel`,
+        // which is a different answer: the false arm of a `csinv` is the
+        // complement of its operand, not the operand itself.
+        let invert = word & 0x4000_0000 != 0;
+        let mn = match (invert, op2 & 1) {
+            (false, 0) => "csel",
+            (false, _) => "csinc",
+            (true, 0) => "csinv",
+            (true, _) => "csneg",
         };
-        // CSET is CSINC with both sources the zero register and inverted cond.
-        if op2 == 1 && rn == 31 && rm == 31 {
+        // CSET is CSINC with both sources the zero register and inverted
+        // cond; CSETM is the same form of CSINV, which is one bit lower in
+        // the two-bit field.
+        let alias = rn == 31 && rm == 31 && (op2 & 1) == u32::from(!invert);
+        if alias {
             let inv = CONDS[(cond ^ 1) as usize];
-            return Some(R::new(
-                "cset",
-                format!("cset {}, {}", r(sf, rd), inv),
-            ));
+            let mn = if invert { "csetm" } else { "cset" };
+            return Some(R::new(mn, format!("{mn} {}, {}", r(sf, rd), inv)));
         }
         return Some(R::new(
             mn,
@@ -1033,6 +1038,38 @@ mod tests {
         let d = dec(0xd65f_03c0);
         assert_eq!(&*d.insn.mnemonic, "ret");
         assert_eq!(d.insn.flow, FlowKind::Return);
+    }
+
+    #[test]
+    fn conditional_select_keeps_its_operand_form() {
+        // The four members of the family share a mask, and bit 30 is what
+        // separates `csel`/`csinc` from `csinv`/`csneg`. Reading only the
+        // two-bit field below it decoded `csinv w0, w2, w3, eq` as
+        // `csel w0, w2, w3, eq`, which selects the operand instead of its
+        // complement — a different function, and a silently wrong one.
+        for (word, mnemonic) in [
+            (0x1a83_0040u32, "csel"),
+            (0x1a83_0440, "csinc"),
+            (0x5a83_0040, "csinv"),
+            (0x5a83_0440, "csneg"),
+        ] {
+            let d = dec(word);
+            assert_eq!(&*d.insn.mnemonic, mnemonic, "{word:#010x}");
+            assert!(
+                d.insn.text.starts_with(mnemonic),
+                "{word:#010x}: {}",
+                d.insn.text
+            );
+            assert_eq!(d.insn.text, format!("{mnemonic} w0, w2, w3, eq"));
+        }
+        // `cset` is `csinc` with both sources zero and the condition
+        // inverted; `csetm` is the same form of `csinv`.
+        let d = dec(0x1a9f_07e0);
+        assert_eq!(&*d.insn.mnemonic, "cset");
+        assert_eq!(d.insn.text, "cset w0, ne");
+        let d = dec(0x5a9f_03e0);
+        assert_eq!(&*d.insn.mnemonic, "csetm");
+        assert_eq!(d.insn.text, "csetm w0, ne");
     }
 
     #[test]

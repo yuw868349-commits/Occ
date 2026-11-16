@@ -204,6 +204,7 @@ impl Builder<'_> {
                     ret,
                     addr,
                 } => {
+                    let name = self.rename_in_name(b, &name);
                     let args = args.iter().map(|a| self.rewrite(a, b)).collect();
                     let ret = ret.map(|r| {
                         let version = self.write(b, &r);
@@ -256,6 +257,66 @@ impl Builder<'_> {
             },
             other => other,
         };
+    }
+
+    /// Rename the registers named inside an indirect call's target.
+    ///
+    /// The target of a `call rax` is carried as text, so it never passes
+    /// through [`Self::rewrite`]: the printed call read `rax` — the value the
+    /// register held at the function's entry — however many times the body had
+    /// written it since. The identifiers inside the text are the only part
+    /// that needs renaming, and they are renamed only when the block already
+    /// has a definition for them, so this cannot invent a value.
+    fn rename_in_name(&mut self, b: BlockId, name: &str) -> String {
+        let Some(inner) = name.strip_prefix("(*").and_then(|r| r.strip_suffix(')')) else {
+            return name.to_string();
+        };
+        let mut out = String::with_capacity(inner.len());
+        let mut token = String::new();
+        let mut changed = false;
+        for c in inner.chars() {
+            if c.is_alphanumeric() || c == '_' || c == '.' {
+                token.push(c);
+                continue;
+            }
+            if !token.is_empty() {
+                changed |= self.rename_token(&mut out, b, &token);
+                token.clear();
+            }
+            out.push(c);
+        }
+        if !token.is_empty() {
+            changed |= self.rename_token(&mut out, b, &token);
+        }
+        if changed {
+            // The identifier is printed as it will be named in the rest of the
+            // body, where a version separator is an underscore.
+            format!("(*{})", out.replace('.', "_"))
+        } else {
+            name.to_string()
+        }
+    }
+
+    fn rename_token(&mut self, out: &mut String, b: BlockId, token: &str) -> bool {
+        // Only a name the function defines anywhere is a variable here: the
+        // text also holds type names and numbers, and reading those would
+        // invent a phi for `u64`.
+        let known = self.defs.contains_key(&(b, token.to_string()))
+            || self.counters.contains_key(token);
+        if !known {
+            out.push_str(token);
+            return false;
+        }
+        match self.read(b, token) {
+            Expr::Var(v) => {
+                out.push_str(&v);
+                true
+            }
+            _ => {
+                out.push_str(token);
+                false
+            }
+        }
     }
 
     fn rewrite(&mut self, e: &Expr, b: BlockId) -> Expr {
@@ -363,7 +424,18 @@ impl Builder<'_> {
         }
         let preds = self.preds[b].clone();
         if preds.is_empty() {
-            // Function entry: the register still holds its incoming value.
+            // Function entry: a register still holds its incoming value, which
+            // is what the caller passed. A stack slot does not: nothing in this
+            // function has written it, so its contents are whatever was left
+            // there. Reading it by name produced `local_8_u64.3 =
+            // local_8_u64`, which looks like a definition feeding itself and
+            // says nothing about where the value came from.
+            if name.starts_with("local_") {
+                self.note_once(format!(
+                    "{name} is read before anything writes it: the frame slot is uninitialised here"
+                ));
+                return Expr::Unknown("uninitialised slot".into());
+            }
             return Expr::Var(name.to_string());
         }
         if preds.len() == 1 {

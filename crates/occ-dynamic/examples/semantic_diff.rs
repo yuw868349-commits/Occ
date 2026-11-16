@@ -42,7 +42,7 @@ use occ_decompile::lift::x86::{Lifter, X86Target};
 use occ_dynamic::probe::Probe;
 use occ_sys::ptrace::Registers;
 
-static TARGET: X86Target = X86Target;
+static TARGET: X86Target = X86Target::sysv();
 
 /// General-purpose registers, in the order the report prints them.
 const GP: [&str; 16] = [

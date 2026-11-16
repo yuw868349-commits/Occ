@@ -64,6 +64,11 @@ impl Graph {
     }
 }
 
+/// Successors of a block, as the structurer sees them.
+pub fn succs_of(b: &Block) -> Vec<BlockId> {
+    successors(b)
+}
+
 fn successors(b: &Block) -> Vec<BlockId> {
     match &b.term {
         Term::Jump(t) => vec![*t],
@@ -143,14 +148,20 @@ fn dominators(n: usize, preds: &[Vec<BlockId>], entry: BlockId) -> Vec<BlockId> 
 
 fn intersect(idom: &[BlockId], rpo: &[usize], mut a: BlockId, mut b: BlockId) -> BlockId {
     while a != b {
-        while rpo[a] < rpo[b] {
+        // The reverse post-order numbers the entry lowest, so the deeper
+        // node is the one with the larger number, and the deeper node is
+        // the one that walks up. Walking the shallower one instead climbs
+        // past the meeting point and lands on a block that dominates both
+        // — or, in the reversed graph the post-dominators use, on the
+        // virtual exit, which then reads as "control never rejoins here".
+        while rpo[a] > rpo[b] {
             let d = idom[a];
             if d == a {
                 return a;
             }
             a = d;
         }
-        while rpo[b] < rpo[a] {
+        while rpo[b] > rpo[a] {
             let d = idom[b];
             if d == b {
                 return b;
@@ -162,22 +173,25 @@ fn intersect(idom: &[BlockId], rpo: &[usize], mut a: BlockId, mut b: BlockId) ->
 }
 
 /// Post-dominators, computed on the reversed graph from a virtual exit.
+///
+/// The reversed graph has an edge `u -> v` for every original edge `v -> u`,
+/// so the *predecessors* of a block in it are the block's original
+/// successors. Passing the original predecessor lists here instead computed
+/// dominators of the original graph from a root nothing reaches, which left
+/// every post-dominator undefined — and a branch with no join is a branch
+/// the structurer cannot close, so it fell back to `goto` for joins that
+/// were perfectly ordinary.
 fn post_dominators(blocks: &[Block], succs: &[Vec<BlockId>]) -> Vec<Option<BlockId>> {
     let n = blocks.len();
-    let mut preds = vec![Vec::new(); n];
-    let mut exits = Vec::new();
+    let mut rev_preds = vec![Vec::new(); n];
     for (b, ss) in succs.iter().enumerate() {
         if ss.is_empty() {
-            exits.push(b);
+            // A virtual exit at index `n` with an edge from every real exit.
+            rev_preds[b].push(n);
         }
         for s in ss {
-            preds[*s].push(b);
+            rev_preds[b].push(*s);
         }
-    }
-    // A virtual exit at index `n` with an edge from every real exit.
-    let mut rev_preds = preds;
-    for e in exits {
-        rev_preds[e].push(n);
     }
     let idom = dominators(n + 1, &rev_preds, n);
     idom.iter()
@@ -311,6 +325,7 @@ impl<'a> Structurer<'a> {
         let mut nodes = Vec::new();
         let mut cur = Some(start);
         let mut guard = 0usize;
+        let mut entered = false;
         while let Some(b) = cur {
             guard += 1;
             if guard > 200_000 {
@@ -320,6 +335,14 @@ impl<'a> Structurer<'a> {
             if Some(b) == ctx.stop {
                 break;
             }
+            // A block that walks back into the loop header is a `continue`,
+            // whether it got there by a jump or by falling out of a branch
+            // that returned the header as its continuation.
+            if entered && ctx.loop_header == Some(b) {
+                nodes.push(Node::Continue);
+                break;
+            }
+            entered = true;
             // A loop is structured as one unit *before* its header's statements
             // are emitted. Emitting the header first would leave every value it
             // computes outside the loop that uses it.
@@ -474,13 +497,26 @@ impl<'a> Structurer<'a> {
                 let then_in = then_bb.is_some_and(|b| body_blocks.contains(&b));
                 let else_in = else_bb.is_some_and(|b| body_blocks.contains(&b));
                 if then_in == else_in {
-                    // Both edges stay inside, or both leave. Neither is a loop
-                    // test this structurer can express; treat the header as a
-                    // plain conditional so the body is still emitted.
-                    let mut local = stmts;
-                    local.extend(self.stmts_to_nodes(&[]));
-                    nodes.extend(local);
-                    return self.branch(header, cond, then_bb, else_bb, &inner, nodes);
+                    // Both edges stay inside, or both leave: the header is
+                    // not the loop test, and the test is deeper in the body.
+                    // Treating the header as a plain conditional put the
+                    // body's inputs outside the loop and left the back edge
+                    // as a `goto`. The loop is `for (;;)` and the test is a
+                    // `break`, which is what the machine does.
+                    let _ = cond;
+                    self.placed.remove(&header);
+                    let inner = Region {
+                        stop: None,
+                        loop_header: Some(header),
+                        loop_exits: exits.clone(),
+                    };
+                    nodes.push(Node::While {
+                        cond: Expr::Const(1),
+                        body: self.region(header, &inner),
+                    });
+                    let mut outs: Vec<BlockId> = exits.iter().copied().collect();
+                    outs.sort_unstable();
+                    return if outs.len() == 1 { Some(outs[0]) } else { None };
                 }
                 let (body_entry, exit, body_cond) = if then_in {
                     (then_bb.unwrap_or_default(), else_bb, cond)
@@ -592,55 +628,57 @@ impl<'a> Structurer<'a> {
                 return None;
             }
         };
-        // Back edge through a conditional: `if (cond) continue;`.
+        // Inside a loop, an edge can be the back edge, an exit, or neither.
+        // Both sides are read before either is written, because the four
+        // combinations are different statements: `if (c) continue;`,
+        // `if (c) break;`, `if (c) continue; else break;` — and the last one
+        // matters, because walking into the exit from inside the loop puts
+        // the code after the loop inside its body.
         if let Some(h) = ctx.loop_header {
             let then_back = then_bb == h;
             let else_back = else_bb == h;
-            if then_back && !else_back {
-                nodes.push(Node::If {
-                    cond,
-                    then_body: vec![Node::Continue],
-                    else_body: Vec::new(),
-                });
-                return Some(else_bb);
-            }
-            if else_back && !then_back {
-                nodes.push(Node::If {
-                    cond: negate(cond),
-                    then_body: vec![Node::Continue],
-                    else_body: Vec::new(),
-                });
-                return Some(then_bb);
-            }
-        }
-
-        // Inside a loop: a branch to an exit block is a break.
-        if ctx.loop_header.is_some() {
-            let then_exit = ctx.loop_exits.contains(&then_bb);
-            let else_exit = ctx.loop_exits.contains(&else_bb);
-            if then_exit && !else_exit {
-                nodes.push(Node::If {
-                    cond,
-                    then_body: vec![Node::Break],
-                    else_body: Vec::new(),
-                });
-                return Some(else_bb);
-            }
-            if else_exit && !then_exit {
-                nodes.push(Node::If {
-                    cond: negate(cond),
-                    then_body: vec![Node::Break],
-                    else_body: Vec::new(),
-                });
-                return Some(then_bb);
-            }
-            if then_exit && else_exit {
-                nodes.push(Node::If {
-                    cond,
-                    then_body: vec![Node::Break],
-                    else_body: vec![Node::Break],
-                });
-                return None;
+            let then_exit = !then_back && ctx.loop_exits.contains(&then_bb);
+            let else_exit = !else_back && ctx.loop_exits.contains(&else_bb);
+            let then_out = if then_back {
+                Some(Node::Continue)
+            } else if then_exit {
+                Some(Node::Break)
+            } else {
+                None
+            };
+            let else_out = if else_back {
+                Some(Node::Continue)
+            } else if else_exit {
+                Some(Node::Break)
+            } else {
+                None
+            };
+            match (then_out, else_out) {
+                (Some(t), Some(e)) => {
+                    nodes.push(Node::If {
+                        cond,
+                        then_body: vec![t],
+                        else_body: vec![e],
+                    });
+                    return None;
+                }
+                (Some(t), None) => {
+                    nodes.push(Node::If {
+                        cond,
+                        then_body: vec![t],
+                        else_body: Vec::new(),
+                    });
+                    return Some(else_bb);
+                }
+                (None, Some(e)) => {
+                    nodes.push(Node::If {
+                        cond: negate(cond),
+                        then_body: vec![e],
+                        else_body: Vec::new(),
+                    });
+                    return Some(then_bb);
+                }
+                (None, None) => {}
             }
         }
 
@@ -689,40 +727,13 @@ impl<'a> Structurer<'a> {
                 Some(j)
             }
             None => {
-                // No join: at most one arm continues, the other leaves.
-                let then_terminates = self.terminates(then_bb);
-                let else_terminates = self.terminates(else_bb);
-                if then_terminates && !else_terminates {
-                    // `then_bb` leaves the function, so only the other arm
-                    // survives: `if (!cond) { else_bb }`. Emitting the dead arm
-                    // as an `else` body reads as if it continued.
-                    let body = self.region(else_bb, &Region {
-                        stop: ctx.stop,
-                        loop_header: ctx.loop_header,
-                        loop_exits: ctx.loop_exits.clone(),
-                    });
-                    nodes.push(Node::If {
-                        cond: negate(cond),
-                        then_body: body,
-                        else_body: Vec::new(),
-                    });
-                    // The arm ran to its own end; there is nothing left for the
-                    // enclosing region to walk into.
-                    return None;
-                }
-                if else_terminates && !then_terminates {
-                    let body = self.region(then_bb, &Region {
-                        stop: ctx.stop,
-                        loop_header: ctx.loop_header,
-                        loop_exits: ctx.loop_exits.clone(),
-                    });
-                    nodes.push(Node::If {
-                        cond,
-                        then_body: body,
-                        else_body: Vec::new(),
-                    });
-                    return None;
-                }
+                // No join, so at most one arm can carry on past the branch,
+                // and the other one has to end the region. Both are still
+                // emitted: the arm that ends does it with a `return` or a
+                // jump, and leaving it out dropped that `return` — the
+                // function then read as returning nothing when its condition
+                // held. The shape is a plain `if`/`else` whose arms both
+                // terminate, which is exactly what the machine does.
                 nodes.push(Node::If {
                     cond,
                     then_body: self.region(then_bb, &Region {
@@ -751,17 +762,6 @@ impl<'a> Structurer<'a> {
             }
         }
         out
-    }
-
-    /// True when every path from `b` leaves the function without returning to
-    /// the caller's continuation.
-    ///
-    /// Post-dominance answers this in one lookup, and it has to be asked that
-    /// way: checking only the block's own terminator says "this arm continues"
-    /// for a `do { } while` whose exit is another `ret` block, and the arm that
-    /// does return then gets dropped from the output.
-    fn terminates(&self, b: BlockId) -> bool {
-        self.graph.ipdom.get(b).copied().flatten().is_none()
     }
 
     fn stmts_to_nodes(&self, stmts: &[Stmt]) -> Vec<Node> {
@@ -870,5 +870,207 @@ pub fn negate(e: Expr) -> Expr {
             arg: Box::new(other),
             bits: 1,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::{Block, Expr, Node, Stmt, Term};
+    use occ_core::Addr;
+
+    fn block(id: usize, term: Term) -> Block {
+        Block {
+            id,
+            addr: Addr(0x1000 + id as u64 * 0x10),
+            stmts: Vec::new(),
+            term,
+        }
+    }
+
+    /// Block `id` with a distinctive statement, so the tests can tell which
+    /// blocks reached the output.
+    fn marked(id: usize, term: Term) -> Block {
+        Block {
+            stmts: vec![Stmt::Assign {
+                dest: format!("v{id}"),
+                value: Expr::Const(id as u64),
+            }],
+            ..block(id, term)
+        }
+    }
+
+    fn graph(blocks: &[Block], entry: BlockId) -> (Graph, Vec<Vec<BlockId>>) {
+        let mut preds = vec![Vec::new(); blocks.len()];
+        let mut succs = vec![Vec::new(); blocks.len()];
+        for b in blocks {
+            for s in successors(b) {
+                succs[b.id].push(s);
+                preds[s].push(b.id);
+            }
+        }
+        (Graph::new(blocks, &preds, &succs, entry), preds)
+    }
+
+    fn flatten(nodes: &[Node], out: &mut Vec<String>) {
+        for n in nodes {
+            match n {
+                Node::Assign { dest, .. } => out.push(dest.clone()),
+                Node::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    flatten(then_body, out);
+                    flatten(else_body, out);
+                }
+                Node::While { body, .. } | Node::DoWhile { body, .. } => flatten(body, out),
+                Node::Switch { cases, default, .. } => {
+                    for (_, body) in cases {
+                        flatten(body, out);
+                    }
+                    flatten(default, out);
+                }
+                Node::Return(Some(Expr::Const(v))) => out.push(format!("ret{v}")),
+                Node::Label(l) => out.push(format!("label:{l}")),
+                Node::Goto(l) => out.push(format!("goto:{l}")),
+                _ => {}
+            }
+        }
+    }
+
+    /// A diamond: `0` branches to `1` and `2`, both jump to `3`.
+    fn diamond() -> Vec<Block> {
+        vec![
+            marked(
+                0,
+                Term::Branch {
+                    cond: Expr::Var("c".into()),
+                    then_bb: Some(1),
+                    else_bb: Some(2),
+                },
+            ),
+            marked(1, Term::Jump(3)),
+            marked(2, Term::Jump(3)),
+            marked(3, Term::Ret(None)),
+        ]
+    }
+
+    #[test]
+    fn post_dominators_find_the_join_of_a_diamond() {
+        // The join is what tells the structurer where an `if` ends. Computing
+        // it on the original predecessor lists instead of the reversed ones
+        // left every post-dominator undefined, and a branch with no join fell
+        // back to `goto` for the most ordinary shape there is.
+        let blocks = diamond();
+        let (g, _) = graph(&blocks, 0);
+        assert_eq!(g.ipdom[0], Some(3), "the branch rejoins at 3");
+        assert_eq!(g.ipdom[1], Some(3));
+        assert_eq!(g.ipdom[2], Some(3));
+        assert_eq!(g.ipdom[3], None, "3 returns; nothing post-dominates it");
+        assert_eq!(g.idom[3], 0);
+    }
+
+    #[test]
+    fn a_join_two_arms_share_is_not_a_goto() {
+        let blocks = diamond();
+        let (g, _) = graph(&blocks, 0);
+        let mut s = Structurer::new(&blocks, &g);
+        let body = s.run(0);
+        let mut seen = Vec::new();
+        flatten(&body, &mut seen);
+        assert_eq!(s.unstructured, 0, "no goto: {body:?}");
+        assert!(!seen.iter().any(|n| n.starts_with("goto:")), "{seen:?}");
+        // Both arms and the join are in the output, once each.
+        for m in ["v0", "v1", "v2", "v3"] {
+            assert_eq!(
+                seen.iter().filter(|n| *n == m).count(),
+                1,
+                "{m} appears once: {seen:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_if_whose_arms_both_return_keeps_both_returns() {
+        // `if (c) return 1; else return 2;` — the two arms leave the function
+        // and rejoin nowhere. Emitting only one of them dropped a return, and
+        // the function then read as returning nothing on that path.
+        let blocks = vec![
+            marked(
+                0,
+                Term::Branch {
+                    cond: Expr::Var("c".into()),
+                    then_bb: Some(1),
+                    else_bb: Some(2),
+                },
+            ),
+            marked(1, Term::Ret(Some(Expr::Const(1)))),
+            marked(2, Term::Ret(Some(Expr::Const(2)))),
+        ];
+        let (g, _) = graph(&blocks, 0);
+        assert_eq!(g.ipdom[0], None, "no block post-dominates the branch");
+        let mut s = Structurer::new(&blocks, &g);
+        let body = s.run(0);
+        let mut seen = Vec::new();
+        flatten(&body, &mut seen);
+        assert!(seen.contains(&"ret1".to_string()), "{seen:?}");
+        assert!(seen.contains(&"ret2".to_string()), "{seen:?}");
+        assert_eq!(s.unstructured, 0, "{body:?}");
+    }
+
+    #[test]
+    fn a_loop_whose_test_is_not_at_its_header_is_still_a_loop() {
+        // The header runs the body and branches to two blocks that are both
+        // inside the loop; the real test is one of them. Treating the header
+        // as a plain conditional put the body's inputs outside the loop and
+        // left the back edge as a `goto`.
+        let blocks = vec![
+            marked(0, Term::Jump(1)),
+            marked(
+                1,
+                Term::Branch {
+                    cond: Expr::Var("c".into()),
+                    then_bb: Some(2),
+                    else_bb: Some(3),
+                },
+            ),
+            marked(2, Term::Jump(4)),
+            marked(3, Term::Jump(4)),
+            marked(
+                4,
+                Term::Branch {
+                    cond: Expr::Var("d".into()),
+                    then_bb: Some(1),
+                    else_bb: Some(5),
+                },
+            ),
+            marked(5, Term::Ret(None)),
+        ];
+        let (g, _) = graph(&blocks, 0);
+        assert!(g.loops.contains_key(&1), "1 heads a loop");
+        let mut s = Structurer::new(&blocks, &g);
+        let body = s.run(0);
+        let mut seen = Vec::new();
+        flatten(&body, &mut seen);
+        assert_eq!(s.unstructured, 0, "no goto: {body:?}");
+        assert!(
+            body.iter().any(|n| matches!(n, Node::While { .. })),
+            "the loop is a loop: {body:?}"
+        );
+    }
+
+    #[test]
+    fn a_chain_of_blocks_needs_no_jumps() {
+        let blocks = vec![
+            marked(0, Term::Jump(1)),
+            marked(1, Term::Jump(2)),
+            marked(2, Term::Ret(None)),
+        ];
+        let (g, _) = graph(&blocks, 0);
+        let mut s = Structurer::new(&blocks, &g);
+        let body = s.run(0);
+        assert_eq!(s.unstructured, 0, "{body:?}");
+        assert_eq!(body.len(), 4, "three blocks and a return: {body:?}");
     }
 }

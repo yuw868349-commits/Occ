@@ -568,6 +568,11 @@ impl<'a> Lifter<'a> {
         });
         self.core.written.clear();
         self.core.written.insert(self.core.target.ret_reg());
+        self.core.ever_written.insert(self.core.target.ret_reg());
+        // The temporaries and the argument registers are the callee's to
+        // overwrite; `s0`..`s11` are the ones it has to restore.
+        let caller_saved: Vec<u8> = (5..=7).chain(10..=17).chain(28..=31).collect();
+        self.core.clobber(&caller_saved, self.core.target.ret_reg());
         let _ = (RA, ZERO, FlowKind::Call);
     }
 

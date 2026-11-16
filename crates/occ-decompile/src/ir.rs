@@ -1461,9 +1461,13 @@ impl Expr {
             Expr::Un { op, arg, bits } => {
                 let arg = arg.simplify();
                 if let Expr::Const(v) = &arg {
+                    // The operation happens at the width of the operand: the
+                    // complement of zero in four bytes is `0xffffffff`, not
+                    // the fourteen f's of a 64-bit word.
+                    let width = usize::from(*bits).clamp(1, 8);
                     return Expr::Const(match op {
-                        UnOp::Neg => v.wrapping_neg(),
-                        UnOp::Not => !*v,
+                        UnOp::Neg => truncate(v.wrapping_neg(), width),
+                        UnOp::Not => truncate(!*v, width),
                         UnOp::LNot => u64::from(*v == 0),
                     });
                 }

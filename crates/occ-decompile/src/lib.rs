@@ -121,15 +121,27 @@ pub fn is_liftable(arch: occ_core::Arch) -> bool {
 }
 
 /// The lifter for an architecture, or `None` when the architecture has none.
+///
+/// The container format picks the calling convention where it decides one.
+/// A Windows x86-64 binary passes its arguments in `rcx`, `rdx`, `r8` and
+/// `r9`; reading it with System V's order hands every function the wrong
+/// arguments, which is the kind of mistake that produces a plausible
+/// decompilation of a program that does not exist.
 fn lifter_for<'a>(
     arch: occ_core::Arch,
+    format: occ_core::Format,
     name_of: &'a dyn Fn(Addr) -> String,
     symbols: &'a dyn Fn(&str) -> Option<u64>,
 ) -> Option<Box<dyn lift::Lifter + 'a>> {
     match arch {
         occ_core::Arch::X86_64 => {
-            static TARGET: lift::x86::X86Target = lift::x86::X86Target;
-            Some(Box::new(lift::x86::Lifter::new(&TARGET, name_of, symbols)))
+            static SYSV: lift::x86::X86Target = lift::x86::X86Target::sysv();
+            static WIN64: lift::x86::X86Target = lift::x86::X86Target::win64();
+            let target = match format {
+                occ_core::Format::Pe | occ_core::Format::Coff => &WIN64,
+                _ => &SYSV,
+            };
+            Some(Box::new(lift::x86::Lifter::new(target, name_of, symbols)))
         }
         occ_core::Arch::Aarch64 => {
             static TARGET: lift::aarch64::Aarch64Target = lift::aarch64::Aarch64Target;
@@ -226,7 +238,7 @@ pub fn build_program(
 ) -> Program {
     let mut notes: Vec<String> = Vec::new();
     let symbols = symbol_lookup(image);
-    let Some(mut lifter) = lifter_for(image.arch, name_of, &symbols) else {
+    let Some(mut lifter) = lifter_for(image.arch, image.format, name_of, &symbols) else {
         notes.push(format!(
             "lifting is implemented for x86-64, AArch64 and RISC-V, this is {}",
             image.arch.label()
@@ -252,10 +264,18 @@ pub fn build_program(
 
     let mut blocks: Vec<Block> = Vec::with_capacity(func.blocks.len());
     let mut tail: Vec<Stmt> = Vec::new();
+    let mut truncated = false;
+    // A tail call hands the callee's result straight back to this function's
+    // caller, so the return register holds a value even when no instruction in
+    // the body wrote it.
+    let mut forwards_call_result = false;
+    // Jump targets inside the function's own range that its body never
+    // decoded. Collected so the lift can say how many paths leave it.
+    let mut holes: Vec<Addr> = Vec::new();
     let arg_reg_names = lifter.arg_reg_names();
     for (i, bb) in func.blocks.iter().enumerate() {
         if i >= opts.max_blocks {
-            notes.push(format!("stopped after {} blocks", opts.max_blocks));
+            truncated = true;
             break;
         }
         let insns = func
@@ -271,16 +291,46 @@ pub fn build_program(
                 FlowKind::UnconditionalBranch => match insn.target {
                     Some(occ_core::CallTarget::Direct { to }) => match by_addr.get(&to) {
                         Some(t) => Term::Jump(*t),
+                        None if inside(func, to) => {
+                            // The jump lands on an address this function's own
+                            // range covers but its body never decoded. That is
+                            // a hole, not a call: naming `sub_140001aff` here
+                            // invented a function that does not exist and
+                            // claimed this one returns its result.
+                            tail.push(Stmt::Comment(format!(
+                                "jump to {:#x} was never decoded; it is inside this function, so control leaves the recovered body here",
+                                to.get()
+                            )));
+                            holes.push(to);
+                            Term::Unreachable
+                        }
                         None => {
                             // A jump out of the function is a tail call: the
-                            // arguments are already in their registers.
-                            tail.push(Stmt::Call {
-                                name: name_of(to),
-                                args: lifter.call_args(),
-                                ret: None,
-                                addr: insn.addr,
-                            });
-                            Term::Ret(None)
+                            // arguments are already in their registers. What
+                            // the callee returns is what this function returns
+                            // — the frame that called it is still on the stack
+                            // — so the call carries the return value instead
+                            // of dropping it, and the block ends by handing
+                            // that value back.
+                            if calls_noreturn(insn, name_of) {
+                                tail.push(Stmt::Call {
+                                    name: name_of(to),
+                                    args: lifter.call_args(),
+                                    ret: None,
+                                    addr: insn.addr,
+                                });
+                                Term::Unreachable
+                            } else {
+                                let ret = lifter.ret_reg();
+                                tail.push(Stmt::Call {
+                                    name: name_of(to),
+                                    args: lifter.call_args(),
+                                    ret: Some(ret.clone()),
+                                    addr: insn.addr,
+                                });
+                                forwards_call_result = true;
+                                Term::Ret(Some(Expr::var(ret)))
+                            }
                         }
                     },
                     Some(occ_core::CallTarget::Indirect { via: Some(slot) }) => {
@@ -394,6 +444,45 @@ pub fn build_program(
         });
     }
 
+    // A prefix cut leaves terminators that point at blocks the cap dropped.
+    // Those targets are indices into a vector that no longer has them, and the
+    // first pass that dereferences one aborts the process. The target exists —
+    // it just was not lifted — so the edge is cut here, while that is still
+    // known, and the cut is reported rather than hidden.
+    if truncated {
+        let cut = drop_edges_outside(&mut blocks);
+        notes.push(format!(
+            "stopped after {} of {} blocks; {cut} edge(s) into the unlifted remainder were cut",
+            blocks.len(),
+            func.blocks.len(),
+        ));
+    }
+
+    // A hole is a fact about the recovery, not about this function's source:
+    // the bytes are there, the body has a jump into them, and nothing decoded
+    // them. Saying so is the difference between an incomplete listing and a
+    // wrong one.
+    if !holes.is_empty() {
+        holes.sort_unstable_by_key(|a| a.get());
+        holes.dedup();
+        let shown = holes
+            .iter()
+            .take(4)
+            .map(|a| format!("{:#x}", a.get()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = holes.len().saturating_sub(4);
+        notes.push(format!(
+            "{} jump(s) land inside this function on bytes that were never decoded ({}); the paths stop there",
+            holes.len(),
+            if more > 0 {
+                format!("{shown}, and {more} more")
+            } else {
+                shown
+            }
+        ));
+    }
+
     // Which register the value comes back in depends on the function's
     // type, which the code does not carry; the body says where the
     // function left its last value, and that is settled only once every
@@ -403,7 +492,7 @@ pub fn build_program(
     // A function that never wrote the register the value comes from has
     // no value to return, and printing one would claim the function chose
     // it.
-    let ret_defined = lifter.ret_defined();
+    let ret_defined = lifter.ret_defined() || forwards_call_result;
     for b in blocks.iter_mut() {
         if let Term::Ret(Some(_)) = b.term {
             b.term = if ret_defined {
@@ -436,11 +525,30 @@ pub fn build_program(
     let mut cfg = ssa::Cfg::new(blocks);
     // The entry block is the one at the function's entry address, not block 0:
     // with `-freorder-blocks` the entry sits in the middle of the layout.
-    let mut entry = cfg
-        .blocks
-        .iter()
-        .position(|b| b.addr == func.entry)
-        .unwrap_or(0);
+    let mut entry = match cfg.blocks.iter().position(|b| b.addr == func.entry) {
+        Some(e) => e,
+        // The cap can fall before the entry block. Structuring whatever block
+        // happened to be first would present a fragment of the function as the
+        // function, so the result says it could not start instead.
+        None if truncated => {
+            notes.push(format!(
+                "the entry block at {:#x} lies outside the {}-block limit; nothing to structure",
+                func.entry.0, opts.max_blocks
+            ));
+            return Program {
+                entry: 0,
+                blocks: Vec::new(),
+                preds: Vec::new(),
+                succs: Vec::new(),
+                params: Vec::new(),
+                param_regs: Vec::new(),
+                param_aliases: Vec::new(),
+                ret_type: None,
+                notes,
+            };
+        }
+        None => 0,
+    };
     // A function whose entry is also a jump target has a predecessor from
     // outside the function: the caller. Without a block to represent that edge,
     // a `do { } while` at the top of a function looks like it is entered from
@@ -540,6 +648,16 @@ fn tail_slot(image: &Image, tail: &mut Vec<Stmt>, slot: Addr) {
     }));
 }
 
+/// True when `a` falls inside the address range `f` covers.
+///
+/// A recovered function spans from its entry to the end of its last
+/// instruction, and the bytes in between are not all instructions: a body that
+/// jumps over a chunk the descent never followed leaves a hole. A branch into
+/// that hole is not a call to anything.
+fn inside(f: &Function, a: Addr) -> bool {
+    a.get() >= f.entry.get() && a.get() < f.end().get()
+}
+
 /// True when the instruction calls a function that does not come back.
 fn calls_noreturn(insn: &occ_core::Instruction, name_of: &dyn Fn(Addr) -> String) -> bool {
     let Some(occ_core::CallTarget::Direct { to }) = insn.target else {
@@ -570,6 +688,80 @@ fn calls_noreturn(insn: &occ_core::Instruction, name_of: &dyn Fn(Addr) -> String
 /// fall back to `goto`, which is both unreadable and, when the label was
 /// consumed by an earlier arm, wrong. Copying it per predecessor costs one
 /// statement and keeps the graph a tree of returns.
+/// Cut every successor that points past the end of `blocks`.
+///
+/// Returns how many edges were cut. A branch keeps the side that still has a
+/// block; a jump that loses its target — and a switch that loses any case —
+/// ends as control flow the pass cannot follow, because a switch with missing
+/// cases would claim the function never goes there.
+fn drop_edges_outside(blocks: &mut [Block]) -> usize {
+    let n = blocks.len();
+    let mut cut = 0;
+    for b in blocks.iter_mut() {
+        let term = std::mem::replace(&mut b.term, Term::Unreachable);
+        b.term = match term {
+            Term::Jump(t) => {
+                if t >= n {
+                    cut += 1;
+                    Term::Unreachable
+                } else {
+                    Term::Jump(t)
+                }
+            }
+            Term::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
+                let then_bb = then_bb.filter(|t| {
+                    if *t >= n {
+                        cut += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let else_bb = else_bb.filter(|t| {
+                    if *t >= n {
+                        cut += 1;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if then_bb.is_none() && else_bb.is_none() {
+                    Term::Unreachable
+                } else {
+                    Term::Branch {
+                        cond,
+                        then_bb,
+                        else_bb,
+                    }
+                }
+            }
+            Term::Switch {
+                index,
+                targets,
+                first_case,
+            } => {
+                let kept: Vec<BlockId> = targets.iter().copied().filter(|t| *t < n).collect();
+                cut += targets.len() - kept.len();
+                if kept.len() == targets.len() {
+                    Term::Switch {
+                        index,
+                        targets,
+                        first_case,
+                    }
+                } else {
+                    Term::Indirect { target: index }
+                }
+            }
+            other => other,
+        };
+    }
+    cut
+}
+
 fn split_return_blocks(blocks: &mut Vec<Block>) {
     let mut preds: Vec<Vec<BlockId>> = vec![Vec::new(); blocks.len()];
     for (i, b) in blocks.iter().enumerate() {
@@ -692,13 +884,17 @@ fn parameter_names(blocks: &[Block], arg_regs: &[String]) -> (Vec<String>, Vec<S
     for b in blocks {
         walk(&b.stmts, &mut used, arg_regs, &b.term);
     }
-    let mut params = Vec::new();
-    let mut regs = Vec::new();
-    for (i, u) in used.iter().enumerate() {
-        if *u {
-            params.push(format!("a{i}"));
-            regs.push(arg_regs[i].clone());
-        }
+    // A parameter is a position, not a set: a function that reads the third
+    // argument register takes three arguments, whether or not the body says
+    // anything about the first two. Listing only the registers the body reads
+    // printed `f(a2)` for a two-argument function, and a caller reading that
+    // prototype passes its argument in the wrong register.
+    let arity = used.iter().rposition(|u| *u).map_or(0, |i| i + 1);
+    let mut params = Vec::with_capacity(arity);
+    let mut regs = Vec::with_capacity(arity);
+    for (i, reg) in arg_regs.iter().enumerate().take(arity) {
+        params.push(format!("a{i}"));
+        regs.push(reg.clone());
     }
     (params, regs)
 }
@@ -865,20 +1061,23 @@ mod tests {
         }
         walk(&body, &mut defined, &mut jumped);
 
-        assert!(
-            !jumped.is_empty(),
-            "the shared tail needs a jump: {body:?}"
-        );
+        // With a correct post-dominator tree the shared tail is a join, so
+        // the two arms close into one `if`/`else` and no jump is needed at
+        // all. Either way the rule is the same: a jump has to land on a
+        // label that the body defines.
         for target in &jumped {
             assert!(
                 defined.contains(target),
                 "the jump to {target} has no label to land on; labels: {defined:?}"
             );
+            let labelled = body
+                .iter()
+                .any(|n| matches!(n, crate::ir::Node::Label(l) if l == target));
+            assert!(labelled, "the label is in the body: {body:?}");
         }
-        // The label has to carry the block it names, not just the name.
-        let labelled = body
-            .iter()
-            .any(|n| matches!(n, crate::ir::Node::Label(l) if l == &jumped[0]));
-        assert!(labelled, "the label is in the body");
+        // And the tail's statement must appear exactly once, whether it was
+        // inlined into both arms or emitted under a label.
+        let assigns = format!("{body:?}").matches("Const(7)").count();
+        assert_eq!(assigns, 1, "the shared tail runs once: {body:?}");
     }
 }

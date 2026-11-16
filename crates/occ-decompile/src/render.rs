@@ -30,6 +30,7 @@ pub fn render(d: &Decompiled) -> String {
         out,
         indent: 1,
         aliases: Aliases::new(d),
+        last_call: None,
     };
     r.nodes(&d.body);
     for note in &d.notes {
@@ -43,6 +44,12 @@ struct Renderer {
     out: String,
     indent: usize,
     aliases: Aliases,
+    /// Where the previous statement started, together with the call it printed
+    /// when that statement was `dest = callee(args);`. Returning `dest` right
+    /// after it is the same thing the source said in one line — a `return` of a
+    /// call's result, which is how tail calls come out — so the two are printed
+    /// as one rather than as a temporary the reader has to follow.
+    last_call: Option<(usize, String, Vec<Expr>, String)>,
 }
 
 impl Renderer {
@@ -71,6 +78,9 @@ impl Renderer {
     }
 
     fn node(&mut self, node: &Node) {
+        // Anything that is not a call ends the run in which a following
+        // `return` could still be folded into it.
+        let previous_call = self.last_call.take();
         match node {
             Node::Assign { dest, value } => {
                 let line = format!("{} = {};", name(dest), expr(value));
@@ -93,8 +103,10 @@ impl Renderer {
                 );
                 match ret {
                     Some(dest) => {
+                        let at = self.out.len();
                         let line = format!("{} = {call};", name(dest));
                         self.line(&line);
+                        self.last_call = Some((at, callee.clone(), args.clone(), dest.clone()));
                     }
                     None => self.line(&format!("{call};")),
                 }
@@ -148,6 +160,17 @@ impl Renderer {
                 self.close("");
             }
             Node::Return(Some(value)) => {
+                if let (Expr::Var(v), Some((at, callee, args, dest))) = (value, previous_call)
+                    && *v == *dest
+                {
+                    self.out.truncate(at);
+                    let call = format!(
+                        "{callee}({})",
+                        args.iter().map(expr).collect::<Vec<_>>().join(", ")
+                    );
+                    self.line(&format!("return {call};"));
+                    return;
+                }
                 let line = format!("return {};", expr(value));
                 self.line(&line);
             }
@@ -364,6 +387,7 @@ pub fn expr(e: &Expr) -> String {
         out: String::new(),
         indent: 0,
         aliases: Aliases { map: HashMap::new() },
+        last_call: None,
     };
     r.fmt_expr(e, &mut out, 0);
     out

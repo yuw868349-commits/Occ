@@ -91,6 +91,22 @@ pub enum Operand {
     Imm(u64),
     /// A condition name, as AArch64's `csel` and `cset` print it.
     Cond(String),
+    /// A register with a shift or an extension, as AArch64 writes the third
+    /// operand of `add` and the index of a load: `w1, sxtw #2`.
+    ///
+    /// It is a separate operand because the modifier belongs to the operand
+    /// it follows, not to the instruction: `add x3, x2, w1, sxtw #2` has four
+    /// comma-separated fields and three operands. Lifting it as a fourth
+    /// operand lost it, and the instruction became "unparsed" — which is how
+    /// a whole array index disappeared from the output.
+    Modified {
+        /// The register being shifted or extended.
+        reg: Reg,
+        /// How it is modified.
+        kind: ModKind,
+        /// Shift amount in bits, zero when the text omitted it.
+        amount: u8,
+    },
     /// A vector register.
     Vec(VecClass, u8),
     /// A slot of the x87 register stack.
@@ -116,6 +132,83 @@ pub enum Operand {
         /// pre-indexed and post-indexed forms AArch64 uses.
         base_update: Option<i64>,
     },
+}
+
+/// How a register operand is modified before it is used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModKind {
+    /// Logical shift left.
+    Lsl,
+    /// Logical shift right.
+    Lsr,
+    /// Arithmetic shift right.
+    Asr,
+    /// Rotate right.
+    Ror,
+    /// Sign-extend a byte.
+    Sxtb,
+    /// Sign-extend a halfword.
+    Sxth,
+    /// Sign-extend a word.
+    Sxtw,
+    /// Sign-extend the register, which is a no-op on a 64-bit one.
+    Sxtx,
+    /// Zero-extend a byte.
+    Uxtb,
+    /// Zero-extend a halfword.
+    Uxth,
+    /// Zero-extend a word.
+    Uxtw,
+    /// Zero-extend the register, which is a no-op on a 64-bit one.
+    Uxtx,
+}
+
+impl ModKind {
+    /// The width the extension starts from, in bytes.
+    const fn from(self) -> Option<u8> {
+        Some(match self {
+            ModKind::Sxtb | ModKind::Uxtb => 1,
+            ModKind::Sxth | ModKind::Uxth => 2,
+            ModKind::Sxtw | ModKind::Uxtw => 4,
+            ModKind::Sxtx | ModKind::Uxtx => return None,
+            _ => return None,
+        })
+    }
+
+    /// True when the extension is a signed one.
+    const fn signed(self) -> bool {
+        matches!(
+            self,
+            ModKind::Sxtb | ModKind::Sxth | ModKind::Sxtw | ModKind::Sxtx
+        )
+    }
+
+    /// True when the modifier is a shift rather than an extension.
+    const fn is_shift(self) -> bool {
+        matches!(
+            self,
+            ModKind::Lsl | ModKind::Lsr | ModKind::Asr | ModKind::Ror
+        )
+    }
+
+    /// The modifier a mnemonic names, if it names one.
+    pub fn of_name(name: &str) -> Option<ModKind> {
+        Some(match name {
+            "lsl" => ModKind::Lsl,
+            "lsr" => ModKind::Lsr,
+            "asr" => ModKind::Asr,
+            "ror" => ModKind::Ror,
+            "sxtb" => ModKind::Sxtb,
+            "sxth" => ModKind::Sxth,
+            "sxtw" => ModKind::Sxtw,
+            "sxtx" => ModKind::Sxtx,
+            "uxtb" => ModKind::Uxtb,
+            "uxth" => ModKind::Uxth,
+            "uxtw" => ModKind::Uxtw,
+            "uxtx" => ModKind::Uxtx,
+            _ => return None,
+        })
+    }
 }
 
 /// Which vector register file a register belongs to.
@@ -174,6 +267,7 @@ impl Operand {
     pub fn size(&self) -> u8 {
         match self {
             Operand::Reg(r) => r.size,
+            Operand::Modified { reg, .. } => reg.size,
             Operand::Imm(_) => 8,
             Operand::Cond(_) => 1,
             Operand::Vec(class, _) => class.size(),
@@ -522,6 +616,14 @@ pub struct Core<'a> {
     /// is not: it says what the function as a whole touched, which is how
     /// the return value's register is worked out.
     pub ever_written: HashSet<u8>,
+    /// Registers a call has overwritten since their last definition.
+    ///
+    /// A call is where the lifted text stops modelling: the callee may write
+    /// any caller-saved register, and the lifted statements say nothing about
+    /// it. Reading such a register afterwards used to print the value it held
+    /// *before* the call, which is a number the program no longer has. The
+    /// register is marked here and reads become explicitly unknown instead.
+    pub clobbered: HashSet<u8>,
     /// Notes about approximations, one per address.
     pub notes: Vec<(Addr, String)>,
     /// Absolute address the current instruction's PC-relative operand refers
@@ -543,6 +645,7 @@ impl<'a> Core<'a> {
             flags: FlagState::default(),
             written: HashSet::new(),
             ever_written: HashSet::new(),
+            clobbered: HashSet::new(),
             notes: Vec::new(),
             pc_target: None,
         }
@@ -569,6 +672,7 @@ impl<'a> Core<'a> {
     pub fn read(&mut self, op: &Operand, stmts: &mut Vec<Stmt>) -> Expr {
         match op {
             Operand::Reg(r) => self.read_reg(*r),
+            Operand::Modified { reg, kind, amount } => self.read_modified(*reg, *kind, *amount),
             Operand::Imm(v) => Expr::Const(*v),
             Operand::Mem { size, .. } => {
                 if let Some(slot) = self.stack_slot(op) {
@@ -596,6 +700,17 @@ impl<'a> Core<'a> {
     /// A view that starts above the bottom of the register is shifted down
     /// first, so `ah` reads bits 8 to 15 of `rax`.
     pub fn read_reg(&self, r: Reg) -> Expr {
+        // A register that is hardwired to zero reads as zero, whatever the
+        // program last tried to write into it and whatever width the view
+        // asks for: the low half of zero is zero too.
+        if Some(r.idx) == self.target.zero_reg() {
+            return Expr::Const(0);
+        }
+        // A caller-saved register a call has overwritten holds whatever the
+        // callee left there, which this tool does not model.
+        if self.clobbered.contains(&r.idx) && self.target.fixed_register(r.idx).is_none() {
+            return Expr::Unknown(format!("{} after a call", self.name(r.idx)));
+        }
         // A register the linker fixes reads as the value the linker gave it,
         // not as an unknown name.
         if r.offset == 0
@@ -605,11 +720,6 @@ impl<'a> Core<'a> {
         }
         let full = Expr::var(self.name(r.idx));
         let width = self.target.reg_width(r.idx);
-        // A register that is hardwired to zero reads as zero, whatever the
-        // program last tried to write into it.
-        if r.offset == 0 && r.size >= width && Some(r.idx) == self.target.zero_reg() {
-            return Expr::Const(0);
-        }
         if r.offset == 0 && r.size >= width {
             return full;
         }
@@ -628,6 +738,91 @@ impl<'a> Core<'a> {
             arg: Box::new(shifted),
             from: 8,
             to: r.size,
+        }
+    }
+
+    /// Read a register with a shift or an extension applied to it.
+    ///
+    /// The order matters: on AArch64 the extension happens first and the
+    /// shift second, so `w1, sxtw #2` is `(i64)(i32)w1 << 2` and not the
+    /// other way round. The extended value is always 64 bits wide, because
+    /// that is what the register it lands in holds.
+    pub fn read_modified(&self, reg: Reg, kind: ModKind, amount: u8) -> Expr {
+        let mut value = self.read_reg(reg);
+        if !kind.is_shift()
+            && let Some(from) = kind.from()
+        {
+            value = if kind.signed() {
+                // A signed extension of a narrow view is one cast, not a
+                // truncation followed by a sign-extending cast of the
+                // truncated value: `(i64)(u32)w1` reads unsigned and is not
+                // what `sxtw` does.
+                widen_signed(value, from)
+            } else {
+                match value {
+                    Expr::Cast {
+                        kind: CastKind::Trunc,
+                        arg,
+                        from: 8,
+                        to,
+                    } if to == from => Expr::Cast {
+                        kind: CastKind::Trunc,
+                        arg,
+                        from: 8,
+                        to,
+                    },
+                    other => Expr::Cast {
+                        kind: CastKind::Zext,
+                        arg: Box::new(other),
+                        from,
+                        to: 8,
+                    },
+                }
+            };
+        }
+        if amount == 0 {
+            return value;
+        }
+        let op = match kind {
+            ModKind::Lsr => BinOp::Shr,
+            ModKind::Asr => BinOp::Sar,
+            ModKind::Ror => {
+                // The IR has no rotate, so a rotate is spelled out the way
+                // the instruction does it: the high half shifted up and the
+                // low half shifted down, or'd together.
+                let bits = u32::from(reg.size) * 8;
+                let complement = Expr::Bin {
+                    op: BinOp::Sub,
+                    lhs: Box::new(Expr::Const(u64::from(bits))),
+                    rhs: Box::new(Expr::Const(u64::from(amount))),
+                    bits: reg.size,
+                };
+                let high = Expr::Bin {
+                    op: BinOp::Shl,
+                    lhs: Box::new(value.clone()),
+                    rhs: Box::new(complement),
+                    bits: reg.size,
+                };
+                let low = Expr::Bin {
+                    op: BinOp::Shr,
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(u64::from(amount))),
+                    bits: reg.size,
+                };
+                return Expr::Bin {
+                    op: BinOp::Or,
+                    lhs: Box::new(high),
+                    rhs: Box::new(low),
+                    bits: reg.size,
+                };
+            }
+            _ => BinOp::Shl,
+        };
+        Expr::Bin {
+            op,
+            lhs: Box::new(value),
+            rhs: Box::new(Expr::Const(u64::from(amount))),
+            bits: 8,
         }
     }
 
@@ -714,6 +909,7 @@ impl<'a> Core<'a> {
                 let dest = self.name(r.idx);
                 self.written.insert(r.idx);
                 self.ever_written.insert(r.idx);
+                self.clobbered.remove(&r.idx);
                 let width = self.target.reg_width(r.idx);
                 let value = if r.size == width && r.offset == 0 {
                     value
@@ -745,6 +941,9 @@ impl<'a> Core<'a> {
                 }
             }
             Operand::Imm(_) | Operand::Cond(_) => {}
+            // A modified register is not a destination: the modifier only
+            // says how its value is read.
+            Operand::Modified { .. } => {}
             // Writing a whole vector register or an x87 slot as one word
             // would lose the elements the register holds, so the
             // architectures that have them write them element by element.
@@ -993,6 +1192,19 @@ impl<'a> Core<'a> {
                 }
             }
             _ => Expr::Unknown("memory flags".into()),
+        }
+    }
+
+    /// Record that a call overwrote `regs`.
+    ///
+    /// The return register is not among them: the call defines it, so it
+    /// holds the callee's result rather than an unknown.
+    pub fn clobber(&mut self, regs: &[u8], ret: u8) {
+        self.clobbered.clear();
+        for r in regs {
+            if *r != ret {
+                self.clobbered.insert(*r);
+            }
         }
     }
 
