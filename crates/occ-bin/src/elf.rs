@@ -992,11 +992,11 @@ fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<
             if version == 4 {
                 addr_size = data.get(p).copied().unwrap_or(addr_size);
             }
-            if aug.starts_with('z') {
+            if let Some(aug_body) = aug.strip_prefix('z') {
                 let Some(aug_len) = uleb(data, &mut p) else { break };
                 let aug_end = p.saturating_add(aug_len as usize);
                 let mut q = p;
-                for c in aug[1..].chars() {
+                for c in aug_body.chars() {
                     match c {
                         'R' => {
                             encoding = data.get(q).copied().unwrap_or(0);

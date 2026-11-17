@@ -979,11 +979,11 @@ fn build_unit(
     // nearest enclosing subprogram, whatever blocks lie between them, or
     // `for (int i = ...)` loses its induction variable.
     let mut owner_of: Vec<Option<usize>> = vec![None; dies.len()];
-    for i in 0..dies.len() {
+    for (i, owner) in owner_of.iter_mut().enumerate() {
         let mut cur = Some(i);
         while let Some(c) = cur {
             if dies[c].tag == DW_TAG_SUBPROGRAM {
-                owner_of[i] = Some(c);
+                *owner = Some(c);
                 break;
             }
             cur = parent_of[c];

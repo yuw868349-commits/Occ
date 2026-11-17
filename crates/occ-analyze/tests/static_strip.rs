@@ -43,7 +43,13 @@ impl Drop for Scratch {
 }
 
 fn scratch() -> Scratch {
-    let dir = std::env::temp_dir().join(format!("occ-static-{}", std::process::id()));
+    // Tests in one binary run on parallel threads and share a process id, so
+    // the directory name needs a per-call part too: otherwise one test's
+    // setup deletes the directory another test just created.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("occ-static-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch");
     Scratch(dir)
