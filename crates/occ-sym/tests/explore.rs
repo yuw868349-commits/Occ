@@ -40,6 +40,7 @@ fn image_with_code(code: &[u8]) -> Image {
         fingerprint: Fingerprint::unknown(ImageId(0)),
         interpreter: None,
         warnings: Vec::new(),
+        function_bounds: Vec::new(),
     }
 }
 

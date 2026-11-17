@@ -258,6 +258,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         fingerprint: fp,
         interpreter: None,
         warnings,
+        function_bounds: Vec::new(),
     })
 }
 

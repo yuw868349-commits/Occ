@@ -38,6 +38,7 @@ pub fn image_with_sections(sections: Vec<Section>) -> Image {
         fingerprint: Fingerprint::unknown(ImageId(0)),
         interpreter: None,
         warnings: Vec::new(),
+        function_bounds: Vec::new(),
     }
 }
 

@@ -657,6 +657,24 @@ pub struct Image {
     pub interpreter: Option<String>,
     /// Non-fatal problems encountered while loading.
     pub warnings: Vec<String>,
+    /// Function boundaries the container states outright.
+    ///
+    /// An unwind table or a Mach-O function-starts list names every function
+    /// the compiler emitted, including the static ones the symbol table may
+    /// have dropped. These are facts, not heuristics: recovery uses them as
+    /// seeds and treats their ranges as exact.
+    pub function_bounds: Vec<FunctionBound>,
+}
+
+/// One function extent the container states.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionBound {
+    /// First byte of the function.
+    pub start: Addr,
+    /// One past the last byte, or zero when only the start is known.
+    pub end: Addr,
+    /// Which table stated it: `eh_frame`, `pdata`, `function_starts`.
+    pub source: &'static str,
 }
 
 impl Image {
@@ -824,6 +842,7 @@ mod tests {
             },
             interpreter: Some("/lib64/ld-linux-x86-64.so.2".into()),
             warnings: Vec::new(),
+            function_bounds: Vec::new(),
         }
     }
 

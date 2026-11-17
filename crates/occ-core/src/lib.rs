@@ -51,9 +51,9 @@ pub use evidence::{
 pub use handle::{Handle, HandleKind};
 pub use hypothesis::{Hypothesis, HypothesisState, Verdict};
 pub use image::{
-    Arch, CompilerFamily, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind,
-    LangGuess, Linkage, Perm, RelocKind, Relocation, Section, SectionKind, Segment, Symbol,
-    SymbolBinding, SymbolKind,
+    Arch, CompilerFamily, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
+    Import, ImportKind, LangGuess, Linkage, Perm, RelocKind, Relocation, Section, SectionKind,
+    Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 /// Crate version, surfaced in MCP `serverInfo` so a client can pin behaviour.

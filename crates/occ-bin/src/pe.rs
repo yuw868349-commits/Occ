@@ -16,9 +16,9 @@
 
 use crate::reader::Reader;
 use occ_core::{
-    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind,
-    Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind, Segment, Symbol,
-    SymbolBinding, SymbolKind,
+    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
+    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind,
+    Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 /// `IMAGE_FILE_DLL`: the image is a library, not a program.
@@ -29,6 +29,7 @@ const PE32_PLUS_MAGIC: u16 = 0x20b;
 // Data directory indices.
 const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
+const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 
 // Section characteristics.
@@ -149,6 +150,11 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     }
     let _ = rich;
 
+    // The exception directory is the linker's own function list. On x64 and
+    // ARM64 each entry states both ends; on ARM32 it states the start and a
+    // unwind record, and the end is the next start.
+    let function_bounds = pdata_bounds(data, &l);
+
     let mut fingerprint = Fingerprint::unknown(id);
     fingerprint.linkage = if l.characteristics & IMAGE_FILE_DLL != 0 {
         Linkage::Shared
@@ -176,6 +182,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         fingerprint,
         interpreter: None,
         warnings,
+        function_bounds,
     })
 }
 
@@ -274,6 +281,62 @@ fn parse_layout(r: &Reader<'_>, data: &[u8]) -> Result<Layout> {
 }
 
 /// Translate a relative virtual address into a file offset.
+/// Function extents from the exception directory (`.pdata`).
+///
+/// x64 and ARM64 entries are `RUNTIME_FUNCTION` records of twelve bytes:
+/// begin RVA, end RVA, unwind RVA. ARM32 records are eight bytes and carry no
+/// end, so the next entry's start is this one's end — which is exact because
+/// the linker emits the table sorted by address.
+fn pdata_bounds(data: &[u8], l: &Layout) -> Vec<FunctionBound> {
+    let Some(&(rva, size)) = l.dirs.get(DIR_EXCEPTION) else {
+        return Vec::new();
+    };
+    if rva == 0 || size == 0 {
+        return Vec::new();
+    }
+    let Some(base) = rva_to_offset(l, rva) else {
+        return Vec::new();
+    };
+    let arm32 = l.machine == 0x01c0;
+    let entry = if arm32 { 8usize } else { 12 };
+    let count = (size as usize / entry).min(1_000_000);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = base + i * entry;
+        let Some(begin) = data
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        else {
+            break;
+        };
+        if begin == 0 {
+            continue;
+        }
+        let end = if arm32 {
+            0
+        } else {
+            data.get(at + 4..at + 8)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .unwrap_or(0)
+        };
+        out.push(FunctionBound {
+            start: Addr(l.image_base + u64::from(begin)),
+            end: Addr(l.image_base + u64::from(end)),
+            source: "pdata",
+        });
+    }
+    if arm32 {
+        out.sort_by_key(|b| b.start.0);
+        for i in 0..out.len() {
+            let next = out.get(i + 1).map(|b| b.start).unwrap_or(Addr::NULL);
+            if out[i].end.is_null() {
+                out[i].end = next;
+            }
+        }
+    }
+    out
+}
+
 fn rva_to_offset(l: &Layout, rva: u32) -> Option<usize> {
     for s in &l.sections {
         let span = s.virtual_size.max(s.raw_size);
@@ -649,8 +712,12 @@ fn map_machine(machine: u16) -> Arch {
         0x014c => Arch::X86,
         0x8664 => Arch::X86_64,
         0xaa64 => Arch::Aarch64,
+        // IMAGE_FILE_MACHINE_ARMNT. The old 0x01c2/0x01c4 ARM and Thumb-only
+        // values are not produced by any current toolchain; 0x01c0 is what
+        // MSVC and LLVM emit for ARMv7.
         0x01c0 => Arch::Arm,
-        0x5032 => Arch::RiscV64,
+        0x5032 => Arch::RiscV32,
+        0x5064 => Arch::RiscV64,
         _ => Arch::Other,
     }
 }
@@ -789,7 +856,7 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         path: path.to_string(),
         format: Format::Coff,
         arch: map_machine(machine),
-        bits: if matches!(machine, 0x8664 | 0xaa64 | 0x5032) {
+        bits: if matches!(machine, 0x8664 | 0xaa64 | 0x5064) {
             64
         } else {
             32
@@ -812,5 +879,6 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         },
         interpreter: None,
         warnings: vec!["COFF object: addresses are section-relative until linked".into()],
+        function_bounds: Vec::new(),
     })
 }

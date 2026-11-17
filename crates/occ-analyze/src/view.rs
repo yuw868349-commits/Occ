@@ -266,6 +266,7 @@ mod tests {
             fingerprint: Fingerprint::unknown(ImageId(0)),
             interpreter: None,
             warnings: Vec::new(),
+            function_bounds: Vec::new(),
         }
     }
 

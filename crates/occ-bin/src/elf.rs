@@ -17,10 +17,12 @@
 //!   addressable produces hundreds of entities all living at `0x0`.
 
 use crate::reader::Reader;
+use std::collections::HashMap;
+
 use occ_core::{
-    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind,
-    Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind, Segment, Symbol,
-    SymbolBinding, SymbolKind,
+    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
+    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind,
+    Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 // Section header types.
@@ -229,6 +231,18 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         }
         _ => Linkage::Unknown,
     };
+    // The unwind table states each function's extent. It is the linker's own
+    // answer, and it survives `strip`, unlike the symbol table.
+    let function_bounds = if object {
+        Vec::new()
+    } else {
+        sections
+            .iter()
+            .find(|s| s.name == ".eh_frame" && s.file_size > 0)
+            .map(|s| eh_frame_bounds(data, s, h.endian, h.bits))
+            .unwrap_or_default()
+    };
+
     let mut fingerprint = Fingerprint::unknown(id);
     fingerprint.linkage = linkage;
 
@@ -252,6 +266,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         fingerprint,
         interpreter,
         warnings,
+        function_bounds,
     })
 }
 
@@ -912,6 +927,263 @@ fn read_needed(
     out
 }
 
+/// One parsed call-frame-information record.
+struct Cie {
+    /// How the FDE's `initial_location` is encoded (`DW_EH_PE_*`).
+    fde_encoding: u8,
+    /// Address size of the target.
+    addr_size: u8,
+}
+
+/// Function extents from `.eh_frame`.
+///
+/// Every FDE pairs an initial location with a range, which is exactly the
+/// function boundary the compiler emitted. The table survives `strip`, so it
+/// names functions whose symbols are gone.
+///
+/// The parser follows the CIE augmentation string rather than assuming
+/// `zR`: a CIE that carries a personality routine or LSDA has extra bytes
+/// before the FDE list, and ignoring them would decode the first FDE from the
+/// middle of its own header.
+fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<FunctionBound> {
+    let r = Reader::new(data, endian);
+    let start = sec.file_offset as usize;
+    let end = start
+        .saturating_add(sec.file_size as usize)
+        .min(data.len());
+    let mut pos = start;
+    let mut cies: HashMap<usize, Cie> = HashMap::new();
+    let mut out = Vec::new();
+    let mut guard = 0usize;
+    while pos + 4 <= end && guard < 1_000_000 {
+        guard += 1;
+        let entry_start = pos;
+        let Ok(len) = r.u32(pos) else { break };
+        if len == 0 {
+            break;
+        }
+        let (body_len, body_start) = if len == 0xffff_ffff {
+            let Ok(l) = r.u64(pos + 4) else { break };
+            (l as usize, pos + 12)
+        } else {
+            (len as usize, pos + 4)
+        };
+        let body_end = body_start.saturating_add(body_len);
+        if body_len < 4 || body_end > end {
+            break;
+        }
+        let Ok(id) = r.u32(body_start) else { break };
+        if id == 0 {
+            // A CIE. Read only what locates the FDE's fields.
+            let mut p = body_start + 4;
+            let Some(&version) = data.get(p) else { break };
+            p += 1;
+            let aug = cstr_at(data, p);
+            p += aug.len() + 1;
+            let Some(_code_align) = uleb(data, &mut p) else { break };
+            let Some(_data_align) = sleb(data, &mut p) else { break };
+            if version == 1 {
+                p += 1;
+            } else if uleb(data, &mut p).is_none() {
+                break;
+            }
+            let mut encoding = 0u8;
+            let mut addr_size = bits / 8;
+            if version == 4 {
+                addr_size = data.get(p).copied().unwrap_or(addr_size);
+            }
+            if aug.starts_with('z') {
+                let Some(aug_len) = uleb(data, &mut p) else { break };
+                let aug_end = p.saturating_add(aug_len as usize);
+                let mut q = p;
+                for c in aug[1..].chars() {
+                    match c {
+                        'R' => {
+                            encoding = data.get(q).copied().unwrap_or(0);
+                            q += 1;
+                        }
+                        'L' => q += 1,
+                        'P' => {
+                            let Some(enc) = data.get(q).copied() else { break };
+                            q += 1;
+                            if skip_encoded(data, endian, &mut q, enc, addr_size).is_none() {
+                                break;
+                            }
+                        }
+                        'S' | 'B' | 'G' => {}
+                        _ => break,
+                    }
+                }
+                p = aug_end;
+            }
+            let _ = p;
+            cies.insert(
+                entry_start,
+                Cie {
+                    fde_encoding: encoding,
+                    addr_size,
+                },
+            );
+        } else if let Some(cie) = entry_start
+            .checked_sub(0)
+            .and_then(|_| body_start.checked_sub(id as usize))
+            .and_then(|o| cies.get(&o))
+        {
+            // An FDE names its CIE by distance back from the id field.
+            let mut p = body_start + 4;
+            let field_at = sec.addr.0 + (p - start) as u64;
+            let Some(location) =
+                read_encoded(data, endian, &mut p, cie.fde_encoding, cie.addr_size, field_at)
+            else {
+                pos = body_end;
+                continue;
+            };
+            // The range uses the same format but never the pcrel application:
+            // it is a length, not an address.
+            let range_at = sec.addr.0 + (p - start) as u64;
+            let range = read_encoded(
+                data,
+                endian,
+                &mut p,
+                cie.fde_encoding & 0x0f,
+                cie.addr_size,
+                range_at,
+            )
+            .unwrap_or(0);
+            if range > 0 {
+                out.push(FunctionBound {
+                    start: Addr(location),
+                    end: Addr(location.saturating_add(range)),
+                    source: "eh_frame",
+                });
+            }
+        }
+        pos = body_end;
+    }
+    out.sort_by_key(|b| b.start.0);
+    out.dedup_by_key(|b| b.start.0);
+    out
+}
+
+/// Decode one `DW_EH_PE_*` value, advancing `pos`.
+fn read_encoded(
+    data: &[u8],
+    endian: Endian,
+    pos: &mut usize,
+    enc: u8,
+    addr_size: u8,
+    field_at: u64,
+) -> Option<u64> {
+    let value = read_encoded_raw(data, endian, pos, enc, addr_size)?;
+    let app = enc & 0x70;
+    Some(match app {
+        0x10 => field_at.wrapping_add(value), // pcrel
+        0x00 => value,                        // absptr
+        // textrel/datarel/funcrel/aligned are not used by compiler-emitted
+        // unwind tables; refusing them keeps a wrong answer out.
+        _ => return None,
+    })
+}
+
+fn read_encoded_raw(
+    data: &[u8],
+    endian: Endian,
+    pos: &mut usize,
+    enc: u8,
+    addr_size: u8,
+) -> Option<u64> {
+    let format = enc & 0x0f;
+    let r = Reader::new(data, endian);
+    let v = match format {
+        0x00 => {
+            let n = usize::from(addr_size);
+            if n == 8 {
+                r.u64(*pos).ok()?
+            } else {
+                u64::from(r.u32(*pos).ok()?)
+            }
+        }
+        0x01 => uleb(data, pos)?,
+        0x02 => u64::from(r.u16(*pos).ok()?),
+        0x03 => u64::from(r.u32(*pos).ok()?),
+        0x04 => r.u64(*pos).ok()?,
+        0x09 => sleb(data, pos)? as u64,
+        0x0a => i64::from(r.u16(*pos).ok()? as i16) as u64,
+        0x0b => i64::from(r.u32(*pos).ok()? as i32) as u64,
+        0x0c => r.u64(*pos).ok()?,
+        _ => return None,
+    };
+    if format != 0x00 && format != 0x01 && format != 0x09 {
+        *pos += match format {
+            0x02 | 0x0a => 2,
+            0x03 | 0x0b => 4,
+            _ => 8,
+        };
+    } else if format == 0x01 || format == 0x09 {
+        // ULEB/SLEB readers already advanced.
+    } else {
+        *pos += usize::from(addr_size);
+    }
+    Some(v)
+}
+
+fn skip_encoded(
+    data: &[u8],
+    endian: Endian,
+    pos: &mut usize,
+    enc: u8,
+    addr_size: u8,
+) -> Option<()> {
+    read_encoded_raw(data, endian, pos, enc, addr_size)?;
+    Some(())
+}
+
+fn cstr_at(data: &[u8], off: usize) -> String {
+    if off >= data.len() {
+        return String::new();
+    }
+    let rest = &data[off..];
+    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
+}
+
+fn uleb(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut result = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        result |= u64::from(b & 0x7f) << shift;
+        if b & 0x80 == 0 {
+            return Some(result);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+fn sleb(data: &[u8], pos: &mut usize) -> Option<i64> {
+    let mut result = 0i64;
+    let mut shift = 0u32;
+    loop {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        result |= i64::from(b & 0x7f) << shift;
+        shift += 7;
+        if b & 0x80 == 0 {
+            if shift < 64 && b & 0x40 != 0 {
+                result |= -1i64 << shift;
+            }
+            return Some(result);
+        }
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
 /// Map an ELF machine number onto the architecture enum.
 fn map_machine(machine: u16, bits: u8) -> Arch {
     match machine {
@@ -919,7 +1191,16 @@ fn map_machine(machine: u16, bits: u8) -> Arch {
         62 => Arch::X86_64,
         40 => Arch::Arm,
         183 => Arch::Aarch64,
-        243 => Arch::RiscV64,
+        243 => {
+            // EM_RISCV says nothing about width; the ELF class does. Reporting
+            // an RV32 object as `riscv64 32-bit` was a label bug, not a
+            // decoding one: the decoder already followed `bits`.
+            if bits == 32 {
+                Arch::RiscV32
+            } else {
+                Arch::RiscV64
+            }
+        }
         8 if bits == 32 => Arch::Other, // MIPS
         21 => Arch::Other,              // PowerPC64
         _ => Arch::Other,

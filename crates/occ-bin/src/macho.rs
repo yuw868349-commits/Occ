@@ -17,9 +17,9 @@
 //! it is an anonymous indirect branch.
 
 use occ_core::{
-    Addr, Arch, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind, Linkage,
-    Perm, RelocKind, Relocation, Result, Section, SectionKind, Segment, Symbol, SymbolBinding,
-    SymbolKind, CoreError,
+    Addr, Arch, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId, Import,
+    ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind, Segment,
+    Symbol, SymbolBinding, SymbolKind, CoreError,
 };
 
 use crate::reader::Reader;
@@ -41,6 +41,7 @@ const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
 const LC_FUNCTION_STARTS: u32 = 0x26;
 const LC_MAIN: u32 = 0x8000_0028;
 const LC_REEXPORT_DYLIB: u32 = 0x8000_001f;
+const LC_DYLD_CHAINED_FIXUPS: u32 = 0x8000_0034;
 
 /// Parse a Mach-O or fat Mach-O file.
 pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
@@ -124,7 +125,6 @@ struct Symtab {
 }
 
 struct Seg {
-    #[allow(dead_code)]
     name: String,
     vmaddr: u64,
     vmsize: u64,
@@ -170,6 +170,9 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
     let mut dylibs: Vec<String> = Vec::new();
     let mut bind_info: Option<(u32, u32, u32, u32)> = None;
     let mut export_info: Option<(u32, u32)> = None;
+    let mut function_starts: Option<(u32, u32)> = None;
+    let mut chained: Option<(u32, u32)> = None;
+    let mut thread_entry: Option<u64> = None;
     let mut warnings: Vec<String> = Vec::new();
     let mut pie = false;
 
@@ -282,11 +285,23 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
                     dylibs.push(fixed(data, off + name_off, cmdsize - name_off));
                 }
             }
-            LC_FUNCTION_STARTS => {}
-            LC_UNIXTHREAD if entry_off.is_none() => {
-                warnings.push(
-                    "LC_UNIXTHREAD entry point is not decoded; entry reports the image base".into(),
-                );
+            LC_FUNCTION_STARTS => {
+                function_starts = Some((r.u32(off + 8)?, r.u32(off + 12)?));
+            }
+            LC_DYLD_CHAINED_FIXUPS => {
+                chained = Some((r.u32(off + 8)?, r.u32(off + 12)?));
+            }
+            LC_UNIXTHREAD => {
+                // The thread state is the only place an old-style executable
+                // states where execution begins. Refusing to read it left the
+                // entry at the image base, which is a header, not code.
+                thread_entry = read_thread_entry(&r, data, off, cmdsize, cputype, is64);
+                if thread_entry.is_none() {
+                    warnings.push(
+                        "LC_UNIXTHREAD has no program counter for this CPU; entry stays at the image base"
+                            .into(),
+                    );
+                }
             }
             _ => {}
         }
@@ -307,7 +322,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
             .find(|s| o >= s.fileoff && o < s.fileoff + s.filesize)
             .map(|s| Addr(s.vmaddr + (o - s.fileoff)))
             .unwrap_or(Addr(image_base + o)),
-        None => Addr(image_base),
+        None => thread_entry.map_or(Addr(image_base), Addr),
     };
 
     // An object has no loadable segments: its single `__TEXT` is a section
@@ -353,6 +368,40 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         }
     }
 
+    // Chained fixups are the only import record in a current arm64 binary.
+    if let Some((fix_off, fix_size)) = chained
+        && fix_size > 0
+        && !object
+    {
+        let chained_imports =
+            read_chained_fixups(data, base, fix_off as usize, fix_size as usize, &segs, &dylibs);
+        let before = imports.len();
+        for (name, slot, library) in chained_imports {
+            if let Some(existing) = imports.iter_mut().find(|i| i.name == name) {
+                if existing.slot.is_none() {
+                    existing.slot = Some(slot);
+                }
+                if existing.library.is_none() {
+                    existing.library = library;
+                }
+            } else {
+                imports.push(Import {
+                    name,
+                    library,
+                    ordinal: None,
+                    slot: Some(slot),
+                    kind: ImportKind::Normal,
+                });
+            }
+        }
+        if imports.len() > before {
+            warnings.push(format!(
+                "chained fixups named {} import slot(s)",
+                imports.len() - before
+            ));
+        }
+    }
+
     // Export trie, when present, is more accurate than N_EXT symbols.
     if let Some((export_off, export_size)) = export_info
         && export_size > 0
@@ -366,6 +415,32 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
     imports.sort_by(|a, b| a.name.cmp(&b.name));
     imports.dedup_by(|a, b| a.name == b.name);
     exports.sort_by_key(|e| e.addr);
+    // The compiler's own function list, when the linker kept it.
+    let mut function_bounds = Vec::new();
+    if let Some((starts_off, starts_size)) = function_starts
+        && starts_size > 0
+        && !object
+    {
+        let text_base = segs
+            .iter()
+            .find(|s| s.name == "__TEXT")
+            .map(|s| s.vmaddr)
+            .unwrap_or(image_base);
+        let text_end = segs
+            .iter()
+            .filter(|s| s.vmaddr == text_base)
+            .map(|s| s.vmaddr + s.vmsize)
+            .max()
+            .unwrap_or(text_base);
+        function_bounds = read_function_starts(
+            data,
+            base + starts_off as usize,
+            starts_size as usize,
+            text_base,
+            text_end,
+        );
+    }
+
     let mut relocations = Vec::new();
     for s in &sections {
         // Mach-O section relocations live in the section structure; recording
@@ -418,6 +493,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         fingerprint: fp,
         interpreter: None,
         warnings,
+        function_bounds,
     })
 }
 
@@ -562,6 +638,219 @@ fn read_symbols(
     }
     let _ = data;
     (symbols, imports, exports)
+}
+
+/// Read the program counter out of an `LC_UNIXTHREAD` command.
+///
+/// The command holds a thread state whose layout is the kernel's, not
+/// Mach-O's: a flavour, a count of 32-bit words, then the registers. The
+/// program counter sits at a fixed offset per flavour, and reading the wrong
+/// one would point the analysis into the middle of a function.
+fn read_thread_entry(
+    r: &Reader<'_>,
+    _data: &[u8],
+    off: usize,
+    cmdsize: usize,
+    cputype: u32,
+    _is64: bool,
+) -> Option<u64> {
+    let flavor = r.u32(off + 8).ok()?;
+    let count = r.u32(off + 12).ok()? as usize;
+    let state = off + 16;
+    // The count is in 32-bit words and must fit in the command.
+    if 16 + count.saturating_mul(4) > cmdsize {
+        return None;
+    }
+    match (cputype, flavor) {
+        // x86_THREAD_STATE64: 21 registers, rip is the 17th.
+        (0x0100_0007, 4) => r.u64(state + 16 * 8).ok(),
+        // ARM_THREAD_STATE64: x0..x28, fp, lr, sp, pc. pc follows sp.
+        (0x0100_000c | 0x0200_000c, 6) => r.u64(state + 32 * 8).ok(),
+        // ARM_THREAD_STATE: r0..r12, sp, lr, pc.
+        (12, 1) => r.u32(state + 15 * 4).ok().map(u64::from),
+        // x86_THREAD_STATE32: eax..edi, eip is the 11th word.
+        (7, 1) => r.u32(state + 10 * 4).ok().map(u64::from),
+        _ => None,
+    }
+}
+
+/// Read `LC_FUNCTION_STARTS`.
+///
+/// The payload is a run of ULEB128 deltas from the previous function start,
+/// beginning at the `__TEXT` base, terminated by zero. Every entry is a
+/// function the compiler emitted, including the static ones the symbol table
+/// may have dropped.
+fn read_function_starts(
+    data: &[u8],
+    chunk_off: usize,
+    size: usize,
+    text_base: u64,
+    text_end: u64,
+) -> Vec<FunctionBound> {
+    let Some(chunk) = data.get(chunk_off..chunk_off.saturating_add(size)) else {
+        return Vec::new();
+    };
+    let mut pos = 0usize;
+    let mut addr = text_base;
+    let mut starts: Vec<u64> = Vec::new();
+    while pos < chunk.len() && starts.len() < 1_000_000 {
+        let Some(delta) = uleb(chunk, &mut pos) else { break };
+        if delta == 0 {
+            break;
+        }
+        addr = addr.wrapping_add(delta);
+        starts.push(addr);
+    }
+    let mut out = Vec::with_capacity(starts.len());
+    for (i, start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(text_end).max(*start);
+        out.push(FunctionBound {
+            start: Addr(*start),
+            end: Addr(end),
+            source: "function_starts",
+        });
+    }
+    out
+}
+
+/// Read the bound imports out of `LC_DYLD_CHAINED_FIXUPS`.
+///
+/// Modern arm64 macOS binaries carry no bind opcode stream: the pointers are
+/// encoded in chains, and the only record of which slot holds which import is
+/// the chain itself. Without this the import table of a current binary is
+/// empty, and every call through the GOT is an anonymous indirect branch.
+///
+/// Only the 64-bit pointer formats are decoded. An arm64e image uses
+/// authenticated pointers with a different layout, and guessing at that would
+/// attribute calls to the wrong symbol.
+fn read_chained_fixups(
+    data: &[u8],
+    base: usize,
+    off: usize,
+    size: usize,
+    segs: &[Seg],
+    dylibs: &[String],
+) -> Vec<(String, Addr, Option<String>)> {
+    let mut out = Vec::new();
+    let Some(chunk) = data.get(base + off..base + off + size) else {
+        return out;
+    };
+    let rd = |at: usize| -> Option<u32> {
+        chunk
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let Some(starts_off) = rd(4) else { return out };
+    let Some(imports_off) = rd(8) else { return out };
+    let Some(symbols_off) = rd(12) else { return out };
+    let Some(imports_count) = rd(16) else { return out };
+    let Some(imports_format) = rd(20) else { return out };
+
+    // Import records, then their names in the symbol pool.
+    let import_size = match imports_format {
+        1 | 3 => 4usize,
+        2 => 8,
+        _ => return out,
+    };
+    let mut imports: Vec<(String, Option<String>)> = Vec::new();
+    for i in 0..imports_count as usize {
+        let at = imports_off as usize + i * import_size;
+        let Some(name_off) = (match imports_format {
+            1 => chunk
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f_ffff),
+            2 => chunk
+                .get(at..at + 4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f_ffff),
+            3 => chunk.get(at..at + 8).map(|b| {
+                u32::from_le_bytes([b[4], b[5], b[6], b[7]])
+            }),
+            _ => None,
+        }) else {
+            break;
+        };
+        let ordinal = chunk
+            .get(at..at + import_size)
+            .map(|b| b[0] as usize)
+            .unwrap_or(0);
+        let name_at = symbols_off as usize + name_off as usize;
+        let name = cstr(chunk, name_at);
+        if name.is_empty() {
+            continue;
+        }
+        imports.push((name, dylibs.get(ordinal.saturating_sub(1)).cloned()));
+    }
+
+    // Walks of the chain, segment by segment.
+    let Some(seg_count) = rd(starts_off as usize) else { return out };
+    for s in 0..seg_count as usize {
+        let Some(info_off) = rd(starts_off as usize + 4 + s * 4) else {
+            continue;
+        };
+        if info_off == 0 {
+            continue;
+        }
+        let at = starts_off as usize + info_off as usize;
+        let Some(page_size) = rd(at) else { continue };
+        let Some(format) = chunk.get(at + 4..at + 6).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+            continue;
+        };
+        let Some(page_count) = chunk.get(at + 6..at + 8).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+            continue;
+        };
+        // 1 = PTR_64, 2 = PTR_64_OFFSET; both use the same 64-bit layout.
+        if !matches!(format, 1 | 2) {
+            continue;
+        }
+        let Some(seg) = segs.get(s) else { continue };
+        for page in 0..page_count as usize {
+            let Some(start) = chunk
+                .get(at + 8 + page * 2..at + 10 + page * 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            else {
+                break;
+            };
+            if start == 0xffff {
+                continue;
+            }
+            let mut cursor = seg.vmaddr + (page * page_size as usize) as u64 + u64::from(start);
+            let mut guard = 0usize;
+            while guard < 100_000 {
+                guard += 1;
+                if cursor < seg.vmaddr || cursor >= seg.vmaddr + seg.filesize {
+                    break;
+                }
+                let file_at = (seg.fileoff + (cursor - seg.vmaddr)) as usize;
+                let Some(raw) = chunk.get(file_at..file_at + 8).map(|b| {
+                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+                }) else {
+                    break;
+                };
+                let bind = raw >> 63 != 0;
+                let next = (raw >> 51) & 0xfff;
+                if bind {
+                    let ordinal = (raw & 0xff_ffff) as usize;
+                    if let Some((name, library)) = imports.get(ordinal) {
+                        out.push((name.clone(), Addr(cursor), library.clone()));
+                    }
+                }
+                if next == 0 {
+                    break;
+                }
+                cursor = cursor.wrapping_add(next * 4);
+            }
+        }
+    }
+    out
+}
+
+fn cstr(data: &[u8], off: usize) -> String {
+    if off >= data.len() {
+        return String::new();
+    }
+    let rest = &data[off..];
+    let end = rest.iter().position(|b| *b == 0).unwrap_or(rest.len());
+    String::from_utf8_lossy(&rest[..end]).into_owned()
 }
 
 fn uleb(data: &[u8], pos: &mut usize) -> Option<u64> {

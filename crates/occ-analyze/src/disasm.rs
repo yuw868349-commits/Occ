@@ -85,6 +85,8 @@ struct Seed {
     addr: Addr,
     size: Option<u64>,
     name: Option<String>,
+    /// The container table that stated this extent, when one did.
+    source: Option<&'static str>,
 }
 
 /// Recover functions by recursive descent over a native instruction decoder.
@@ -166,6 +168,18 @@ fn decode_native(
             budget_hit = true;
         }
         let mut f = outcome.func;
+        if let Some(source) = seed.source {
+            f.boundary_confidence = 1.0;
+            f.boundary_evidence.push(Evidence::support(
+                EvidenceKind::Symbol,
+                EvidenceSource::Loader,
+                format!(
+                    "{source} states a {}-byte body at {:#x}",
+                    f.size, f.entry.0
+                ),
+                1.0,
+            ));
+        }
         f.name = seed.name.or(f.name);
         f.is_thunk = is_thunk(&f);
         owned.insert(f.entry.0, f.end().0);
@@ -179,6 +193,7 @@ fn decode_native(
                     addr: callee,
                     size: None,
                     name: None,
+                    source: None,
                 });
             }
         }
@@ -891,7 +906,12 @@ fn collect_seeds(view: &View, thunks: &[(Addr, String)]) -> Vec<Seed> {
     let mut seeds = Vec::new();
     let mut push = |addr: Addr, size: Option<u64>, name: Option<String>| {
         if addressable(view, addr) {
-            seeds.push(Seed { addr, size, name });
+            seeds.push(Seed {
+                addr,
+                size,
+                name,
+                source: None,
+            });
         }
     };
 
@@ -942,6 +962,20 @@ fn collect_seeds(view: &View, thunks: &[(Addr, String)]) -> Vec<Seed> {
             {
                 push(t, None, None);
             }
+        }
+    }
+    drop(push);
+    // Unwind tables and function-start lists name extents outright. They are
+    // seeds, not guesses, and they survive `strip`.
+    for b in &image.function_bounds {
+        if addressable(view, b.start) {
+            let size = (b.end.0 > b.start.0).then_some(b.end.0 - b.start.0);
+            seeds.push(Seed {
+                addr: b.start,
+                size,
+                name: None,
+                source: Some(b.source),
+            });
         }
     }
     seeds
