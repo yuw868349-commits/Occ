@@ -20,6 +20,7 @@ use occ_core::{Addr, Arch, CallTarget, FlowKind, Instruction, MAX_INSN_LEN};
 use crate::Decoded;
 
 mod simd;
+mod sve;
 
 /// Registers 0..30, plus the zero register.
 const XZR: [&str; 32] = [
@@ -238,7 +239,7 @@ fn decode_word(origin: Addr, word: u32) -> R {
                 return r;
             }
         }
-        0b0010 => return undefined(origin, word, "SVE"),
+        0b0010 => return sve::decode(origin, word),
         0b0111 | 0b1111 => return simd::decode(origin, word),
         _ => {}
     }
