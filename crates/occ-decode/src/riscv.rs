@@ -24,6 +24,13 @@ const REGS: [&str; 32] = [
     "t5", "t6",
 ];
 
+/// Floating-point register names, ABI spelling.
+const FREGS: [&str; 32] = [
+    "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7", "fs0", "fs1", "fa0", "fa1", "fa2",
+    "fa3", "fa4", "fa5", "fa6", "fa7", "fs2", "fs3", "fs4", "fs5", "fs6", "fs7", "fs8", "fs9",
+    "fs10", "fs11", "ft8", "ft9", "ft10", "ft11",
+];
+
 const BRANCHES: [&str; 8] = ["beq", "bne", "?", "?", "blt", "bge", "bltu", "bgeu"];
 const LOADS: [&str; 8] = ["lb", "lh", "lw", "ld", "lbu", "lhu", "lwu", "?"];
 const STORES: [&str; 8] = ["sb", "sh", "sw", "sd", "?", "?", "?", "?"];
@@ -43,6 +50,10 @@ const fn sext(v: u32, n: u32) -> i64 {
 
 fn reg(n: u32) -> &'static str {
     REGS[n as usize & 31]
+}
+
+fn freg(n: u32) -> &'static str {
+    FREGS[n as usize & 31]
 }
 
 /// Decoder bound to one width.
@@ -426,6 +437,155 @@ impl Decoder {
                     }
                 }
             },
+            0x07 => {
+                // Floating-point load.
+                let imm = sext(bits(w, 31, 20), 12);
+                let mn = match funct3 {
+                    2 => "flw",
+                    3 => "fld",
+                    _ => return undefined(origin, w, "reserved fp load"),
+                };
+                R::new(
+                    mn,
+                    format!("{mn} {}, {}({})", freg(rd), imm, reg(rs1)),
+                )
+            }
+            0x27 => {
+                // Floating-point store.
+                let imm = sext(bits(w, 31, 25) << 5 | bits(w, 11, 7), 12);
+                let mn = match funct3 {
+                    2 => "fsw",
+                    3 => "fsd",
+                    _ => return undefined(origin, w, "reserved fp store"),
+                };
+                R::new(
+                    mn,
+                    format!("{mn} {}, {}({})", freg(rs2), imm, reg(rs1)),
+                )
+            }
+            0x43 | 0x47 | 0x4b | 0x4f => {
+                // Fused multiply-add family. fmt occupies bits 26:25, and the
+                // third source is the funct7 field.
+                let fmt = bits(w, 26, 25);
+                let suffix = match fmt {
+                    0 => "s",
+                    1 => "d",
+                    _ => return undefined(origin, w, "reserved fp format"),
+                };
+                let mn = match opcode {
+                    0x43 => "fmadd",
+                    0x47 => "fmsub",
+                    0x4b => "fnmsub",
+                    _ => "fnmadd",
+                };
+                R::new(
+                    mn,
+                    format!(
+                        "{mn}.{suffix} {}, {}, {}, {}",
+                        freg(rd),
+                        freg(rs1),
+                        freg(rs2),
+                        freg(bits(w, 31, 27))
+                    ),
+                )
+            }
+            0x53 => {
+                // OP-FP. funct5 selects the operation, fmt the width, and for
+                // the converting forms rs2 names the other width.
+                let fmt = funct7 & 0b11;
+                let suffix = match fmt {
+                    0 => "s",
+                    1 => "d",
+                    _ => return undefined(origin, w, "reserved fp format"),
+                };
+                let funct5 = funct7 >> 2;
+                match funct5 {
+                    0x00 => R::new("fadd", format!("fadd.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
+                    0x01 => R::new("fsub", format!("fsub.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
+                    0x02 => R::new("fmul", format!("fmul.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
+                    0x03 => R::new("fdiv", format!("fdiv.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
+                    0x0b if rs2 == 0 => R::new("fsqrt", format!("fsqrt.{suffix} {}, {}", freg(rd), freg(rs1))),
+                    0x04 => {
+                        let mn = match funct3 {
+                            0 => "fsgnj",
+                            1 => "fsgnjn",
+                            2 => "fsgnjx",
+                            _ => return undefined(origin, w, "reserved fsgnj"),
+                        };
+                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)))
+                    }
+                    0x05 => {
+                        let mn = match funct3 {
+                            0 => "fmin",
+                            1 => "fmax",
+                            _ => return undefined(origin, w, "reserved fmin"),
+                        };
+                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)))
+                    }
+                    0x08 => {
+                        // fcvt: rs2 names the source format.
+                        let (to, from) = match (fmt, rs2) {
+                            (0, 1) => ("s", "d"),
+                            (1, 0) => ("d", "s"),
+                            _ => return undefined(origin, w, "reserved fcvt width"),
+                        };
+                        R::new(
+                            "fcvt",
+                            format!("fcvt.{to}.{from} {}, {}", freg(rd), freg(rs1)),
+                        )
+                    }
+                    0x14 => {
+                        let mn = match funct3 {
+                            0 => "feq",
+                            1 => "flt",
+                            2 => "fle",
+                            _ => return undefined(origin, w, "reserved fcmp"),
+                        };
+                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", reg(rd), freg(rs1), freg(rs2)))
+                    }
+                    0x18 => {
+                        // Float to integer.
+                        let mn = match rs2 {
+                            0 => "fcvt.w",
+                            1 => "fcvt.wu",
+                            2 if self.bits == 64 => "fcvt.l",
+                            3 if self.bits == 64 => "fcvt.lu",
+                            _ => return undefined(origin, w, "reserved fcvt to int"),
+                        };
+                        R::new(mn, format!("{mn}.{suffix} {}, {}", reg(rd), freg(rs1)))
+                    }
+                    0x1a => {
+                        // Integer to float.
+                        let from = match rs2 {
+                            0 => "w",
+                            1 => "wu",
+                            2 if self.bits == 64 => "l",
+                            3 if self.bits == 64 => "lu",
+                            _ => return undefined(origin, w, "reserved fcvt from int"),
+                        };
+                        R::new(
+                            "fcvt",
+                            format!("fcvt.{suffix}.{from} {}, {}", freg(rd), reg(rs1)),
+                        )
+                    }
+                    0x1c => match rs2 {
+                        0 => R::new(
+                            "fmv.x",
+                            format!("fmv.x.{suffix} {}, {}", reg(rd), freg(rs1)),
+                        ),
+                        1 => R::new(
+                            "fclass",
+                            format!("fclass.{suffix} {}, {}", reg(rd), freg(rs1)),
+                        ),
+                        _ => undefined(origin, w, "reserved fp move"),
+                    },
+                    0x1e if rs2 == 0 => R::new(
+                        "fmv",
+                        format!("fmv.{suffix}.x {}, {}", freg(rd), reg(rs1)),
+                    ),
+                    _ => undefined(origin, w, "reserved op-fp"),
+                }
+            }
             0x2f => {
                 // Atomic memory operations, RV64/RV32 word and doubleword.
                 let funct5 = bits(w, 31, 27);

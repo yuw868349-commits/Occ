@@ -19,6 +19,8 @@ use occ_core::{Addr, Arch, CallTarget, FlowKind, Instruction, MAX_INSN_LEN};
 
 use crate::Decoded;
 
+mod simd;
+
 /// Registers 0..30, plus the zero register.
 const XZR: [&str; 32] = [
     "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
@@ -220,7 +222,13 @@ fn decode_word(origin: Addr, word: u32) -> R {
                 return r;
             }
         }
+        // The structure loads and stores sit inside the load/store group by
+        // their top bits but are Advanced SIMD instructions: they move a list
+        // of vectors, so they belong to the SIMD decoder.
         g if g & 0b0101 == 0b0100 => {
+            if matches!(bits(word, 28, 24), 0b01100 | 0b01101) {
+                return simd::decode(origin, word);
+            }
             if let Some(r) = load_store(origin, word) {
                 return r;
             }
@@ -230,7 +238,8 @@ fn decode_word(origin: Addr, word: u32) -> R {
                 return r;
             }
         }
-        0b0111 | 0b1111 => return undefined(origin, word, "SIMD/FP"),
+        0b0010 => return undefined(origin, word, "SVE"),
+        0b0111 | 0b1111 => return simd::decode(origin, word),
         _ => {}
     }
     undefined(origin, word, "unimplemented encoding")
@@ -846,11 +855,20 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
         let imm = sext(bits(word, 23, 5) << 2, 21);
         let to = origin.offset(imm);
         let rt = bits(word, 4, 0);
-        let (mn, name) = match opc {
-            0 => ("ldr", w(rt)),
-            1 => ("ldr", x(rt)),
-            2 => ("ldrsw", x(rt)),
-            _ => ("prfm", x(rt)),
+        let (mn, name) = if word & 0x0400_0000 != 0 {
+            match opc {
+                0 => ("ldr", format!("s{rt}")),
+                1 => ("ldr", format!("d{rt}")),
+                2 => ("ldr", format!("q{rt}")),
+                _ => return None,
+            }
+        } else {
+            match opc {
+                0 => ("ldr", w(rt).to_string()),
+                1 => ("ldr", x(rt).to_string()),
+                2 => ("ldrsw", x(rt).to_string()),
+                _ => ("prfm", x(rt).to_string()),
+            }
         };
         let mut r = R::new(mn, format!("{mn} {name}, {to}")).with_pc(to);
         r.reads.push(to);
@@ -859,6 +877,7 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
 
     // Load/store pair.
     if word & 0x3a00_0000 == 0x2800_0000 {
+        let vector = word & 0x0400_0000 != 0;
         let opc = bits(word, 31, 30);
         let load = word & 0x0040_0000 != 0;
         let mode = bits(word, 24, 23);
@@ -866,15 +885,29 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
         let rt2 = bits(word, 14, 10);
         let rn = bits(word, 9, 5);
         let rt = bits(word, 4, 0);
-        let (width, wide) = match opc {
-            0 => (4i64, false),
-            2 => (8i64, true),
-            1 if load => (4i64, true), // LDPSW sign-extends into X registers
+        // With V set the pair moves FP/SIMD registers and `opc` is their
+        // width: 4, 8 or 16 bytes.
+        let (width, wide) = match (vector, opc) {
+            (true, 0) => (4i64, false),
+            (true, 1) => (8i64, false),
+            (true, 2) => (16i64, false),
+            (true, 3) => return None,
+            (false, 0) => (4i64, false),
+            (false, 2) => (8i64, true),
+            (false, 1) if load => (4i64, true), // LDPSW sign-extends into X registers
             _ => return None,
         };
         let off = imm7 * width;
         let mn = if load { "ldp" } else { "stp" };
-        let (a, b) = (r(wide, rt), r(wide, rt2));
+        let (a, b) = if vector {
+            match opc {
+                0 => (format!("s{rt}"), format!("s{rt2}")),
+                1 => (format!("d{rt}"), format!("d{rt2}")),
+                _ => (format!("q{rt}"), format!("q{rt2}")),
+            }
+        } else {
+            (r(wide, rt).to_string(), r(wide, rt2).to_string())
+        };
         let base = xsp(rn);
         let text = match mode {
             0b01 => format!("{mn} {a}, {b}, [{base}], #{off}"),
@@ -884,8 +917,15 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
         return Some(R::new(mn, text));
     }
 
+    // Single-register loads and stores. Bit 26 turns the group from general
+    // purpose registers to FP/SIMD ones, which moves the encoding from the
+    // 0x38/0x39 pair to 0x3c/0x3d.
+    let vector = word & 0x0400_0000 != 0;
     let top = (word >> 24) & 0x3f;
-    if top != 0x39 && top != 0x38 {
+    let known = top == 0x39
+        || top == 0x38
+        || (vector && (top == 0x3d || top == 0x3c));
+    if !known {
         return None;
     }
 
@@ -893,6 +933,23 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
     let opc = bits(word, 23, 22);
     let rn = bits(word, 9, 5);
     let rt = bits(word, 4, 0);
+
+    // A vector access names its register width in `size` and the transfer
+    // direction in `opc`, with the quadword form moving to `size` zero so that
+    // its own bit 22 can be set. `opc` is 00 or 01 for a store and a load of a
+    // 32- or 64-bit register, and 10 or 11 for the same of a 128-bit one.
+    if vector {
+        let (mn, name, scale) = match (size, opc) {
+            (2, 0) => ("str", format!("s{rt}"), 2),
+            (2, 1) => ("ldr", format!("s{rt}"), 2),
+            (3, 0) => ("str", format!("d{rt}"), 3),
+            (3, 1) => ("ldr", format!("d{rt}"), 3),
+            (0, 2) => ("str", format!("q{rt}"), 4),
+            (0, 3) => ("ldr", format!("q{rt}"), 4),
+            _ => return None,
+        };
+        return address_form(word, mn, &name, scale, rn, top == 0x3d);
+    }
 
     // Mnemonic, destination width and store flag from (size, opc).
     let (mn, wide, _store) = match (size, opc) {
@@ -937,19 +994,31 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
         ),
         _ => return None,
     };
-    let rt_name = r(wide, rt);
+    let rt_name = r(wide, rt).to_string();
+    address_form(word, mn, &rt_name, size, rn, top == 0x39)
+}
 
-    if top == 0x39 {
-        // Unsigned offset: imm12 scaled by the access size.
-        let imm = bits(word, 21, 10) << size;
+/// Render the addressing form of a single-register load or store: unsigned
+/// offset (`unsigned`), and the unscaled, pre/post-indexed and register-offset
+/// forms that share bits 11:10 as a mode selector. `scale` is the access size
+/// in log2 bytes, which both the unsigned-offset immediate and the register
+/// offset shift use.
+fn address_form(
+    word: u32,
+    mn: &'static str,
+    rt_name: &str,
+    scale: u32,
+    rn: u32,
+    unsigned: bool,
+) -> Option<R> {
+    if unsigned {
+        let imm = bits(word, 21, 10) << scale;
         return Some(R::new(
             mn,
             format!("{mn} {rt_name}, [{}, #{imm}]", xsp(rn)),
         ));
     }
-
-    let sub = bits(word, 11, 10);
-    match sub {
+    match bits(word, 11, 10) {
         0b00 => {
             let imm = sext(bits(word, 20, 12), 9);
             Some(R::new(
@@ -979,7 +1048,7 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
             let idx = if matches!(option, 3 | 7) { x(rm) } else { w(rm) };
             let mut operand = format!("{idx}, {ext}");
             if s {
-                operand.push_str(&format!(" #{size}"));
+                operand.push_str(&format!(" #{scale}"));
             }
             Some(R::new(
                 mn,
