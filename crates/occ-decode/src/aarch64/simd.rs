@@ -799,7 +799,7 @@ fn shape_operands(shape: Shape, q: bool, size: u32, rd: u32, rn: u32, extra: &st
             "{}, {}, #{}",
             vreg(rd, arrangement(true, size + 1)),
             vreg(rn, arrangement(q, size)),
-            (8u32 << size) + 0
+            8u32 << size
         ),
     };
     Some(text)
@@ -1699,64 +1699,112 @@ fn structure_mnemonic(load: bool, count: u32, replicate: bool) -> &'static str {
 }
 
 /// Structure loads and stores. `single` selects the lane and replicate shapes
-/// (`op1` = 01101) from the multiple-structure shape (`op1` = 01100); the count
-/// is carried in bits 13 and 21 and the load bit in 22. `Rm` names the
-/// writeback register, with 31 meaning "post-index by the structure size".
+/// (`op1` = 01101) from the multiple-structure shape (`op1` = 01100).
+///
+/// For the multiple-structure shape the opcode in bits 15:12 names the register
+/// count directly (0 -> 4, 4 -> 3, 8 -> 2, and 2/6/7/10 -> 1). For the
+/// single-structure shape bit 21 halves the count (1/3 vs 2/4) and bits 15:13
+/// pick the element width and whether the form replicates; the lane index is
+/// packed into `Q : bit12 : size` and right-shifted by the element width.
+/// `Rm` = 31 means post-index by the transfer size, `Rm` = 30 means `x30`, and
+/// any other value with bit 23 set is a register post-index.
 fn structure(word: u32, q: bool, single: bool) -> Result<R, &'static str> {
     let load = bits(word, 22, 22) == 1;
     let rd = bits(word, 4, 0);
     let rn = bits(word, 9, 5);
     let rm = bits(word, 20, 16);
     let size = bits(word, 11, 10);
-    let (count, arrangement, lane, stride) = if !single {
-        // Multiple structures: the opcode field names the count.
-        let count = match bits(word, 15, 12) {
-            0b0111 => 1,
-            0b1000 => 2,
-            0b0100 => 3,
-            0b0000 => 4,
+    let opc = bits(word, 15, 12);
+    let post = bits(word, 23, 23) == 1;
+
+    // With no post-index the offset register field must be clear: it only
+    // carries a meaning when bit 23 says the form writes back. Bit 21 is part
+    // of the multiple-structure encoding and must be clear there; in the
+    // single-structure group it instead halves the register count.
+    if !post && rm != 0 {
+        return Err("SIMD/FP structure (unallocated)");
+    }
+    if !single && bits(word, 21, 21) == 1 {
+        return Err("SIMD/FP structure (unallocated)");
+    }
+    let (count, reg_arr, lane, stride) = if !single {
+        let count = match opc {
+            0 => 4,
+            4 => 3,
+            8 => 2,
+            2 | 6 | 7 | 10 => 1,
             _ => return Err("SIMD/FP structure load (unallocated)"),
         };
+        // A 64-bit element only has one lane at `Q = 0`, and the multiple-
+        // structure forms need at least two.
+        if size == 3 && !q {
+            return Err("SIMD/FP structure load (unallocated)");
+        }
         let a = arrangement(q, size);
         (count, a, None, count * (8 << (q as u32)))
-    } else if bits(word, 12, 12) == 0 {
-        // A single lane: the index is packed into the size and count bits.
-        let count = 1 + bits(word, 13, 13) * 2 + bits(word, 21, 21);
-        let (a, lane) = match size {
-            0 => (arrangement(q, 0), bits(word, 12, 10) | (bits(word, 30, 30) << 3)),
-            1 => (arrangement(q, 1), bits(word, 12, 11) | (bits(word, 30, 30) << 2)),
-            2 => (arrangement(q, 2), bits(word, 12, 12) | (bits(word, 30, 30) << 1)),
-            _ => (arrangement(q, 3), bits(word, 30, 30)),
-        };
-        (count, a, Some(lane), count * (8 << size))
     } else {
-        // Replicating load: bit 12 = 1, `op` = 3..6 by count.
-        if !load {
-            return Err("SIMD/FP structure store (unallocated)");
+        let b21 = bits(word, 21, 21);
+        let count = 1 + b21 + 2 * ((opc >> 1) & 1);
+        if opc & 0b1100 == 0b1100 {
+            if !load || opc & 1 == 1 {
+                return Err("SIMD/FP structure replicate (unallocated)");
+            }
+            let a = arrangement(q, size);
+            (count, a, None, count << size)
+        } else {
+            let packed = (bits(word, 30, 30) << 3) | ((opc & 1) << 2) | size;
+            // The low bits of `packed` below the element width are a marker,
+            // not part of the index, and the encoding only exists when they
+            // match the width: `001` for a double, zero otherwise.
+            let (elem, shift) = match (opc >> 2) & 3 {
+                0 => ("b", 0u32),
+                1 => ("h", 1),
+                _ => {
+                    if size & 1 == 0 {
+                        ("s", 2)
+                    } else {
+                        ("d", 3)
+                    }
+                }
+            };
+            let marker = if shift == 3 { 1 } else { 0 };
+            if packed & ((1 << shift) - 1) != marker {
+                return Err("SIMD/FP structure lane (unallocated)");
+            }
+            let lane = packed >> shift;
+            let lanes = (if q { 16 } else { 8 }) >> shift;
+            if lane >= lanes {
+                return Err("SIMD/FP structure lane (unallocated)");
+            }
+            (count, elem, Some(lane), count << shift)
         }
-        let count = 1 + bits(word, 13, 13) * 2 + bits(word, 21, 21);
-        (count, arrangement(q, size), None, count * (8 << size))
     };
-    if count > 4 {
-        return Err("SIMD/FP structure load (unallocated)");
-    }
-    let mn = structure_mnemonic(load, count, single && bits(word, 12, 12) == 1);
+    let mn = structure_mnemonic(load, count, single && opc & 0b1100 == 0b1100);
     let mut list = String::from("{ ");
     for i in 0..count {
         if i > 0 {
             list.push_str(", ");
         }
-        list.push_str(&vreg((rd + i) & 31, arrangement));
+        if single && lane.is_some() {
+            list.push_str(&format!("v{}.{reg_arr}", (rd + i) & 31));
+        } else {
+            list.push_str(&vreg((rd + i) & 31, reg_arr));
+        }
     }
-    list.push_str(" }");
     if let Some(lane) = lane {
-        list.push_str(&format!("[{lane}]"));
+        list.push_str(&format!("}}[{lane}]"));
+    } else {
+        list.push_str(" }");
     }
     let base = format!("x{rn}");
-    let text = match rm {
-        31 => format!("{mn} {list}, [{base}], #{stride}"),
-        30 => format!("{mn} {list}, [{base}], x30"),
-        _ => format!("{mn} {list}, [{base}]"),
+    let text = if !post {
+        format!("{mn} {list}, [{base}]")
+    } else {
+        match rm {
+            31 => format!("{mn} {list}, [{base}], #{stride}"),
+            30 => format!("{mn} {list}, [{base}], x30"),
+            _ => format!("{mn} {list}, [{base}], x{rm}"),
+        }
     };
     Ok(R::new(mn, text))
 }

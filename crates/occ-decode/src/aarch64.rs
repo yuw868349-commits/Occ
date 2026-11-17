@@ -226,7 +226,7 @@ fn decode_word(origin: Addr, word: u32) -> R {
         // their top bits but are Advanced SIMD instructions: they move a list
         // of vectors, so they belong to the SIMD decoder.
         g if g & 0b0101 == 0b0100 => {
-            if matches!(bits(word, 28, 24), 0b01100 | 0b01101) {
+            if matches!(bits(word, 29, 24), 0b001100 | 0b001101) {
                 return simd::decode(origin, word);
             }
             if let Some(r) = load_store(origin, word) {
