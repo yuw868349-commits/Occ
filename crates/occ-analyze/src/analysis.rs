@@ -52,12 +52,29 @@ impl Default for AnalysisOptions {
 pub struct Coverage {
     /// Executable bytes declared by sections.
     pub code_bytes: u64,
-    /// Bytes an instruction covers, unioned across functions.
+    /// Bytes covered by instructions the decoder understood, unioned across
+    /// functions.
     ///
-    /// This is the number the summary means by "code decoded". It is not the
-    /// same as the space the functions claim: a body can jump over a chunk the
-    /// recovery never followed, and counting the range would report those bytes
-    /// as decoded when nothing reads them.
+    /// This, not [`decoded_bytes`](Self::decoded_bytes), is what "code
+    /// decoded" means. A byte the decoder had to emit as `.word` was read but
+    /// not understood: counting it as decoded let a NEON kernel report 100%
+    /// while five of its six instructions were data directives.
+    ///
+    /// It is also not the space the functions claim: a body can jump over a
+    /// chunk the recovery never followed, and counting the range would report
+    /// those bytes as decoded when nothing reads them.
+    pub insn_bytes: u64,
+    /// Bytes covered by data directives the decoder emitted where it could
+    /// not decode an instruction.
+    ///
+    /// These bytes are accounted for — the stream stayed aligned — but no
+    /// instruction was understood, so they are reported separately instead of
+    /// inflating the decoded fraction.
+    pub unparsed_bytes: u64,
+    /// Bytes covered by any decoded unit: instructions plus data directives.
+    ///
+    /// `decoded_bytes == insn_bytes + unparsed_bytes`; overlaps between the
+    /// two are resolved in favour of `insn_bytes`.
     pub decoded_bytes: u64,
     /// Bytes inside a recovered function's range, holes included.
     pub covered_bytes: u64,
@@ -70,8 +87,24 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// Fraction of executable bytes inside a function, `0.0..=1.0`.
+    /// Fraction of executable bytes the decoder understood, `0.0..=1.0`.
+    ///
+    /// Data directives do not count: a `.word` is a byte that was skipped, not
+    /// one that was decoded.
     pub fn fraction(&self) -> f32 {
+        if self.code_bytes == 0 {
+            0.0
+        } else {
+            (self.insn_bytes as f32 / self.code_bytes as f32).min(1.0)
+        }
+    }
+
+    /// Fraction of executable bytes that any decoded unit covers, including
+    /// data directives, `0.0..=1.0`.
+    ///
+    /// This answers "did the recovery walk these bytes", not "did it
+    /// understand them".
+    pub fn accounted_fraction(&self) -> f32 {
         if self.code_bytes == 0 {
             0.0
         } else {
@@ -131,8 +164,11 @@ impl Analysis {
         }
 
         // Union, not sum: two functions that overlap (a shared tail, a
-        // mis-recovered bound) must not push coverage past 100%.
-        let decoded_bytes = insn_bytes(&functions);
+        // mis-recovered bound) must not push coverage past 100%. Instructions
+        // and data directives are counted separately so that a `.word` cannot
+        // pass for understanding.
+        let (insn_bytes, unparsed_bytes) = byte_accounting(&functions);
+        let decoded_bytes = insn_bytes + unparsed_bytes;
         let covered_bytes = union_len(&functions);
         let blocks = functions.iter().map(|f| f.blocks.len()).sum();
         let insns = functions.iter().map(|f| f.insns.len()).sum();
@@ -146,6 +182,8 @@ impl Analysis {
         Analysis {
             coverage: Coverage {
                 code_bytes: rec.code_bytes,
+                insn_bytes,
+                unparsed_bytes,
                 decoded_bytes,
                 covered_bytes,
                 functions: functions.len(),
@@ -266,20 +304,80 @@ fn union_len(functions: &[Function]) -> u64 {
     span_union(ranges)
 }
 
-/// Total bytes covered by the union of decoded instructions.
+/// Total bytes covered by the union of decoded units, split by whether the
+/// decoder understood them.
 ///
 /// A function's range can be larger than the instructions inside it, so this is
 /// the only count that answers "was this byte decoded". Overlaps are unioned
 /// for the same reason as above: two functions that share a tail are one run of
 /// bytes, not two.
-fn insn_bytes(functions: &[Function]) -> u64 {
-    let mut ranges: Vec<(u64, u64)> = functions
+///
+/// Data directives — `.byte`, `.word`, and the other forms the decoders emit
+/// when an encoding is not understood — cover bytes without decoding anything.
+/// They are counted in `unparsed_bytes`, never in `insn_bytes`. When a byte is
+/// covered by both a real instruction and a directive (one function sharing a
+/// tail with another that mis-read it as data), the instruction wins: something
+/// did understand that byte.
+///
+/// Returns `(instruction bytes, data-directive bytes)`.
+fn byte_accounting(functions: &[Function]) -> (u64, u64) {
+    // (start, end, is_data)
+    let mut ranges: Vec<(u64, u64, bool)> = functions
         .iter()
-        .flat_map(|f| f.insns.iter().map(|i| (i.addr.0, i.end().0)))
-        .filter(|(a, b)| b > a)
+        .flat_map(|f| {
+            f.insns.iter().map(|i| {
+                (
+                    i.addr.0,
+                    i.end().0,
+                    i.mnemonic.starts_with('.'),
+                )
+            })
+        })
+        .filter(|(a, b, _)| b > a)
         .collect();
-    ranges.sort_unstable();
-    span_union(ranges)
+    if ranges.is_empty() {
+        return (0, 0);
+    }
+    ranges.sort_unstable_by_key(|r| r.0);
+
+    // Sweep the endpoints. Depths are per kind; a byte is understood when at
+    // least one instruction covers it, whatever else also covers it.
+    let mut events: Vec<(u64, i32, i32)> = Vec::with_capacity(ranges.len() * 2);
+    for (a, b, is_data) in ranges {
+        if is_data {
+            events.push((a, 1, 0));
+            events.push((b, -1, 0));
+        } else {
+            events.push((a, 0, 1));
+            events.push((b, 0, -1));
+        }
+    }
+    events.sort_unstable_by_key(|e| e.0);
+
+    let mut insn_depth = 0i64;
+    let mut data_depth = 0i64;
+    let mut understood = 0u64;
+    let mut unparsed = 0u64;
+    let mut prev = events[0].0;
+    let mut i = 0;
+    while i < events.len() {
+        let at = events[i].0;
+        if at > prev {
+            let len = at - prev;
+            if insn_depth > 0 {
+                understood += len;
+            } else if data_depth > 0 {
+                unparsed += len;
+            }
+        }
+        while i < events.len() && events[i].0 == at {
+            data_depth += i64::from(events[i].1);
+            insn_depth += i64::from(events[i].2);
+            i += 1;
+        }
+        prev = at;
+    }
+    (understood, unparsed)
 }
 
 fn span_union(ranges: Vec<(u64, u64)>) -> u64 {
