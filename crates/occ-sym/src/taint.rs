@@ -500,6 +500,7 @@ fn collect_into(e: &Expr, state: &Taint, out: &mut Labels) {
             // And the pointer itself: `*p` inherits `p`.
             collect_into(addr, state, out);
         }
+        Expr::Member { base, .. } => collect_into(base, state, out),
         Expr::Bin { lhs, rhs, .. } => {
             collect_into(lhs, state, out);
             collect_into(rhs, state, out);
