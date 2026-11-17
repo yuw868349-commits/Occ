@@ -127,6 +127,7 @@ fn group_a(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x04 => integer_04(origin, word),
         0x24 => compare_24(origin, word),
+        0x84 => gather_84_85(origin, word),
         0xC4 => gather_c45(origin, word),
         0xE4 => store_e45(origin, word),
         _ => undefined(origin, word, "SVE (unimplemented family)"),
@@ -139,6 +140,7 @@ fn group_b(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x05 => permute_05(origin, word),
         0x25 => integer_25(origin, word),
+        0x85 => gather_84_85(origin, word),
         0xC5 => gather_c45(origin, word),
         0xE5 => store_e45(origin, word),
         _ => undefined(origin, word, "SVE (unimplemented family)"),
@@ -3024,6 +3026,310 @@ fn prfop_text(prfop: u32) -> String {
         13 => "pstl3strm".to_string(),
         v => format!("#0x{v:x}"),
     }
+}
+
+// === top bytes 0x84/0x85: SVE 32-bit gathers, prefetches and replicates ====
+//
+// Both top bytes sit in the same encoding space, `Inst{31-25} = 0b1000010`,
+// and hold ten instruction classes.  Each class fixes enough bits that no
+// two of them can claim the same word:
+//
+//   sve_mem_32b_gld_sv        scalar base plus a vector of offsets
+//   sve_mem_32b_prfm_sv       the same shape, as a prefetch
+//   sve_mem_32b_gld_vi        a vector of pointers plus an immediate index
+//   sve_mem_ld_dup            LD1R, a replicated load with an immediate
+//   sve2_mem_gldnt_vs_base    LDNT1x, a vector of pointers plus a scalar
+//   sve_mem_prfm_ss           prefetch, scalar base plus scalar offset
+//   sve_mem_32b_prfm_vi       prefetch, a vector of pointers plus an index
+//   sve_mem_prfm_si           prefetch, predicate, immediate scaled by VL
+//   sve_mem_z_fill            LDR (vector, immediate) scaled by VL
+//   sve_mem_p_fill            LDR (predicate, immediate) scaled by VL
+//
+// The two top bytes differ only in bit 24, which is the most significant
+// bit of the four-bit opcode of the gather loads and one half of the
+// dtype field of the replicate loads.  A zero in bit 24 selects the
+// 8-bit and 16-bit accesses, a one selects the 32-bit and 64-bit ones.
+
+/// Decode one word of the SVE 32-bit gather space.
+fn gather_84_85(origin: Addr, word: u32) -> R {
+    match gather_84_85_text(word) {
+        Ok((mn, text)) => R::new(mn, text),
+        Err(family) => undefined(origin, word, family),
+    }
+}
+
+/// The printed form of one word of the 32-bit gather space.
+fn gather_84_85_text(word: u32) -> GatherText {
+    if bits(word, 31, 25) != 0b1000010 {
+        return Err("SVE 32-bit gather (unallocated)");
+    }
+    let pg = bits(word, 12, 10);
+    let rn = bits(word, 9, 5);
+    let rt = bits(word, 4, 0);
+    // The four-bit opcode of the 32-bit gather loads: bit 24 comes first,
+    // then bit 23, then the two bits below the predicate field.
+    let opc = (bits(word, 24, 24) << 3) | (bits(word, 23, 23) << 2) | bits(word, 14, 13);
+
+    // `sve_mem_z_fill` and `sve_mem_p_fill`: a whole vector or predicate
+    // loaded from memory, with the offset scaled by the vector length.
+    let kind = bits(word, 15, 13);
+    if bits(word, 31, 22) == 0b1000010110 && matches!(kind, 0b010 | 0b000) {
+        let imm9 = (bits(word, 21, 16) << 3) | bits(word, 12, 10);
+        let v = simm_value(imm9, 9);
+        let dst = if kind == 0b010 {
+            format!("z{rt}")
+        } else {
+            // A predicate register only names p0 to p15.
+            if rt > 15 {
+                return Err("SVE 32-bit gather (unallocated)");
+            }
+            format!("p{rt}")
+        };
+        let mem = if v == 0 {
+            format!("[{}]", sp_reg(rn))
+        } else {
+            format!("[{}, {}, mul vl]", sp_reg(rn), imm_text(v))
+        };
+        return Ok(("ldr", format!("ldr\t{dst}, {mem}")));
+    }
+
+    if bits(word, 15, 15) == 0 {
+        // `sve_mem_prfm_si`: a prefetch of a whole vector, with the offset
+        // scaled by the vector length.
+        if bits(word, 31, 22) == 0b1000010111 {
+            if bits(word, 4, 4) != 0 {
+                return Err("SVE 32-bit gather (unallocated)");
+            }
+            let msz = bits(word, 14, 13);
+            let v = simm_value(bits(word, 21, 16), 6);
+            let mem = if v == 0 {
+                format!("[{}]", sp_reg(rn))
+            } else {
+                format!("[{}, {}, mul vl]", sp_reg(rn), imm_text(v))
+            };
+            let prf = prf_mnemonic(msz);
+            return Ok((
+                prf,
+                format!(
+                    "{prf}\t{}, p{pg}, {mem}",
+                    prfop_text(bits(word, 3, 0))
+                ),
+            ));
+        }
+
+        // `sve_mem_32b_prfm_sv`: a prefetch from a base register with the
+        // offsets held in a vector.
+        if bits(word, 24, 23) == 0b00 && bits(word, 21, 21) == 1 {
+            if bits(word, 4, 4) != 0 {
+                return Err("SVE 32-bit gather (unallocated)");
+            }
+            let msz = bits(word, 14, 13);
+            let xs = bits(word, 22, 22) == 1;
+            let mut ext = if xs { "sxtw" } else { "uxtw" }.to_string();
+            if msz != 0 {
+                ext.push_str(&format!(" #{msz}"));
+            }
+            let zm = bits(word, 20, 16);
+            let prf = prf_mnemonic(msz);
+            return Ok((
+                prf,
+                format!(
+                    "{prf}\t{}, p{pg}, [{}, z{zm}.s, {ext}]",
+                    prfop_text(bits(word, 3, 0)),
+                    sp_reg(rn)
+                ),
+            ));
+        }
+
+        // `sve_mem_32b_gld_sv`: a gather from a base register with the
+        // offsets held in a vector.
+        let Some((mn, esz)) = gld32_opc(opc) else {
+            return Err("SVE 32-bit gather (unallocated)");
+        };
+        let xs = bits(word, 22, 22) == 1;
+        let scaled = bits(word, 21, 21) == 1;
+        // Byte accesses have no scaled form.
+        if esz == 1 && scaled {
+            return Err("SVE 32-bit gather (unallocated)");
+        }
+        let mut ext = if xs { "sxtw" } else { "uxtw" }.to_string();
+        if scaled {
+            ext.push_str(&format!(" #{}", esz.trailing_zeros()));
+        }
+        let zm = bits(word, 20, 16);
+        return Ok((
+            mn,
+            format!(
+                "{mn}\t{{ z{rt}.s }}, p{pg}/z, [{}, z{zm}.s, {ext}]",
+                sp_reg(rn)
+            ),
+        ));
+    }
+
+    // `sve_mem_32b_gld_vi`: a gather from a vector of pointers, indexed by
+    // an immediate.
+    if bits(word, 22, 21) == 0b01 {
+        let Some((mn, esz)) = gld32_opc(opc) else {
+            return Err("SVE 32-bit gather (unallocated)");
+        };
+        let imm = bits(word, 20, 16) * esz;
+        let mem = if imm == 0 {
+            format!("[z{rn}.s]")
+        } else {
+            format!("[z{rn}.s, {}]", imm_text(imm as i64))
+        };
+        return Ok((
+            mn,
+            format!("{mn}\t{{ z{rt}.s }}, p{pg}/z, {mem}"),
+        ));
+    }
+
+    // `sve_mem_ld_dup`: the replicated loads, LD1R and its relatives.
+    if bits(word, 22, 22) == 1 {
+        let Some((mn, elem, acc)) = lddup_opc(bits(word, 24, 23), bits(word, 14, 13))
+        else {
+            return Err("SVE 32-bit gather (unallocated)");
+        };
+        let imm = bits(word, 21, 16) * acc;
+        let mem = if imm == 0 {
+            format!("[{}]", sp_reg(rn))
+        } else {
+            format!("[{}, {}]", sp_reg(rn), imm_text(imm as i64))
+        };
+        return Ok((
+            mn,
+            format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}"),
+        ));
+    }
+
+    // The remaining classes all live in `Inst{22-21} = 0b00` and are told
+    // apart by the two bits below the predicate field: bit 14 alone picks
+    // the LDNT1x gather, and bit 13 then picks the prefetch shape.
+    if bits(word, 14, 14) == 0 {
+        // `sve2_mem_gldnt_vs_base`: a vector of pointers plus a scalar
+        // offset.
+        let opc5 = (bits(word, 30, 30) << 4) | opc;
+        let Some(mn) = gldnt32_opc(opc5) else {
+            return Err("SVE 32-bit gather (unallocated)");
+        };
+        let rm = bits(word, 20, 16);
+        let mem = if rm == 31 {
+            format!("[z{rn}.s]")
+        } else {
+            format!("[z{rn}.s, x{rm}]")
+        };
+        return Ok((
+            mn,
+            format!("{mn}\t{{ z{rt}.s }}, p{pg}/z, {mem}"),
+        ));
+    }
+    if bits(word, 13, 13) == 0 {
+        // `sve_mem_prfm_ss`: a prefetch from a base register with a scalar
+        // offset.
+        if bits(word, 4, 4) != 0 {
+            return Err("SVE 32-bit gather (unallocated)");
+        }
+        let opc3 = (bits(word, 24, 24) << 2) | (bits(word, 23, 23) << 1) | bits(word, 14, 14);
+        if !matches!(opc3, 0b001 | 0b011 | 0b101 | 0b111) {
+            return Err("SVE 32-bit gather (unallocated)");
+        }
+        let rm = bits(word, 20, 16);
+        // The offset register may not be the zero register.
+        if rm == 31 {
+            return Err("SVE 32-bit gather (unallocated)");
+        }
+        let k = opc3 >> 1;
+        let off = if k == 0 {
+            format!("x{rm}")
+        } else {
+            format!("x{rm}, lsl #{k}")
+        };
+        let prf = prf_mnemonic(k);
+        return Ok((
+            prf,
+            format!(
+                "{prf}\t{}, p{pg}, [{}, {off}]",
+                prfop_text(bits(word, 3, 0)),
+                sp_reg(rn)
+            ),
+        ));
+    }
+    // `sve_mem_32b_prfm_vi`: a prefetch from a vector of pointers, indexed
+    // by an immediate.
+    if bits(word, 4, 4) != 0 {
+        return Err("SVE 32-bit gather (unallocated)");
+    }
+    let msz = bits(word, 24, 23);
+    let imm = bits(word, 20, 16) * (1 << msz);
+    let mem = if imm == 0 {
+        format!("[z{rn}.s]")
+    } else {
+        format!("[z{rn}.s, {}]", imm_text(imm as i64))
+    };
+    let prf = prf_mnemonic(msz);
+    Ok((
+        prf,
+        format!(
+            "{prf}\t{}, p{pg}, {mem}",
+            prfop_text(bits(word, 3, 0))
+        ),
+    ))
+}
+
+/// The four-bit opcode of the 32-bit gather loads: the mnemonic and the
+/// size of one element in bytes.
+fn gld32_opc(opc: u32) -> Option<(&'static str, u32)> {
+    Some(match opc {
+        0b0000 => ("ld1sb", 1),
+        0b0001 => ("ldff1sb", 1),
+        0b0010 => ("ld1b", 1),
+        0b0011 => ("ldff1b", 1),
+        0b0100 => ("ld1sh", 2),
+        0b0101 => ("ldff1sh", 2),
+        0b0110 => ("ld1h", 2),
+        0b0111 => ("ldff1h", 2),
+        0b1010 => ("ld1w", 4),
+        0b1011 => ("ldff1w", 4),
+        _ => return None,
+    })
+}
+
+/// The five-bit opcode of the SVE2 gather that takes a vector of 32-bit
+/// pointers and a scalar offset.
+fn gldnt32_opc(opc: u32) -> Option<&'static str> {
+    Some(match opc {
+        0b00000 => "ldnt1sb",
+        0b00001 => "ldnt1b",
+        0b00100 => "ldnt1sh",
+        0b00101 => "ldnt1h",
+        0b01001 => "ldnt1w",
+        _ => return None,
+    })
+}
+
+/// The replicated loads: the two dtype fields give the mnemonic, the
+/// element the destination register holds and the size of the access in
+/// bytes, which is what the immediate is scaled by.
+fn lddup_opc(dtypeh: u32, dtypel: u32) -> Option<(&'static str, char, u32)> {
+    Some(match (dtypeh, dtypel) {
+        (0b00, 0b00) => ("ld1rb", 'b', 1),
+        (0b00, 0b01) => ("ld1rb", 'h', 1),
+        (0b00, 0b10) => ("ld1rb", 's', 1),
+        (0b00, 0b11) => ("ld1rb", 'd', 1),
+        (0b01, 0b00) => ("ld1rsw", 'd', 4),
+        (0b01, 0b01) => ("ld1rh", 'h', 2),
+        (0b01, 0b10) => ("ld1rh", 's', 2),
+        (0b01, 0b11) => ("ld1rh", 'd', 2),
+        (0b10, 0b00) => ("ld1rsh", 'd', 2),
+        (0b10, 0b01) => ("ld1rsh", 's', 2),
+        (0b10, 0b10) => ("ld1rw", 's', 4),
+        (0b10, 0b11) => ("ld1rw", 'd', 4),
+        (0b11, 0b00) => ("ld1rsb", 'd', 1),
+        (0b11, 0b01) => ("ld1rsb", 's', 1),
+        (0b11, 0b10) => ("ld1rsb", 'h', 1),
+        (0b11, 0b11) => ("ld1rd", 'd', 8),
+        _ => return None,
+    })
 }
 
 // --- Shared helpers ----------------------------------------------------------
