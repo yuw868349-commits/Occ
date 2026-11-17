@@ -583,6 +583,22 @@ pub enum Expr {
         /// Value otherwise.
         no: Box<Expr>,
     },
+    /// A member of an aggregate, named by debug information.
+    ///
+    /// `*(u32 *)(p + 4)` where `p` points at `struct point` is `p->y` once the
+    /// debug info says what `p` points at and where `y` lives. The width is
+    /// kept because the load still has one, and the name is kept separately
+    /// from the offset because that is what the source said.
+    Member {
+        /// Pointer to the aggregate.
+        base: Box<Expr>,
+        /// Byte offset of the member within the aggregate.
+        offset: u64,
+        /// Access width in bytes.
+        size: u8,
+        /// Member name as declared.
+        name: String,
+    },
     /// A phi node, present between SSA construction and structuring.
     Phi(Vec<(BlockId, Expr)>),
     /// An operation the machine word has no arithmetic for.
@@ -789,6 +805,22 @@ pub struct FlagState {
 }
 
 impl FlagState {
+    /// Rewrite every variable name the flags read.
+    ///
+    /// The flag expressions hold the operands of the comparison that set
+    /// them, so a rename that stopped at an `if`'s condition would leave
+    /// `local_8_u64_1` inside the branch test while the assignment above it
+    /// read `count_1`.
+    pub fn rename_vars(&self, f: &dyn Fn(&str) -> Option<String>) -> FlagState {
+        FlagState {
+            cf: self.cf.as_ref().map(|e| e.rename_vars(f)),
+            zf: self.zf.as_ref().map(|e| e.rename_vars(f)),
+            sf: self.sf.as_ref().map(|e| e.rename_vars(f)),
+            of: self.of.as_ref().map(|e| e.rename_vars(f)),
+            pf: self.pf.as_ref().map(|e| e.rename_vars(f)),
+        }
+    }
+
     /// The value of one flag, named by its bit in the flag mask.
     pub fn get(&self, flag: u8) -> Option<&Expr> {
         use crate::lift::{FLAG_CF, FLAG_OF, FLAG_PF, FLAG_SF, FLAG_ZF};
@@ -1151,6 +1183,87 @@ impl Expr {
         Expr::Var(name.into())
     }
 
+    /// Rewrite every variable name through `f`, leaving everything else.
+    ///
+    /// `f` returns `None` for a name it does not rename. The walk covers every
+    /// place a value can be buried, including phi operands and the flag state
+    /// a condition reads: a rename that skipped either would leave the body
+    /// half-renamed, which reads worse than not renaming at all.
+    pub fn rename_vars(&self, f: &dyn Fn(&str) -> Option<String>) -> Expr {
+        match self {
+            Expr::Const(_) | Expr::Unknown(_) => self.clone(),
+            Expr::Var(n) => f(n).map_or_else(|| self.clone(), Expr::Var),
+            Expr::Load { addr, size, signed } => Expr::Load {
+                addr: Box::new(addr.rename_vars(f)),
+                size: *size,
+                signed: *signed,
+            },
+            Expr::Bin { op, lhs, rhs, bits } => Expr::Bin {
+                op: *op,
+                lhs: Box::new(lhs.rename_vars(f)),
+                rhs: Box::new(rhs.rename_vars(f)),
+                bits: *bits,
+            },
+            Expr::Un { op, arg, bits } => Expr::Un {
+                op: *op,
+                arg: Box::new(arg.rename_vars(f)),
+                bits: *bits,
+            },
+            Expr::Cond { op, lhs, rhs, bits } => Expr::Cond {
+                op: *op,
+                lhs: Box::new(lhs.rename_vars(f)),
+                rhs: Box::new(rhs.rename_vars(f)),
+                bits: *bits,
+            },
+            Expr::Bool { op, args } => Expr::Bool {
+                op: *op,
+                args: args.iter().map(|a| a.rename_vars(f)).collect(),
+            },
+            Expr::FlagCond { cond, state, bits } => Expr::FlagCond {
+                cond: *cond,
+                state: Box::new(state.rename_vars(f)),
+                bits: *bits,
+            },
+            Expr::Cast {
+                kind,
+                arg,
+                from,
+                to,
+            } => Expr::Cast {
+                kind: *kind,
+                arg: Box::new(arg.rename_vars(f)),
+                from: *from,
+                to: *to,
+            },
+            Expr::Select { cond, yes, no } => Expr::Select {
+                cond: Box::new(cond.rename_vars(f)),
+                yes: Box::new(yes.rename_vars(f)),
+                no: Box::new(no.rename_vars(f)),
+            },
+            Expr::Member {
+                base,
+                offset,
+                size,
+                name,
+            } => Expr::Member {
+                base: Box::new(base.rename_vars(f)),
+                offset: *offset,
+                size: *size,
+                name: name.clone(),
+            },
+            Expr::Phi(args) => Expr::Phi(
+                args.iter()
+                    .map(|(b, e)| (*b, e.rename_vars(f)))
+                    .collect(),
+            ),
+            Expr::Intrinsic { op, args, bits } => Expr::Intrinsic {
+                op: *op,
+                args: args.iter().map(|a| a.rename_vars(f)).collect(),
+                bits: *bits,
+            },
+        }
+    }
+
     /// Wrap in parentheses when the expression needs them at `min` precedence.
     fn fmt_prec(&self, f: &mut fmt::Formatter<'_>, min: u8) -> fmt::Result {
         let (prec, needs) = match self {
@@ -1278,6 +1391,10 @@ impl Expr {
                 write!(f, " : ")?;
                 no.fmt_prec(f, 0)?;
             }
+            Expr::Member { base, name, .. } => {
+                base.fmt_prec(f, 0)?;
+                write!(f, "->{name}")?;
+            }
             Expr::Phi(args) => {
                 write!(f, "phi(")?;
                 for (i, (bb, e)) in args.iter().enumerate() {
@@ -1332,6 +1449,7 @@ impl Expr {
                 yes.vars(out);
                 no.vars(out);
             }
+            Expr::Member { base, .. } => base.vars(out),
             Expr::Phi(args) => {
                 for (_, e) in args {
                     e.vars(out);
@@ -1405,6 +1523,17 @@ impl Expr {
                 cond: Box::new(cond.substitute(map)),
                 yes: Box::new(yes.substitute(map)),
                 no: Box::new(no.substitute(map)),
+            },
+            Expr::Member {
+                base,
+                offset,
+                size,
+                name,
+            } => Expr::Member {
+                base: Box::new(base.substitute(map)),
+                offset: *offset,
+                size: *size,
+                name: name.clone(),
             },
             Expr::Phi(args) => Expr::Phi(
                 args.iter()
@@ -1658,6 +1787,17 @@ impl Expr {
                     no: Box::new(no),
                 }
             }
+            Expr::Member {
+                base,
+                offset,
+                size,
+                name,
+            } => Expr::Member {
+                base: Box::new(base.simplify()),
+                offset: *offset,
+                size: *size,
+                name: name.clone(),
+            },
             Expr::Load { addr, size, signed } => Expr::Load {
                 addr: Box::new(addr.simplify()),
                 size: *size,
@@ -2387,6 +2527,11 @@ pub struct Decompiled {
     pub name: String,
     /// Parameter names, in ABI order.
     pub params: Vec<String>,
+    /// Declared type of each parameter, parallel to [`params`](Self::params).
+    ///
+    /// Empty when the image carries no debug information. An entry is `None`
+    /// when the debug info names the parameter but not its type.
+    pub param_types: Vec<Option<String>>,
     /// Register names to the parameter names they were given.
     ///
     /// The renderer renames a value that arrives in a register to the
@@ -2402,6 +2547,8 @@ pub struct Decompiled {
     pub unstructured: usize,
     /// Human-readable notes about approximations.
     pub notes: Vec<String>,
+    /// Source range the function covers, when debug information says.
+    pub source: Option<crate::debug::SourceRef>,
 }
 
 #[cfg(test)]

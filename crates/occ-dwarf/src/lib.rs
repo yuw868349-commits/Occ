@@ -139,6 +139,15 @@ pub struct DwarfFunction {
     pub decl_file: Option<String>,
     /// Declaration line.
     pub decl_line: Option<u32>,
+    /// Declared return type, when the subprogram states one.
+    pub return_type: Option<String>,
+    /// Frame base as DWARF expresses it.
+    ///
+    /// The usual value is `call_frame_cfa`, which is what lets a `fbreg`
+    /// location be converted to a decompiler slot. `reg6` says the frame base
+    /// is a register, and a consumer that assumes the CFA would put every
+    /// local at the wrong address.
+    pub frame_base: Option<String>,
     /// Parameters, in declaration order.
     pub params: Vec<Variable>,
     /// Local variables.
@@ -291,8 +300,26 @@ impl Dwarf {
                 str_offsets,
                 addr_sec,
                 loc_sec,
+                // DWARF 5's per-unit header is eight bytes. The unit's own
+                // `DW_AT_str_offsets_base`/`DW_AT_addr_base` override this as
+                // soon as the root DIE has been read.
+                str_offsets_base: std::cell::Cell::new(8),
+                addr_base: std::cell::Cell::new(8),
             };
-            let (dies, _consumed) = read_dies(&context, info, pos, unit_start, &abbrevs, addr_size);
+            let (mut dies, _consumed) = read_dies(&context, info, pos, unit_start, &abbrevs, addr_size);
+            // The root DIE's own string references were read before its
+            // base was known. When the unit names a base other than the
+            // usual 8, read it again so the unit's name comes from the right
+            // string too.
+            let sb = context.str_offsets_base.get();
+            let ab = context.addr_base.get();
+            if sb != 8 || ab != 8 {
+                let again = context.clone();
+                again.str_offsets_base.set(sb);
+                again.addr_base.set(ab);
+                let (d, _) = read_dies(&again, info, pos, unit_start, &abbrevs, addr_size);
+                dies = d;
+            }
 
             let mut unit = Unit {
                 offset: unit_start as u64,
@@ -396,6 +423,7 @@ fn section_bytes<'a>(view: &'a View<'_>, name: &str) -> Option<&'a [u8]> {
     view.section_data_named(name)
 }
 
+#[derive(Clone)]
 struct Context<'a> {
     version: u16,
     addr_size: u8,
@@ -407,6 +435,15 @@ struct Context<'a> {
     line_str: &'a [u8],
     str_offsets: &'a [u8],
     addr_sec: &'a [u8],
+    /// Where this unit's offsets start in `.debug_str_offsets`.
+    ///
+    /// DWARF 5 puts an 8-byte header in front of each unit's offset array, and
+    /// a unit names its own start with `DW_AT_str_offsets_base`. Reading from
+    /// zero read the header's length as an offset, which produced names that
+    /// belonged to a different string: `sum.c` where `total` should be.
+    str_offsets_base: std::cell::Cell<u64>,
+    /// Where this unit's addresses start in `.debug_addr`.
+    addr_base: std::cell::Cell<u64>,
 }
 
 /// A parsed DIE, kept flat with a depth field.
@@ -503,6 +540,19 @@ fn read_dies(
         }
         if bad {
             break;
+        }
+        // The root DIE names where this unit's string and address tables
+        // start. Every later DIE in the unit uses those bases, so the values
+        // have to be picked up before the next DIE is read.
+        if depth == 0 {
+            for (at, v) in &attrs {
+                let Value::Uint(n) = v else { continue };
+                match *at {
+                    DW_AT_STR_OFFSETS_BASE => ctx.str_offsets_base.set(*n),
+                    DW_AT_ADDR_BASE => ctx.addr_base.set(*n),
+                    _ => {}
+                }
+            }
         }
         dies.push(Die {
             offset: die_offset,
@@ -691,7 +741,9 @@ fn read_uint_bytes(data: &[u8], pos: &mut usize, n: usize) -> Option<u64> {
 
 fn read_strx(ctx: &Context<'_>, idx: u64) -> String {
     let width = if ctx.is64 { 8 } else { 4 };
-    let at = (idx as usize).saturating_mul(width);
+    let at = (ctx.str_offsets_base.get() as usize).saturating_add(
+        (idx as usize).saturating_mul(width),
+    );
     let Some(b) = ctx.str_offsets.get(at..at + width) else {
         return String::new();
     };
@@ -709,7 +761,8 @@ fn read_addr_index(ctx: &Context<'_>, data: &[u8], pos: &mut usize, bytes: usize
     }
     *pos += bytes;
     // Prefer .debug_addr when the compiler put the real address there.
-    let at = (v as usize).saturating_mul(usize::from(ctx.addr_size));
+    let at = (ctx.addr_base.get() as usize)
+        .saturating_add((v as usize).saturating_mul(usize::from(ctx.addr_size)));
     if let Some(b) = ctx.addr_sec.get(at..at + usize::from(ctx.addr_size)) {
         let mut addr = 0u64;
         for (i, byte) in b.iter().enumerate() {
@@ -828,6 +881,9 @@ const DW_TAG_MEMBER: u64 = 0x0d;
 
 const DW_AT_NAME: u64 = 0x03;
 const DW_AT_LOCATION: u64 = 0x02;
+const DW_AT_FRAME_BASE: u64 = 0x40;
+const DW_AT_STR_OFFSETS_BASE: u64 = 0x72;
+const DW_AT_ADDR_BASE: u64 = 0x73;
 const DW_AT_BYTE_SIZE: u64 = 0x0b;
 const DW_AT_LOW_PC: u64 = 0x11;
 const DW_AT_HIGH_PC: u64 = 0x12;
@@ -918,6 +974,22 @@ fn build_unit(
         stack.push(i);
     }
 
+    // A local can sit inside a lexical block, which is a child of the
+    // subprogram rather than the subprogram itself. Variables belong to the
+    // nearest enclosing subprogram, whatever blocks lie between them, or
+    // `for (int i = ...)` loses its induction variable.
+    let mut owner_of: Vec<Option<usize>> = vec![None; dies.len()];
+    for i in 0..dies.len() {
+        let mut cur = Some(i);
+        while let Some(c) = cur {
+            if dies[c].tag == DW_TAG_SUBPROGRAM {
+                owner_of[i] = Some(c);
+                break;
+            }
+            cur = parent_of[c];
+        }
+    }
+
     for (i, d) in dies.iter().enumerate() {
         match d.tag {
             DW_TAG_SUBPROGRAM => {
@@ -946,6 +1018,18 @@ fn build_unit(
                     high_pc: Addr(high),
                     decl_file: decl_file(d, unit, ctx.version),
                     decl_line: d.get(DW_AT_DECL_LINE).and_then(|v| v.as_u64()).map(|n| n as u32),
+                    return_type: d
+                        .get(DW_AT_TYPE)
+                        .and_then(|v| v.as_u64())
+                        .and_then(|r| type_name_at(dies, &by_offset, r, 0)),
+                    // The frame base is usually a block holding a single
+                    // `DW_OP_call_frame_cfa`; a location list here would need
+                    // the address to pick an entry, and no consumer of this
+                    // field has one yet.
+                    frame_base: match attr_chain(dies, &by_offset, i, DW_AT_FRAME_BASE) {
+                        Some(Value::Block(b)) => Some(describe_expr(&b)),
+                        _ => None,
+                    },
                     params: Vec::new(),
                     locals: Vec::new(),
                     inlined: Vec::new(),
@@ -953,7 +1037,7 @@ fn build_unit(
                 // Children of this subprogram.
                 let mut j = i + 1;
                 while j < dies.len() && dies[j].depth > d.depth {
-                    if parent_of[j] == Some(i) {
+                    if owner_of[j] == Some(i) {
                         match dies[j].tag {
                             DW_TAG_PARAM | DW_TAG_VARIABLE => {
                                 let name = attr_chain(dies, &by_offset, j, DW_AT_NAME)

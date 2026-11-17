@@ -18,12 +18,20 @@ pub fn render(d: &Decompiled) -> String {
     } else {
         d.params
             .iter()
-            .map(|p| format!("u64 {p}"))
+            .enumerate()
+            .map(|(i, p)| match d.param_types.get(i).and_then(|t| t.as_deref()) {
+                // `struct point *p`, not `struct point * p`: the star belongs
+                // to the declarator in C, and the debug info already spaced it.
+                Some(t) if t.ends_with('*') => format!("{t}{p}"),
+                Some(t) => format!("{t} {p}"),
+                None => format!("u64 {p}"),
+            })
             .collect::<Vec<_>>()
             .join(", ")
     };
     // The return type is only known when the body says where the function
-    // left its value; without that, the machine word is the honest answer.
+    // left its value, or when debug info declares it. Without either, the
+    // machine word is the honest answer.
     let ret = d.ret_type.as_deref().unwrap_or("u64");
     let _ = writeln!(out, "{ret} {}({params}) {{", d.name);
     let mut r = Renderer {
@@ -32,6 +40,12 @@ pub fn render(d: &Decompiled) -> String {
         aliases: Aliases::new(d),
         last_call: None,
     };
+    if let Some(src) = &d.source {
+        r.line(&format!(
+            "// source: {}:{}-{}",
+            src.file, src.first_line, src.last_line
+        ));
+    }
     r.nodes(&d.body);
     for note in &d.notes {
         r.line(&format!("// note: {note}"));
@@ -207,6 +221,21 @@ impl Renderer {
             }
         }
         Expr::Var(v) => out.push_str(&self.aliases.var_name(v)),
+        Expr::Member { base, name, .. } => {
+            // The debug info named the aggregate and the member, so the load
+            // reads as the access the source wrote. A base that is not a bare
+            // variable keeps its parentheses: `(a + b)->x` is still clear,
+            // `a + b->x` would not be.
+            let compound = !matches!(base.as_ref(), Expr::Var(_));
+            if compound {
+                out.push('(');
+            }
+            self.fmt_expr(base, out, 0);
+            if compound {
+                out.push(')');
+            }
+            let _ = write!(out, "->{name}");
+        }
         Expr::Load { addr, size, signed } => {
             let _ = write!(out, "*({}*)", type_name(*size, *signed));
             self.fmt_expr(addr, out, 7);

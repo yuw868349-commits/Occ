@@ -404,6 +404,15 @@ fn read_entry_form(data: &[u8], pos: &mut usize, form: u64, line_str: &[u8]) -> 
             *pos += 1;
             Value::Flag(true)
         }
+        0x1e => {
+            // DW_LNCT_MD5: the checksum of the file, sixteen bytes of it.
+            // It is not a name, but its bytes are part of the table and a
+            // reader that stopped here lost the whole line program.
+            let b = data.get(*pos..*pos + 16)?.to_vec();
+            *pos += 16;
+            Value::Block(b)
+        }
+        0x0d => Value::Sint(sleb(data, pos)?), // sdata
         _ => return None,
     })
 }

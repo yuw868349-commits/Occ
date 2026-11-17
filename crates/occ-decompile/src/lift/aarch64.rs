@@ -473,6 +473,7 @@ impl<'a> Lifter<'a> {
             && matches!(&ops[1], Operand::Reg(r) if r.idx == SP && r.size == 8)
         {
             self.core.fp_off = Some(self.core.sp_off);
+            self.core.fp_anchor = Some(self.core.sp_off);
             return;
         }
         let value = self.core.read(&ops[1], stmts);
@@ -1223,5 +1224,15 @@ impl super::Lifter for Lifter<'_> {
 
     fn notes(&mut self) -> Vec<(Addr, String)> {
         std::mem::take(&mut self.core.notes)
+    }
+
+    fn frame_base_slot(&self, reg: &str) -> Option<i64> {
+        let want = self.core.target.fp_reg()?;
+        let got = self.core.target.lookup_reg(reg)?.idx;
+        if got == want {
+            self.core.fp_anchor.or(self.core.fp_off)
+        } else {
+            None
+        }
     }
 }

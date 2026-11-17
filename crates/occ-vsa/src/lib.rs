@@ -270,6 +270,7 @@ impl<'a> Walker<'a> {
                 // use anything, so liveness would delete every definition in
                 // it, including the one the computed jump goes through.
                 keep_dead: true,
+                debug: None,
             },
             &|a: Addr| format!("sub_{:x}", a.0),
         );
@@ -411,6 +412,20 @@ impl<'a> Walker<'a> {
                     bias: 0,
                 })
             }),
+            Expr::Member {
+                base,
+                offset,
+                size,
+                ..
+            } => {
+                let addr = Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: base.clone(),
+                    rhs: Box::new(Expr::Const(*offset)),
+                    bits: 8,
+                };
+                self.load(&addr, *size, false, state, out, depth)
+            }
             Expr::Load { addr, size, signed } => self.load(addr, *size, *signed, state, out, depth),
             Expr::Bin { op, lhs, rhs, bits } => {
                 let a = self.eval(lhs, state, out, depth + 1);

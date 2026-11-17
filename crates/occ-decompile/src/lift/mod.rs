@@ -589,6 +589,15 @@ pub struct Core<'a> {
     pub sp_off: i64,
     /// Frame offset of the frame pointer once anchored.
     pub fp_off: Option<i64>,
+    /// Where the frame pointer was anchored, kept after `pop rbp` restores
+    /// the register.
+    ///
+    /// Debug info locates locals relative to the frame pointer, and the
+    /// question "where was `rbp`?" has to be answered after the whole
+    /// function is lifted — by which time the epilogue has cleared `fp_off`.
+    /// The anchor is therefore recorded when the prologue sets it and never
+    /// cleared.
+    pub fp_anchor: Option<i64>,
     /// Set once the stack pointer moves by a non-constant amount; frame slots
     /// stop being trustworthy from that point.
     pub dynamic_sp: bool,
@@ -640,6 +649,7 @@ impl<'a> Core<'a> {
             symbols: None,
             sp_off: 0,
             fp_off: None,
+            fp_anchor: None,
             dynamic_sp: false,
             pending_cmp: None,
             flags: FlagState::default(),
@@ -1413,6 +1423,17 @@ pub trait Lifter {
 
     /// Notes about approximations made while lifting.
     fn notes(&mut self) -> Vec<(Addr, String)>;
+
+    /// The frame slot of a register that a debug frame base names.
+    ///
+    /// A `DW_AT_frame_base` of `DW_OP_reg6` says every `fbreg` offset is
+    /// relative to `rbp`, not to the canonical frame address. Converting one
+    /// to a lifter slot needs the slot `rbp` itself was anchored at, which is
+    /// what this returns. `None` means the register does not carry a frame
+    /// base in this function, and the debug names are left unapplied.
+    fn frame_base_slot(&self, _reg: &str) -> Option<i64> {
+        None
+    }
 }
 
 /// Split on commas that are not inside brackets.

@@ -327,6 +327,17 @@ impl Builder<'_> {
                 size: *size,
                 signed: *signed,
             },
+            Expr::Member {
+                base,
+                offset,
+                size,
+                name,
+            } => Expr::Member {
+                base: Box::new(self.rewrite(base, b)),
+                offset: *offset,
+                size: *size,
+                name: name.clone(),
+            },
             Expr::Bin { op, lhs, rhs, bits } => Expr::Bin {
                 op: *op,
                 lhs: Box::new(self.rewrite(lhs, b)),

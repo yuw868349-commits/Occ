@@ -168,6 +168,15 @@ impl Machine {
                 let a = self.eval(addr)?;
                 self.load(a, *size, *signed)
             }
+            Expr::Member {
+                base,
+                offset,
+                size,
+                ..
+            } => {
+                let a = self.eval(base)?.wrapping_add(*offset);
+                self.load(a, *size, false)
+            }
             Expr::Bin { op, lhs, rhs, bits } => {
                 let a = self.eval(lhs)?;
                 if *op == BinOp::Div || *op == BinOp::Mod {

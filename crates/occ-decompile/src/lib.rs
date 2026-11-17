@@ -21,6 +21,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod debug;
 pub mod exec;
 pub mod ir;
 pub mod lift;
@@ -53,6 +54,12 @@ pub struct Options {
     /// branch tested is gone. Such a client sets this and reads the block as
     /// lifted.
     pub keep_dead: bool,
+    /// Names, types and source lines from debug information.
+    ///
+    /// `None` means the image has no usable DWARF, and the output keeps the
+    /// mechanical names the lifter chose. An empty value is not the same
+    /// thing: it says debug info exists but says nothing about this function.
+    pub debug: Option<debug::DebugInfo>,
 }
 
 impl Default for Options {
@@ -61,6 +68,7 @@ impl Default for Options {
             max_blocks: 20_000,
             keep_comments: true,
             keep_dead: false,
+            debug: None,
         }
     }
 }
@@ -79,16 +87,29 @@ pub fn decompile(
         return outline(func, name_of, image.arch);
     }
     let program = build_program(image, func, opts, name_of);
+    let dbg = opts.debug.as_ref();
+    // The signature is the one the source declared, when debug info carries
+    // it. The recovered name and the inferred word type stay as the fallback.
+    let name = dbg
+        .and_then(|d| d.name.clone())
+        .unwrap_or_else(|| func.display_name());
+    let ret_type = dbg
+        .and_then(|d| d.return_type.clone())
+        .or_else(|| program.ret_type.clone());
+    let param_types = dbg.map(debug::DebugInfo::param_types).unwrap_or_default();
+    let source = dbg.and_then(|d| d.source_range(d.file.as_deref()));
     if program.blocks.is_empty() {
         return Decompiled {
             entry: func.entry,
-            name: func.display_name(),
-            params: Vec::new(),
+            name,
+            params: program.params,
+            param_types,
             param_aliases: Vec::new(),
-            ret_type: None,
+            ret_type,
             body: Vec::new(),
             unstructured: 0,
             notes: program.notes,
+            source,
         };
     }
     let mut notes = program.notes.clone();
@@ -99,13 +120,15 @@ pub fn decompile(
 
     Decompiled {
         entry: func.entry,
-        name: func.display_name(),
+        name,
         params: program.params.clone(),
+        param_types,
         param_aliases: program.param_aliases.clone(),
-        ret_type: program.ret_type.clone(),
+        ret_type,
         body,
         unstructured: structurer.unstructured,
         notes,
+        source,
     }
 }
 
@@ -613,7 +636,7 @@ pub fn build_program(
         .collect();
     // The stack pointer at entry is the frame base, not a live pointer.
     param_aliases.push((lifter.sp_reg_name(), lifter.sp_alias().to_string()));
-    Program {
+    let mut program = Program {
         entry,
         blocks: cfg.blocks,
         preds: cfg.preds,
@@ -623,6 +646,32 @@ pub fn build_program(
         param_aliases,
         ret_type,
         notes,
+    };
+    if let Some(dbg) = &opts.debug {
+        let frame_base = if dbg.frame_base_is_cfa {
+            Some(cfa_slot(image.arch))
+        } else {
+            dbg.frame_base_reg
+                .as_deref()
+                .and_then(|r| lifter.frame_base_slot(r))
+        };
+        debug::apply(&mut program, dbg, frame_base);
+    }
+    program
+}
+
+/// Frame slot of the canonical frame address.
+///
+/// A `call` on x86 pushes the return address, so the caller's stack pointer —
+/// which is what DWARF calls the canonical frame address — sits eight bytes
+/// above the callee's entry stack pointer (four in 32-bit mode). AArch64 and
+/// RISC-V keep the return address in a register, so their frame base is the
+/// entry stack pointer itself.
+fn cfa_slot(arch: occ_core::Arch) -> i64 {
+    match arch {
+        occ_core::Arch::X86_64 => 8,
+        occ_core::Arch::X86 => 4,
+        _ => 0,
     }
 }
 
@@ -932,6 +981,7 @@ fn outline(func: &Function, name_of: &dyn Fn(Addr) -> String, arch: occ_core::Ar
         entry: func.entry,
         name: func.display_name(),
         params: Vec::new(),
+        param_types: Vec::new(),
         param_aliases: Vec::new(),
         ret_type: None,
         body,
@@ -940,6 +990,7 @@ fn outline(func: &Function, name_of: &dyn Fn(Addr) -> String, arch: occ_core::Ar
             "lifting for {} is not implemented yet",
             arch.label()
         )],
+        source: None,
     }
 }
 

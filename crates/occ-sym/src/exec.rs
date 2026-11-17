@@ -548,6 +548,29 @@ impl Runner<'_> {
                     }
                 }
             }
+            Expr::Member {
+                base,
+                offset,
+                size,
+                ..
+            } => {
+                // A member is a load at a fixed offset; the symbolic executor
+                // does not need the name to know what it reads.
+                let addr = Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: base.clone(),
+                    rhs: Box::new(Expr::Const(*offset)),
+                    bits: 8,
+                };
+                self.eval(
+                    &Expr::Load {
+                        addr: Box::new(addr),
+                        size: *size,
+                        signed: false,
+                    },
+                    state,
+                )
+            }
             Expr::Load { addr, size, signed } => {
                 let a = self.eval(addr, state);
                 let Some(at) = a.as_const() else {

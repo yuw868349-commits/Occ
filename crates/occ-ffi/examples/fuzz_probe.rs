@@ -207,6 +207,7 @@ fn exercise(data: &[u8], path: &Path, deep: bool) -> Result<(), String> {
         max_blocks: 2_000,
         keep_comments: true,
         keep_dead: false,
+        debug: None,
     };
     let name_of = |a: Addr| format!("sub_{:x}", a.get());
     for f in analysis.functions.iter().take(8) {

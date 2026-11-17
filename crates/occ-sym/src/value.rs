@@ -231,7 +231,7 @@ pub fn eval_bool(e: &Expr, env: &std::collections::HashMap<String, u64>) -> Opti
                 eval_bool(no, env)
             }
         }
-        Expr::Load { .. } | Expr::Phi(_) | Expr::Unknown(_) => None,
+        Expr::Load { .. } | Expr::Member { .. } | Expr::Phi(_) | Expr::Unknown(_) => None,
         Expr::Intrinsic { .. } => None,
     }
 }
@@ -309,7 +309,7 @@ pub fn eval_word(e: &Expr, env: &std::collections::HashMap<String, u64>) -> Opti
                 eval_word(no, env)
             }
         }
-        Expr::Load { .. } | Expr::Phi(_) | Expr::Unknown(_) => None,
+        Expr::Load { .. } | Expr::Member { .. } | Expr::Phi(_) | Expr::Unknown(_) => None,
         Expr::Intrinsic { op, args, bits } => {
             let values: Option<Vec<u64>> = args.iter().map(|a| eval_word(a, env)).collect();
             eval_intrinsic(*op, &values?, *bits)
