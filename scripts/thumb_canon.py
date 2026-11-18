@@ -69,6 +69,17 @@ def canonical(text, pc):
     head = parts[0]
     rest = parts[1:]
 
+    # The width suffix comes off first.  A wide instruction is written
+    # `beq.w`, and the condition is inside the name rather than after
+    # it, so the name has to be stripped before the condition can be
+    # read out of it.
+    width = ""
+    for tail in (".w", ".n"):
+        if head.endswith(tail):
+            width = tail
+            head = head[: -len(tail)]
+            break
+
     # Split the mnemonic into a base, a condition and a width suffix.
     # A condition can be written three ways: as its own word (`beq`), as a
     # suffix on the branch (`b.eq`), or as a prefix on the branch
@@ -82,7 +93,7 @@ def canonical(text, pc):
             break
         if base.endswith("." + suffix):
             cond = name
-            base = "b." + base[: -(len(suffix) + 1)]
+            base = "b"
             break
         if base.startswith("b" + suffix) and len(base) == len(suffix) + 1:
             cond = name
@@ -97,12 +108,6 @@ def canonical(text, pc):
         if base == "blo":
             cond = "lo"
             base = "b"
-            break
-    width = ""
-    for tail in (".w", ".n"):
-        if base.endswith(tail):
-            width = tail
-            base = base[: -len(tail)]
             break
 
     # The flag-setting spelling.

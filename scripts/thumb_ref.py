@@ -123,6 +123,78 @@ def iso_pc(hw):
     return iso_addr(hw) + 4
 
 
+# The same for the 32-bit set: four `nop`s in front of the encoding, which
+# is four bytes, so the stride is twelve.
+ISOLATION32_STRIDE = 2 * ISOLATION_PAD + 4
+
+
+def iso32_addr(index):
+    """The address the 32-bit encoding `index` is read at."""
+    return ISOLATION32_STRIDE * index + 2 * ISOLATION_PAD
+
+
+def iso32_pc(index):
+    """The program counter the 32-bit encoding `index` is read at."""
+    return iso32_addr(index) + 4
+
+
+def objdump_isolated_words32(words, scratch):
+    """Read a list of 32-bit encodings with llvm-objdump, each on its own.
+
+    The encoding is the *word*, with the first halfword in the low half:
+    the encoding of `bl #0x100` is the four bytes `00 f0 80 f8`, whose
+    first halfword is `0xf000` and whose second is `0xf880`.
+
+    The table is keyed by address, and the address of the encoding at
+    index `i` is `iso32_addr(i)`.
+    """
+    merged = {}
+    readings = []
+    for i, triple in enumerate(PROFILES):
+        readings.append(_objdump_isolated32(words, scratch, triple, f"p{i}"))
+    for index in range(len(words)):
+        addr = iso32_addr(index)
+        value = None
+        for table in readings:
+            text = table.get(addr)
+            if text is None:
+                continue
+            if text.strip() == "<unknown>":
+                continue
+            value = text
+            break
+        merged[addr] = value
+    return merged
+
+
+def _objdump_isolated32(words, scratch, triple, sub):
+    """Read the 32-bit encodings in one profile."""
+    blob = bytearray()
+    for w in words:
+        blob += ISOLATION_NOP.to_bytes(2, "little") * ISOLATION_PAD
+        blob += (w & 0xFFFFFFFF).to_bytes(4, "little")
+    where = f"{scratch}/{sub}"
+    subprocess.run(["rm", "-rf", where], check=False)
+    subprocess.run(["mkdir", "-p", where], check=True)
+    raw = f"{where}/r.bin"
+    with open(raw, "wb") as f:
+        f.write(bytes(blob))
+    obj = f"{where}/a.o"
+    subprocess.run(
+        [OBJCOPY, "--input-target=binary", "--output-target=elf32-littlearm",
+         "--rename-section", ".data=.text,code", raw, obj],
+        check=True, capture_output=True)
+    res = subprocess.run(
+        [OBJDUMP, "-d", f"--triple={triple}", obj],
+        check=True, capture_output=True, text=True).stdout
+    table = {}
+    for line in res.splitlines():
+        m = re.match(r"\s+([0-9a-f]+):\s+[0-9a-f ]+\s*(.*)$", line)
+        if m:
+            table[int(m.group(1), 16)] = m.group(2).strip()
+    return table
+
+
 def objdump_isolated_space(words, scratch):
     """Read a list of encodings with llvm-objdump, each on its own.
 

@@ -261,7 +261,7 @@ fn a32(w: u32, addr: Addr) -> R {
     if cond == 0b1111 {
         if bits(w, 27, 25) == 0b101 && bits(w, 24, 24) == 1 {
             let off = sext(bits(w, 23, 0) << 2, 26);
-            let target = Addr((i128::from(addr.get()) + 8 + i128::from(off)) as u64);
+            let target = arm_target(a_pc(addr), off);
             return R::new("blx", format!("blx {}", hex(target.get())))
                 .flow(FlowKind::Call)
                 .to(target);
@@ -719,7 +719,7 @@ fn single_offset(w: u32, rn: u32, addr: Addr) -> Transfer {
     // `[pc, #n]` addresses a literal in the same section: the PC reads as
     // the instruction's address plus eight, and the operand is an address.
     let abs = if rn == 15 {
-        Some(Addr((i128::from(addr.get()) + 8 + i128::from(value)) as u64))
+        Some(arm_target(a_pc(addr), value))
     } else {
         None
     };
@@ -866,7 +866,7 @@ fn extra_load_store(w: u32, suffix: &str, addr: Addr) -> R {
 /// The address a PC-relative operand names: the PC reads as the
 /// instruction's address plus eight in A32.
 fn literal(addr: Addr, off: i64) -> Option<Addr> {
-    Some(Addr((i128::from(addr.get()) + 8 + i128::from(off)) as u64))
+    Some(arm_target(a_pc(addr), off))
 }
 
 fn block_transfer(w: u32, suffix: &str) -> R {
@@ -955,7 +955,7 @@ fn reg_list(list: u32) -> String {
 fn branch(w: u32, suffix: &str, addr: Addr) -> R {
     let l = bits(w, 24, 24) == 1;
     let off = sext(bits(w, 23, 0) << 2, 26);
-    let target = Addr((i128::from(addr.get()) + 8 + i128::from(off)) as u64);
+    let target = arm_target(a_pc(addr), off);
     if l {
         R::new("bl", format!("bl{suffix} {}", hex(target.get())))
             .flow(FlowKind::Call)
@@ -995,6 +995,31 @@ const T32_PC_BIAS: i64 = 4;
 /// The address a Thumb PC-relative operand is measured from.
 fn t_pc(addr: Addr) -> i128 {
     i128::from(addr.get()) + i128::from(T32_PC_BIAS)
+}
+
+/// The address a PC-relative operand is measured from in A32.
+///
+/// The program counter reads as the instruction's address plus eight.
+fn a_pc(addr: Addr) -> i128 {
+    i128::from(addr.get()) + 8
+}
+
+/// The address a PC-relative operand names, in the thirty-two bits the
+/// architecture has.
+///
+/// ARM addresses are thirty-two bits wide, so a branch that runs off the
+/// bottom of the address space comes back in at the top of it.  The
+/// references agree on this: a branch whose displacement is negative
+/// enough lands near `0xffff_xxxx` rather than at a negative address, and
+/// an address that stays sixty-four bits wide names a place the processor
+/// could never reach.
+fn arm_target(pc: i128, amount: i64) -> Addr {
+    Addr(((pc + i128::from(amount)) as u64) & 0xFFFF_FFFF)
+}
+
+/// The address a Thumb PC-relative operand names.
+fn t_target(pc: i128, amount: i64) -> Addr {
+    arm_target(pc, amount)
 }
 
 /// Decode one 16-bit T32 halfword.
@@ -1266,7 +1291,7 @@ fn t16_dp_special(x: u32) -> R {
 fn t16_literal(x: u32, addr: Addr) -> R {
     let rt = bits(x, 10, 8);
     let amount = i64::from(bits(x, 7, 0)) * 4;
-    let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+    let target = t_target(t_pc(addr), amount);
     R::new("ldr", format!("ldr {}, [pc, {}]", reg(rt), imm(amount)))
         .reading(target)
         .with_pc(target)
@@ -1334,7 +1359,7 @@ fn t16_mem(base: &str, rt: u32, rn: u32, amount: i64, addr: Addr) -> R {
     // A literal pool is addressed relative to the program counter, which
     // reads as the instruction's address plus four.
     if rn == 15 && base.starts_with("ldr") {
-        let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+        let target = t_target(t_pc(addr), amount);
         r = r.reading(target);
         r.pc = Some(target);
     }
@@ -1446,7 +1471,7 @@ fn t16_misc(x: u32, addr: Addr) -> R {
                 let nz = bits(x, 11, 11) == 1;
                 let rn = bits(x, 2, 0);
                 let amount = i64::from((bits(x, 9, 9) << 5) | bits(x, 7, 3)) * 2;
-                let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+                let target = t_target(t_pc(addr), amount);
                 let name = if nz { "cbnz" } else { "cbz" };
                 let text = format!("{name} {}, {}", reg(rn), hex(target.get()));
                 return R::new(name, text).flow(FlowKind::ConditionalBranch).to(target);
@@ -1491,7 +1516,7 @@ fn t16_misc(x: u32, addr: Addr) -> R {
                 // above.
                 let rn = bits(x, 2, 0);
                 let amount = i64::from((bits(x, 9, 9) << 5) | bits(x, 7, 3)) * 2;
-                let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+                let target = t_target(t_pc(addr), amount);
                 let text = format!("cbnz {}, {}", reg(rn), hex(target.get()));
                 return R::new("cbnz", text).flow(FlowKind::ConditionalBranch).to(target);
             }
@@ -1749,7 +1774,7 @@ fn t16_branch(x: u32, addr: Addr) -> R {
         // A conditional branch: the displacement is eight bits, signed,
         // and scaled by two.
         let amount = sext(bits(x, 7, 0), 8) * 2;
-        let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+        let target = t_target(t_pc(addr), amount);
         let suffix = CONDS[cond as usize];
         let text = format!("b{suffix} {}", hex(target.get()));
         return R::new("b", text).flow(FlowKind::ConditionalBranch).to(target);
@@ -1762,7 +1787,7 @@ fn t16_branch(x: u32, addr: Addr) -> R {
 /// The displacement is eleven bits, signed, and scaled by two.
 fn t16_uncond(x: u32, addr: Addr) -> R {
     let amount = sext(bits(x, 10, 0), 11) * 2;
-    let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
+    let target = t_target(t_pc(addr), amount);
     R::new("b", format!("b {}", hex(target.get())))
         .flow(FlowKind::UnconditionalBranch)
         .to(target)
@@ -1800,16 +1825,469 @@ fn t16_uncond(x: u32, addr: Addr) -> R {
 // The narrow branches are simpler: the displacement is the immediate field
 // itself, doubled.
 
+// ---------------------------------------------------------------------------
+// T32: the 32-bit Thumb instructions
+//
+// The 32-bit space cannot be read in full: it has 2**32 encodings, and the
+// halfword that opens one is a sixteenth of that. It was measured instead.
+// Every first halfword that can open a 32-bit instruction was read behind a
+// set of second halfwords, and the layout of every class was worked out by
+// flipping one bit at a time and watching what moved. What follows is that
+// measurement rather than a recollection of the manual, which is why the
+// width suffixes look the way they do: `and.w` in one form of a class and
+// `and` in another is what the references print, and the measurement is the
+// only thing that settles it.
+
+// ---------------------------------------------------------------------------
+// The two data-processing classes
+//
+// Two classes share the shape `op S Rn | ...`: the one with a shifted
+// register and the one with an immediate. The operation field is four bits
+// wide in both, and the two classes spell the same operation differently,
+// so the two tables below differ in the width suffix alone.
+
+/// The operations of the register-operand class, and whether each one is
+/// written with a width suffix.
+///
+/// The empty name is an operation the architecture leaves undefined.
+const T32_DP_REG_OPS: [(&str, bool); 16] = [
+    ("and", true),
+    ("bic", true),
+    ("orr", true),
+    ("orn", false),
+    ("eor", true),
+    ("", false),
+    ("pkh", false),
+    ("", false),
+    ("add", true),
+    ("", false),
+    ("adc", true),
+    ("sbc", true),
+    ("", false),
+    ("sub", true),
+    ("rsb", false),
+    ("", false),
+];
+
+/// The operations of the immediate class, and whether each one is written
+/// with a width suffix.
+const T32_DP_IMM_OPS: [(&str, bool); 16] = [
+    ("and", false),
+    ("bic", false),
+    ("orr", false),
+    ("orn", false),
+    ("eor", false),
+    ("", false),
+    ("", false),
+    ("", false),
+    ("add", true),
+    ("", false),
+    ("adc", false),
+    ("sbc", false),
+    ("", false),
+    ("sub", true),
+    ("rsb", true),
+    ("", false),
+];
+
+/// The shift of a data-processing operand, as it is written.
+///
+/// A shift that does nothing is not written at all. The two right shifts
+/// take thirty-two for a shift of nothing, and a rotate of nothing is a
+/// rotate through the carry.
+struct T32Shift {
+    /// The two-bit type: left, logical right, arithmetic right, rotate.
+    kind: u32,
+    /// The amount, three bits from the second halfword and two beside the
+    /// type.
+    amount: u32,
+}
+
+impl T32Shift {
+    /// The shift as it is written, or an empty string when it is no shift.
+    fn text(&self) -> String {
+        if self.kind == 0b00 && self.amount == 0 {
+            return String::new();
+        }
+        if self.kind == 0b11 && self.amount == 0 {
+            return "rrx".to_string();
+        }
+        format!("{} #{}", SHIFTS[self.kind as usize], self.amount_out())
+    }
+
+    /// The amount as it is written: the two right shifts take thirty-two
+    /// for a shift of nothing.
+    fn amount_out(&self) -> u32 {
+        match self.kind {
+            0b01 | 0b10 if self.amount == 0 => 32,
+            _ => self.amount,
+        }
+    }
+
+    /// The shift as it is written, with the comma that goes in front of it.
+    fn suffix(&self) -> String {
+        let t = self.text();
+        if t.is_empty() {
+            String::new()
+        } else {
+            format!(", {t}")
+        }
+    }
+}
+
+/// The twelve-bit immediate of the modified-immediate form, expanded.
+///
+/// The encoding is a twelve-bit value whose top two bits say what to do
+/// with the rest: `00` picks one of four byte patterns, and anything else
+/// makes a byte whose top bit is set and rotates it.
+fn thumb_expand_imm(imm12: u32) -> u32 {
+    if imm12 & 0xC00 == 0 {
+        // The eight bits of the value are placed in one of four patterns,
+        // which the two bits above them choose.
+        let byte = imm12 & 0xFF;
+        return match (imm12 >> 8) & 3 {
+            0 => byte,
+            1 => byte * 0x0001_0001,
+            2 => byte * 0x0100_0100,
+            _ => byte * 0x0101_0101,
+        };
+    }
+    let unrotated = 0x80 | (imm12 & 0x7F);
+    unrotated.rotate_right((imm12 >> 7) & 0x1F)
+}
+
+/// The name of the comparison that a data-processing instruction becomes
+/// when it writes no result.
+///
+/// The four operations that can write the program counter instead of a
+/// register are the four comparisons, and each has its own name.
+fn t32_test_name(op: u32) -> Option<&'static str> {
+    match op {
+        0 => Some("tst.w"),
+        4 => Some("teq.w"),
+        8 => Some("cmn.w"),
+        13 => Some("cmp.w"),
+        _ => None,
+    }
+}
+
+/// The data-processing class with a shifted register.
+///
+/// `1110 101 op(4) S Rn | 0 imm3 Rd imm2 type Rm`. The shift amount is
+/// split across the two halfwords: three bits in the second and two beside
+/// the shift type.
+fn t32_dp_reg(hw1: u32, hw2: u32) -> R {
+    let op = bits(hw1, 8, 5);
+    let s = bits(hw1, 4, 4) == 1;
+    let rn = bits(hw1, 3, 0);
+    let rd = bits(hw2, 11, 8);
+    let rm = bits(hw2, 3, 0);
+    let shift = T32Shift {
+        kind: bits(hw2, 5, 4),
+        amount: (bits(hw2, 14, 12) << 2) | bits(hw2, 7, 6),
+    };
+    let (base, wide) = T32_DP_REG_OPS[op as usize];
+    if base.is_empty() {
+        return t32_undefined(hw1, hw2);
+    }
+
+    // The pack of two halves into one register. The two forms differ only
+    // in the shift they take: a left shift packs the bottom half and an
+    // arithmetic shift packs the top one.
+    if base == "pkh" {
+        let name = match shift.kind {
+            0b00 => "pkhbt",
+            0b10 => "pkhtb",
+            _ => return t32_undefined(hw1, hw2),
+        };
+        let text = format!(
+            "{name} {}, {}, {}{}",
+            reg(rd),
+            reg(rn),
+            reg(rm),
+            shift.suffix()
+        );
+        return R::new(name, text);
+    }
+
+    // The move is the logical-or with the program counter as its first
+    // operand, and the shift is then written on its own.
+    if op == 2 && rn == 15 {
+        if shift.kind == 0b11 && shift.amount == 0 {
+            let text = format!("rrx {}, {}", reg(rd), reg(rm));
+            return R::new("rrx", text);
+        }
+        if shift.kind == 0b00 && shift.amount == 0 {
+            let name = if s { "movs.w" } else { "mov.w" };
+            let text = format!("{name} {}, {}", reg(rd), reg(rm));
+            return R::new("mov", text);
+        }
+        let mut name = String::from(SHIFTS[shift.kind as usize]);
+        name.push_str(".w");
+        let text = format!(
+            "{name} {}, {}, #{}",
+            reg(rd),
+            reg(rm),
+            shift.amount_out()
+        );
+        return R::new(name.trim_end_matches(".w").to_string(), text);
+    }
+
+    // The negate is the logical-or-not with the program counter as its
+    // first operand.
+    if op == 3 && rn == 15 {
+        let name = if s { "mvns.w" } else { "mvn.w" };
+        let text = format!("{name} {}, {}{}", reg(rd), reg(rm), shift.suffix());
+        return R::new("mvn", text);
+    }
+
+    // The comparisons write the program counter instead of a register.
+    if s && rd == 15 {
+        if let Some(name) = t32_test_name(op) {
+            let text = format!("{name} {}, {}{}", reg(rn), reg(rm), shift.suffix());
+            return R::new(name.trim_end_matches(".w"), text);
+        }
+    }
+
+    let mut name = String::from(base);
+    if s {
+        name.push('s');
+    }
+    if wide {
+        name.push_str(".w");
+    }
+    let text = format!(
+        "{name} {}, {}, {}{}",
+        reg(rd),
+        reg(rn),
+        reg(rm),
+        shift.suffix()
+    );
+    R::new(base, text)
+}
+
+/// The data-processing class with an immediate.
+///
+/// `11110 i 0 op(4) S Rn | 0 imm3 Rd imm8`. The twelve-bit immediate is
+/// the top bit of the first halfword and the two fields of the second, and
+/// it is expanded rather than used as it stands.
+fn t32_dp_imm(hw1: u32, hw2: u32) -> R {
+    let op = bits(hw1, 8, 5);
+    let s = bits(hw1, 4, 4) == 1;
+    let rn = bits(hw1, 3, 0);
+    let rd = bits(hw2, 11, 8);
+    let imm12 = (bits(hw1, 10, 10) << 11) | (bits(hw2, 14, 12) << 8) | bits(hw2, 7, 0);
+    let value = thumb_expand_imm(imm12);
+    let (base, wide) = T32_DP_IMM_OPS[op as usize];
+    if base.is_empty() {
+        return t32_undefined(hw1, hw2);
+    }
+
+    // The move and the negate are the two operations whose first operand
+    // is the program counter, and the program counter is not printed.
+    let (name, show_rn): (String, bool) = if rn == 15 && op == 2 {
+        (
+            if s { "movs.w" } else { "mov.w" }.to_string(),
+            false,
+        )
+    } else if rn == 15 && op == 3 {
+        (if s { "mvns" } else { "mvn" }.to_string(), false)
+    } else {
+        let mut n = String::from(base);
+        if s {
+            n.push('s');
+        }
+        if wide {
+            n.push_str(".w");
+        }
+        (n, true)
+    };
+
+    if s && rd == 15 {
+        if let Some(test) = t32_test_name(op) {
+            let text = format!("{test} {}, {}", reg(rn), imm(i64::from(value)));
+            return R::new(test.trim_end_matches(".w"), text);
+        }
+    }
+
+    let text = if show_rn {
+        format!("{name} {}, {}, {}", reg(rd), reg(rn), imm(i64::from(value)))
+    } else {
+        format!("{name} {}, {}", reg(rd), imm(i64::from(value)))
+    };
+    R::new(base, text)
+}
+
+/// The class with a wide immediate.
+///
+/// `11110 i 1 op(5) Rn | 0 imm3 Rd imm8`. The five-bit operation field
+/// picks between the add and the subtract of a twelve-bit immediate, the
+/// move of a sixteen-bit one, the two saturations, and the two
+/// bit-field operations.
+///
+/// The layout here was measured rather than remembered, and two things
+/// that a description of the class would lead you to get wrong are worth
+/// writing down:
+///
+/// * the operation field is five bits wide and starts at the eighth bit
+///   of the first halfword, so `0b00100` is the move of a sixteen-bit
+///   immediate and `0b00010` is nothing at all;
+/// * the saturations and the bit-field operations are told apart from
+///   the add and the move by the *fourth* bit of the operation field,
+///   which is the eighth bit of the first halfword.
+fn t32_wide_imm(hw1: u32, hw2: u32) -> R {
+    let i = bits(hw1, 10, 10);
+    let rn = bits(hw1, 3, 0);
+    let rd = bits(hw2, 11, 8);
+    let imm3 = bits(hw2, 14, 12);
+    let imm8 = bits(hw2, 7, 0);
+    match bits(hw1, 8, 4) {
+        // The add and the subtract of a twelve-bit immediate, which is used
+        // as it stands.
+        0b00000 | 0b01010 => {
+            let name = if bits(hw1, 8, 4) == 0 { "addw" } else { "subw" };
+            let value = (i << 11) | (imm3 << 8) | imm8;
+            let text = format!(
+                "{name} {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                imm(i64::from(value))
+            );
+            R::new(name, text)
+        }
+        // The move of a sixteen-bit immediate, in two halves. The top
+        // four bits of the value are the register field of the first
+        // halfword, which is otherwise unused in this class.
+        0b00100 | 0b01100 => {
+            let name = if bits(hw1, 8, 4) == 0b00100 { "movw" } else { "movt" };
+            let value = (rn << 12) | (i << 11) | (imm3 << 8) | imm8;
+            let text = format!("{name} {}, {}", reg(rd), imm(i64::from(value)));
+            R::new(name, text)
+        }
+        // The two bit-field operations: the first operand is the field's
+        // low bit and the second its width.
+        //
+        // The low bit of the field is five bits wide, taken from the
+        // three bits above the destination and the two bits below it,
+        // and the width is the five bits below those, plus one.
+        0b10100 | 0b11100 => {
+            let name = if bits(hw1, 8, 4) == 0b10100 { "sbfx" } else { "ubfx" };
+            let lsb = (imm3 << 2) | bits(hw2, 7, 6);
+            let width = bits(hw2, 4, 0) + 1;
+            let text = format!("{name} {}, {}, #{}, #{}", reg(rd), reg(rn), lsb, width);
+            R::new(name, text)
+        }
+        // The insert of a field, and the clearing of one.
+        //
+        // The end of the field is five bits wide, taken from the three
+        // bits above the destination and the two bits below it, and the
+        // five bits below those say how wide the field is, counted
+        // backwards from that end.
+        //
+        // So a width that fits inside the end is the width of a field
+        // that ends there and starts at the given bit, and a width that
+        // does not is a field that starts at the end and is that many
+        // bits wide.
+        //
+        // The clearing is the insert of a field of zeroes, and it has
+        // no source register, so the class reads the destination field
+        // as the register field instead.
+        0b10110 => {
+            let msb = (imm3 << 2) | bits(hw2, 7, 6);
+            let imm5 = bits(hw2, 4, 0);
+            let (lsb, width) = if imm5 <= msb {
+                (imm5, 1)
+            } else {
+                (msb, imm5 - msb + 1)
+            };
+            if rn == 15 {
+                let text = format!("bfc {}, #{}, #{}", reg(rd), lsb, width);
+                R::new("bfc", text)
+            } else {
+                let text = format!("bfi {}, {}, #{}, #{}", reg(rd), reg(rn), lsb, width);
+                R::new("bfi", text)
+            }
+        }
+        // The two saturations, signed and unsigned, in their thirty-two
+        // bit and their sixteen bit forms.
+        //
+        // The value the result is saturated to is one more than the
+        // four bits below the destination in the sixteen bit form and
+        // one more than the five bits below it in the thirty-two bit
+        // form, except in the unsigned forms, where it is the bits
+        // themselves: an unsigned result is saturated to the largest
+        // value that fits and a signed one to the largest positive
+        // value that fits.
+        //
+        // The sixth bit of the second halfword says whether the source
+        // is shifted before it is saturated, and the shift is an
+        // arithmetic one in the sixteen bit forms and a logical one in
+        // the thirty-two bit forms. The fifth bit has no meaning in
+        // this class and must be clear.
+        0b10000 | 0b10010 | 0b11000 | 0b11010 => {
+            let op = bits(hw1, 8, 4);
+            let sixteen = matches!(op, 0b10010 | 0b11010);
+            let signed = matches!(op, 0b10000 | 0b10010);
+            let name = match (sixteen, signed) {
+                (true, true) => "ssat16",
+                (true, false) => "usat16",
+                (false, true) => "ssat",
+                (false, false) => "usat",
+            };
+            // The sixteen bit form has four bits of saturation value
+            // and the thirty-two bit form has five.
+            if sixteen && bits(hw2, 4, 4) == 1 {
+                return t32_undefined(hw1, hw2);
+            }
+            let sat = if sixteen {
+                bits(hw2, 3, 0) + u32::from(signed)
+            } else {
+                bits(hw2, 4, 0) + u32::from(signed)
+            };
+            // The bit that says the source is shifted is the sixth one;
+            // the fifth one has no meaning in this class and must be
+            // clear.
+            if bits(hw2, 5, 5) == 1 {
+                return t32_undefined(hw1, hw2);
+            }
+            let text = if bits(hw2, 6, 6) == 0 {
+                format!("{name} {}, #{}, {}", reg(rd), sat, reg(rn))
+            } else {
+                // The sixteen bit form has no shift of its own: when the
+                // bit that says the source is shifted is set, the
+                // instruction is the thirty-two bit one after all, and
+                // the shift of that one is a logical one.
+                let amount = (imm3 << 2) | bits(hw2, 7, 6);
+                let shift = if sixteen { "asr" } else { "lsl" };
+                let name = if sixteen {
+                    if signed { "ssat" } else { "usat" }
+                } else {
+                    name
+                };
+                format!("{name} {}, #{}, {}, {shift} #{}", reg(rd), sat, reg(rn), amount)
+            };
+            R::new(name, text)
+        }
+        _ => t32_undefined(hw1, hw2),
+    }
+}
+
 /// The displacement of the wide conditional branch.
 ///
 /// `11110 S cond imm6 | 10 J1 0 J2 imm11`, twenty-one bits wide.
+///
+/// The two jump bits are *not* folded with the sign here: they are the
+/// higher halves of the displacement as they stand, and the higher of the
+/// two comes first.  That is the opposite of the wide unconditional
+/// branch, which is worth writing down because the two forms are easy to
+/// confuse.
 fn t32_branch_cond(hw1: u32, hw2: u32) -> i64 {
     let s = bits(hw1, 10, 10);
-    let j_high = bits(hw2, 11, 11);
-    let j_low = bits(hw2, 13, 13);
+    let j1 = bits(hw2, 13, 13);
+    let j2 = bits(hw2, 11, 11);
     let v = (s << 20)
-        | (j_high << 19)
-        | (j_low << 18)
+        | (j2 << 19)
+        | (j1 << 18)
         | (bits(hw1, 5, 0) << 12)
         | (bits(hw2, 10, 0) << 1);
     sext(v, 21)
@@ -1817,227 +2295,596 @@ fn t32_branch_cond(hw1: u32, hw2: u32) -> i64 {
 
 /// The displacement of the wide unconditional branch and of the call.
 ///
-/// `11110 S imm10 | 1x J1 1 J2 imm11`.  The sign bit is folded into the
+/// `11110 S imm10 | 1x J1 1 J2 imm11`. The sign bit is folded into the
 /// jump bits, so a jump in the opposite direction cancels the sign out.
+///
+/// The fold is `I1 = NOT(J1 EOR S)` and `I2 = NOT(J2 EOR S)`, and the two
+/// come into the field with `I1` first.  Which of the two comes first was
+/// measured against both references rather than remembered: a model with
+/// them the other way round agrees with the references on half the
+/// readings and no more, and the one that puts `I1` first agrees on all
+/// of them.
 fn t32_branch_wide(hw1: u32, hw2: u32) -> i64 {
     let s = bits(hw1, 10, 10);
-    let i_high = 1 ^ (bits(hw2, 13, 13) ^ s);
-    let i_low = 1 ^ (bits(hw2, 11, 11) ^ s);
+    let i1 = 1 ^ (bits(hw2, 13, 13) ^ s);
+    let i2 = 1 ^ (bits(hw2, 11, 11) ^ s);
     let v = (s << 24)
-        | (i_high << 23)
-        | (i_low << 22)
+        | (i1 << 23)
+        | (i2 << 22)
         | (bits(hw1, 9, 0) << 12)
         | (bits(hw2, 10, 0) << 1);
     sext(v, 25)
 }
 
-// ---------------------------------------------------------------------------
-// The operation tables
-//
-// Each table is the operation field's own contents, read out of the
-// references one bit at a time.  The names are the ones the references
-// print.
-
-/// The register-operand data processing: the operation field is four bits
-/// wide here, and it is the same order as the immediate table's.
-const T32_DP_OPS: [&str; 16] = [
-    "and", "bic", "orr", "orn", "eor", "", "add", "adc", "sbc", "rsb", "", "mul", "and", "orr", "",
-    "",
-];
-
-/// The immediate data processing: the operation field is three bits wide,
-/// and the same order as the register table's.
-const T32_DP_IMM_OPS: [&str; 8] = ["and", "bic", "orr", "orn", "eor", "", "add", "adc"];
-
-/// The shift types, by their two-bit field.
-const T32_SHIFT: [&str; 4] = ["lsl", "lsr", "asr", "ror"];
-
-/// The register-operand data-processing class.
+/// The displacement of the call to a halfword-aligned target.
 ///
-/// `1110101 op(4) S Rn | 0 imm3 Rd imm2 type Rm`.  The shift amount is
-/// split across the two halfwords: three bits in the second halfword and
-/// two more beside the shift type.
-fn t32_dp_reg(hw1: u32, hw2: u32) -> R {
-    let op = bits(hw1, 8, 5);
-    let s = bits(hw1, 4, 4);
-    let rn = bits(hw1, 3, 0);
-    let rd = bits(hw2, 11, 8);
-    let rm = bits(hw2, 3, 0);
-    let sh_type = bits(hw2, 5, 4);
-    let amount = (bits(hw2, 14, 12) << 2) | bits(hw2, 7, 6);
-    let base = T32_DP_OPS[op as usize];
-    if base.is_empty() {
-        return t32_undefined(hw1, hw2);
+/// `11110 S imm10H | 11 J1 0 J2 imm10L`. The low half of the offset is
+/// ten bits wide and the target is a halfword, so the two low bits of the
+/// displacement are clear.
+///
+/// The jump bits are folded with the sign here as they are in the wide
+/// unconditional branch, and the field is twenty-five bits wide.
+fn t32_branch_call(hw1: u32, hw2: u32) -> i64 {
+    let s = bits(hw1, 10, 10);
+    let i1 = 1 ^ (bits(hw2, 13, 13) ^ s);
+    let i2 = 1 ^ (bits(hw2, 11, 11) ^ s);
+    let v = (s << 24)
+        | (i1 << 23)
+        | (i2 << 22)
+        | (bits(hw1, 9, 0) << 12)
+        | (bits(hw2, 10, 1) << 2);
+    sext(v, 25)
+}
+
+/// The branches of the 32-bit space.
+///
+/// The top bit of the second halfword separates them from the data
+/// processing that shares their first halfword, and two more bits of it
+/// say which of the four forms this is.
+fn t32_branch(hw1: u32, hw2: u32, addr: Addr) -> R {
+    match (bits(hw2, 14, 14), bits(hw2, 12, 12)) {
+        (0, 0) => {
+            // The conditional branch: the condition is the field the
+            // data-processing class uses for its operation.
+            let cond = bits(hw1, 9, 6);
+            if cond > 13 {
+                return t32_undefined(hw1, hw2);
+            }
+            let amount = t32_branch_cond(hw1, hw2);
+            let target = t_target(t_pc(addr), amount);
+            let text = format!("b{}.w {}", CONDS[cond as usize], hex(target.get()));
+            R::new("b", text).flow(FlowKind::ConditionalBranch).to(target)
+        }
+        (0, 1) => {
+            // The unconditional branch.
+            let amount = t32_branch_wide(hw1, hw2);
+            let target = t_target(t_pc(addr), amount);
+            R::new("b", format!("b.w {}", hex(target.get())))
+                .flow(FlowKind::UnconditionalBranch)
+                .to(target)
+        }
+        (1, 1) => {
+            // The call.
+            let amount = t32_branch_wide(hw1, hw2);
+            let target = t_target(t_pc(addr), amount);
+            R::new("bl", format!("bl {}", hex(target.get())))
+                .flow(FlowKind::Call)
+                .to(target)
+        }
+        _ => {
+            // The call to a halfword-aligned target.
+            //
+            // The last bit of the second halfword says whether the target
+            // keeps the bit it would otherwise lose to the halfword
+            // alignment.  It has to be clear: the references agree that the
+            // form with it set is not an instruction at all.
+            if bits(hw2, 0, 0) == 1 {
+                return t32_undefined(hw1, hw2);
+            }
+            let amount = t32_branch_call(hw1, hw2);
+            let target = t_target(t_pc(addr), amount);
+            R::new("blx", format!("blx {}", hex(target.get())))
+                .flow(FlowKind::Call)
+                .to(target)
+        }
     }
-    // A shift of zero means thirty-two for the two right shifts, and one
-    // for the rotate.
-    let amount = match sh_type {
-        0b01 | 0b10 if amount == 0 => 32,
-        0b11 if amount == 0 => 1,
-        _ => amount,
-    };
-    let name = if s == 1 { format!("{base}s") } else { base.to_string() };
-    let text = format!(
-        "{name} {}, {}, {}, {} #{}",
-        reg(rd),
-        reg(rn),
-        reg(rm),
-        T32_SHIFT[sh_type as usize],
-        amount
-    );
-    R::new(base, text)
 }
 
-/// The plain and the modified immediate data-processing class.
+/// The names of the load and store operations, by their width and their
+/// direction.
 ///
-/// `11110 i 0 op S Rn | 0 imm3 Rd imm8`.  The plain form takes a
-/// twelve-bit immediate whose top four bits sit in the first halfword;
-/// the modified form takes an eight-bit one that is either used as it
-/// stands or rotated right by one.
-fn t32_dp_imm(hw1: u32, hw2: u32) -> R {
-    let i = bits(hw1, 10, 10);
-    let op = bits(hw1, 8, 6);
-    let s = bits(hw1, 5, 5);
-    let rn = bits(hw1, 3, 0);
-    let rd = bits(hw2, 11, 8);
-    let imm8 = bits(hw2, 7, 0);
-    // The plain form is the one whose wide bit is clear and whose
-    // operation field is three bits; the modified form is the other.
-    let plain = i == 0 && bits(hw1, 9, 9) == 0;
-    let (base, value) = if plain {
-        let top = bits(hw1, 9, 6);
-        (T32_DP_IMM_OPS[op as usize], (top << 8) | imm8)
-    } else {
-        let value = if i == 0 { imm8 } else { (imm8 >> 1) | ((imm8 & 1) << 7) };
-        (T32_DP_IMM_OPS[op as usize], value)
-    };
-    if base.is_empty() {
-        return t32_undefined(hw1, hw2);
+/// The width is two bits: a byte, a halfword, a word, and a fourth that
+/// the architecture leaves undefined.
+fn t32_ls_name(load: bool, size: u32) -> &'static str {
+    match (load, size) {
+        (true, 0) => "ldrb",
+        (true, 1) => "ldrh",
+        (true, _) => "ldr",
+        (false, 0) => "strb",
+        (false, 1) => "strh",
+        _ => "str",
     }
-    let name = if s == 1 { format!("{base}s") } else { base.to_string() };
-    let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), imm(i64::from(value)));
-    R::new(base, text)
-}
-
-/// The wide-immediate data-processing class.
-///
-/// `11110 i 100100 Rn | 0 imm3 Rd imm8`, which is `movw` when the wide
-/// bit is clear and `movt` when it is set.  The sixteen-bit immediate is
-/// assembled from four fields spread over two halfwords.
-fn t32_movw(hw1: u32, hw2: u32) -> R {
-    let i = bits(hw1, 10, 10);
-    let rd = bits(hw2, 11, 8);
-    let imm4 = bits(hw1, 3, 0);
-    let imm3 = bits(hw2, 14, 12);
-    let imm8 = bits(hw2, 7, 0);
-    let value = (imm4 << 12) | (i << 11) | (imm3 << 8) | imm8;
-    let name = if bits(hw1, 9, 9) == 0 { "movw" } else { "movt" };
-    R::new(name, format!("{name} {}, {}", reg(rd), imm(i64::from(value))))
-}
-
-/// The add-and-subtract-with-wide-immediate class.
-///
-/// `11110 i 100000 Rn | 0 imm3 Rd imm8` is `addw` and `subw`.
-fn t32_addw(hw1: u32, hw2: u32) -> R {
-    let rn = bits(hw1, 3, 0);
-    let rd = bits(hw2, 11, 8);
-    let imm12 = (bits(hw2, 14, 12) << 8) | bits(hw2, 7, 0);
-    let text = if bits(hw1, 9, 9) == 0 {
-        format!("addw {}, {}, {}", reg(rd), reg(rn), imm(i64::from(imm12)))
-    } else {
-        format!("subw {}, {}, {}", reg(rd), reg(rn), imm(i64::from(imm12)))
-    };
-    R::new("addw", text)
 }
 
 /// The single load and store class.
 ///
-/// `1111 1000 U 1 size Rn | Rt imm12` is the immediate form and
-/// `1111 1000 U 0 size Rn | Rt imm2 Rm` is the register form.  The bit
-/// that separates them is the top bit of the second halfword.
+/// The form with a register offset and the form with a pre-, post- or
+/// offset-indexed byte share the space whose seventh bit is clear; the
+/// form with a twelve-bit offset is the one whose seventh bit is set.
+/// The signed loads live in their own half of the space and have no store.
 fn t32_load_store(hw1: u32, hw2: u32) -> R {
-    let u = bits(hw1, 7, 7);
-    let size = bits(hw1, 6, 6);
+    let size = bits(hw1, 6, 5);
+    let load = bits(hw1, 4, 4) == 1;
     let rn = bits(hw1, 3, 0);
     let rt = bits(hw2, 15, 12);
-    let load = bits(hw1, 4, 4) == 1;
-    let sign = if u == 1 { "" } else { "-" };
-    if bits(hw2, 11, 11) == 0 {
-        // The register form: the offset is a register, scaled by the size.
-        let rm = bits(hw2, 3, 0);
-        let base = t32_ls_name(load, size == 1, false);
-        let text = format!("{base} {}, [{}, {}{}]", reg(rt), reg(rn), sign, reg(rm));
-        return R::new(base, text);
+    if size == 0b11 {
+        return t32_undefined(hw1, hw2);
     }
-    // The immediate form: a twelve-bit offset, scaled by the size.
-    let imm12 = bits(hw2, 10, 0);
-    let amount = if size == 0 { i64::from(imm12) * 4 } else { i64::from(imm12) };
-    let base = t32_ls_name(load, size == 1, false);
-    let text = if amount == 0 {
-        format!("{base} {}, [{}]", reg(rt), reg(rn))
+    // The signed loads are the ones whose first halfword has the ninth bit
+    // set; there is no signed store.
+    let signed = bits(hw1, 8, 8) == 1;
+    if signed && !load {
+        return t32_undefined(hw1, hw2);
+    }
+    let name = if signed {
+        match size {
+            0 => "ldrsb".to_string(),
+            _ => "ldrsh".to_string(),
+        }
     } else {
-        format!("{base} {}, [{}, {}{}]", reg(rt), reg(rn), sign, imm(amount))
+        t32_ls_name(load, size).to_string()
     };
-    R::new(base, text)
+    // The form with the twelve-bit offset is the one whose seventh bit is
+    // set; the other two forms share the space.
+    if bits(hw1, 7, 7) == 1 {
+        let offset = bits(hw2, 11, 0);
+        let text = if offset == 0 {
+            format!("{name}.w {}, [{}]", reg(rt), reg(rn))
+        } else {
+            format!(
+                "{name}.w {}, [{}, {}]",
+                reg(rt),
+                reg(rn),
+                imm(i64::from(offset))
+            )
+        };
+        return R::new(name, text);
+    }
+    // The register form has six bits of nothing between the two registers.
+    if bits(hw2, 11, 6) == 0 {
+        let rm = bits(hw2, 3, 0);
+        let amount = bits(hw2, 5, 4);
+        let text = if amount == 0 {
+            format!("{name}.w {}, [{}, {}]", reg(rt), reg(rn), reg(rm))
+        } else {
+            format!(
+                "{name}.w {}, [{}, {}, lsl #{}]",
+                reg(rt),
+                reg(rn),
+                reg(rm),
+                amount
+            )
+        };
+        return R::new(name, text);
+    }
+    // The form with the pre-, post- and offset-indexed byte. Its three
+    // bits say which of the six forms it is, and one of the eight is
+    // reserved for the translation hint.
+    if bits(hw2, 11, 11) == 0 {
+        return t32_undefined(hw1, hw2);
+    }
+    let p = bits(hw2, 10, 10);
+    let u = bits(hw2, 9, 9);
+    let w = bits(hw2, 8, 8);
+    let offset = bits(hw2, 7, 0);
+    let text = match (p, u, w) {
+        (0, 0, 1) => format!(
+            "{name} {}, [{}], {}",
+            reg(rt),
+            reg(rn),
+            imm(-i64::from(offset))
+        ),
+        (0, 1, 1) => format!("{name} {}, [{}], {}", reg(rt), reg(rn), imm(i64::from(offset))),
+        (1, 0, 0) => format!(
+            "{name} {}, [{}, {}]",
+            reg(rt),
+            reg(rn),
+            imm(-i64::from(offset))
+        ),
+        (1, 0, 1) => format!(
+            "{name} {}, [{}, {}]!",
+            reg(rt),
+            reg(rn),
+            imm(-i64::from(offset))
+        ),
+        (1, 1, 1) => format!("{name} {}, [{}, {}]!", reg(rt), reg(rn), imm(i64::from(offset))),
+        (1, 1, 0) => format!("{name}t {}, [{}]", reg(rt), reg(rn)),
+        _ => return t32_undefined(hw1, hw2),
+    };
+    R::new(name, text)
 }
 
-/// The name of a load or a store, by its direction and its width.
-fn t32_ls_name(load: bool, size: bool, signed: bool) -> &'static str {
-    match (load, size, signed) {
-        (true, false, false) => "ldr",
-        (true, false, true) => "ldrsb",
-        (true, true, false) => "ldrh",
-        (true, true, true) => "ldrsh",
-        (false, false, false) => "str",
-        (false, true, false) => "strh",
-        (false, false, true) => "strb",
-        _ => "strb",
+/// The register list of a load or store multiple, as it is written.
+///
+/// The list is the low twelve bits of the second halfword and the link
+/// register. The stack pointer and the program counter are not in it:
+/// a list that names either of them is not an instruction.
+fn t32_reglist(list: u32, store: bool) -> Option<String> {
+    // A store may not name the stack pointer or the program counter; a
+    // load may name either.
+    if store && list & 0xA000 != 0 {
+        return None;
     }
+    let mut names = Vec::new();
+    for i in 0..13 {
+        if list & (1 << i) == 0 {
+            continue;
+        }
+        names.push(reg(i).to_string());
+    }
+    if list & 0x2000 != 0 {
+        names.push("sp".to_string());
+    }
+    if list & 0x4000 != 0 {
+        names.push("lr".to_string());
+    }
+    if list & 0x8000 != 0 {
+        names.push("pc".to_string());
+    }
+    Some(format!("{{{}}}", names.join(", ")))
 }
 
 /// The load and store multiple class.
 ///
-/// `1110 100 op(2) W L Rn | Rt register_list`.  The register list is
-/// sixteen bits wide, and its two top bits name the stack pointer and the
-/// program counter rather than the registers they would otherwise be.
+/// `1110 1000 10 W L Rn | 0 register_list(12)` is the form that adds to
+/// the base and `1110 1001 00 W L Rn | 0 register_list(12)` the one that
+/// takes from it.
 fn t32_ldm(hw1: u32, hw2: u32) -> R {
-    let op = bits(hw1, 7, 6);
-    let w = bits(hw1, 5, 5);
-    let l = bits(hw1, 4, 4);
+    let w = bits(hw1, 5, 5) == 1;
+    let load = bits(hw1, 4, 4) == 1;
     let rn = bits(hw1, 3, 0);
-    let names = t32_reglist(hw2 & 0xFFFF);
-    let base = match (op, l) {
-        (0b00, 0) => "stm",
-        (0b00, 1) => "ldm",
-        (0b01, 0) => "stmdb",
-        (0b01, 1) => "ldmdb",
-        (0b10, 0) => "stmda",
-        (0b10, 1) => "ldmda",
-        _ => "stmia",
+    let db = bits(hw1, 8, 8) == 1;
+    let Some(names) = t32_reglist(hw2, !load) else {
+        return t32_undefined(hw1, hw2);
+    };
+    if names == "{}" {
+        return t32_undefined(hw1, hw2);
+    }
+    // The push and the pop are the two forms with the stack pointer as
+    // their base, and their lists hold no register above the eleventh.
+    if rn == 13 && w && hw2 & 0xF000 == 0 {
+        let name = if load { "pop.w" } else { "push.w" };
+        return R::new(if load { "pop" } else { "push" }, format!("{name} {names}"));
+    }
+    // The form that adds to the base is written with a width suffix and
+    // the one that takes from it is not.
+    let base = match (db, load) {
+        (false, false) => "stm.w",
+        (false, true) => "ldm.w",
+        (true, false) => "stmdb",
+        (true, true) => "ldmdb",
     };
     let mut rn_name = reg(rn).to_string();
-    if w == 1 {
+    if w {
         rn_name.push('!');
     }
     let text = format!("{base} {rn_name}, {names}");
-    R::new(base, text)
+    R::new(base.trim_end_matches(".w"), text)
 }
 
-/// The register list of a load or store multiple, as it is written.
-fn t32_reglist(list: u32) -> String {
-    let mut names = Vec::new();
-    for i in 0..16 {
-        if list & (1 << i) == 0 {
-            continue;
+/// The load and store dual class.
+///
+/// The pair of registers is in the top eight bits of the second halfword
+/// and the offset in the low eight, scaled by the size of a doubleword.
+fn t32_ldrd(hw1: u32, hw2: u32) -> R {
+    let load = bits(hw1, 4, 4) == 1;
+    let rn = bits(hw1, 3, 0);
+    let rt = bits(hw2, 15, 12);
+    let rt2 = bits(hw2, 11, 8);
+    let offset = i64::from(bits(hw2, 7, 0)) * 4;
+    let name = if load { "ldrd" } else { "strd" };
+    // The three bits say how the offset is applied: the base is written
+    // back before the access, after it, or not at all.
+    let p = bits(hw1, 8, 8) == 1;
+    let u = bits(hw1, 7, 7) == 1;
+    let w = bits(hw1, 5, 5) == 1;
+    let signed = if u { offset } else { -offset };
+    let text = match (p, w) {
+        (true, true) => format!(
+            "{name} {}, {}, [{}, {}]!",
+            reg(rt),
+            reg(rt2),
+            reg(rn),
+            imm(signed)
+        ),
+        (true, false) => format!(
+            "{name} {}, {}, [{}, {}]",
+            reg(rt),
+            reg(rt2),
+            reg(rn),
+            imm(signed)
+        ),
+        _ => format!(
+            "{name} {}, {}, [{}], {}",
+            reg(rt),
+            reg(rt2),
+            reg(rn),
+            imm(signed)
+        ),
+    };
+    R::new(name, text)
+}
+
+/// The exclusive access class.
+///
+/// The store-exclusive and the load-exclusive differ in one bit of the
+/// first halfword, and the second halfword says which of the byte, half
+/// and doubleword forms this is.
+fn t32_exclusive(hw1: u32, hw2: u32) -> R {
+    let load = bits(hw1, 4, 4) == 1;
+    let rn = bits(hw1, 3, 0);
+    let rt = bits(hw2, 15, 12);
+    let offset = i64::from(bits(hw2, 7, 0)) * 4;
+    if load {
+        // The load-exclusive: the four bits beside the offset are all set,
+        // and the four beside those say whether it is the word or the
+        // doubleword form.
+        if bits(hw2, 11, 8) != 0b1111 || !matches!(bits(hw2, 7, 4), 0b0000 | 0b1111) {
+            return t32_undefined(hw1, hw2);
         }
-        names.push(match i {
-            13 => "sp".to_string(),
-            14 => "lr".to_string(),
-            15 => "pc".to_string(),
-            _ => reg(i).to_string(),
-        });
+        let text = if offset == 0 {
+            format!("ldrex {}, [{}]", reg(rt), reg(rn))
+        } else {
+            format!("ldrex {}, [{}, {}]", reg(rt), reg(rn), imm(offset))
+        };
+        return R::new("ldrex", text);
     }
-    format!("{{{}}}", names.join(", "))
+    // The store-exclusive, and the test-and-set forms that share its
+    // space. The test-and-set forms are the ones whose first register is
+    // the program counter.
+    if rt == 15 {
+        let name = match bits(hw2, 7, 4) {
+            0b0000 => "tt",
+            0b1111 => "ttat",
+            _ => "tta",
+        };
+        let text = format!("{name} {}, {}", reg(bits(hw2, 11, 8)), reg(rn));
+        return R::new(name, text);
+    }
+    let rd = bits(hw2, 11, 8);
+    let text = if offset == 0 {
+        format!("strex {}, {}, [{}]", reg(rd), reg(rt), reg(rn))
+    } else {
+        format!(
+            "strex {}, {}, [{}, {}]",
+            reg(rd),
+            reg(rt),
+            reg(rn),
+            imm(offset)
+        )
+    };
+    R::new("strex", text)
+}
+
+/// The shift by a register, the extend, and the saturating add and
+/// subtract.
+///
+/// `1111 1010 op(3) S Rn | 1111 Rd ...` is the class of the register
+/// shifts; the same space holds the extends and the parallel additions
+/// and subtractions, and the second halfword says which of them.
+fn t32_dp_reg2(hw1: u32, hw2: u32) -> R {
+    let rn = bits(hw1, 3, 0);
+    let rd = bits(hw2, 11, 8);
+    let rm = bits(hw2, 3, 0);
+    let s = bits(hw1, 4, 4) == 1;
+    let kind = bits(hw1, 7, 5);
+    let variant = bits(hw2, 7, 4);
+
+    // The parallel additions and subtractions, which sit in the space with
+    // the seventh bit set.
+    if kind & 0b100 != 0 {
+        let plain = match bits(hw1, 6, 4) {
+            0b000 => "sadd8",
+            0b001 => "sadd16",
+            0b010 => "sasx",
+            0b100 => "ssub8",
+            0b101 => "ssub16",
+            0b110 => "ssax",
+            _ => return t32_undefined(hw1, hw2),
+        };
+        let name = match variant {
+            0b0000 => plain.to_string(),
+            0b0001 => match plain {
+                "sadd8" | "ssub8" => "qadd8".to_string(),
+                "sadd16" | "ssub16" => "qadd16".to_string(),
+                _ => "qasx".to_string(),
+            },
+            0b0010 => match plain {
+                "sadd8" | "ssub8" => "shadd8".to_string(),
+                "sadd16" | "ssub16" => "shadd16".to_string(),
+                _ => "shasx".to_string(),
+            },
+            0b0011 => "qadd".to_string(),
+            0b0100 => match plain {
+                "sadd8" | "ssub8" => "uadd8".to_string(),
+                "sadd16" | "ssub16" => "uadd16".to_string(),
+                _ => "uasx".to_string(),
+            },
+            0b0101 => match plain {
+                "sadd8" | "ssub8" => "uqadd8".to_string(),
+                "sadd16" | "ssub16" => "uqadd16".to_string(),
+                _ => "uqasx".to_string(),
+            },
+            0b0110 => match plain {
+                "sadd8" | "ssub8" => "uhadd8".to_string(),
+                "sadd16" | "ssub16" => "uhadd16".to_string(),
+                _ => "uhasx".to_string(),
+            },
+            0b0111 => "uqadd".to_string(),
+            _ => return t32_undefined(hw1, hw2),
+        };
+        let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), reg(rm));
+        return R::new(name, text);
+    }
+
+    // The extends, which are the shifts with the fourth bit of the
+    // variant set.
+    if variant == 0b1111 {
+        let name = match (kind & 0b011, s) {
+            (0b00, false) => "sxtah",
+            (0b00, true) => "uxtah",
+            (0b01, false) => "sxtab16",
+            (0b01, true) => "uxtab16",
+            (0b10, false) => "sxtab",
+            (0b10, true) => "uxtab",
+            _ => return t32_undefined(hw1, hw2),
+        };
+        // The rotate is the two bits beside the offset, and they count
+        // down rather than up.
+        let rotate = ((bits(hw2, 4, 4) << 1) | bits(hw2, 5, 5)) * 8;
+        let text = format!(
+            "{name} {}, {}, {}, ror #{}",
+            reg(rd),
+            reg(rn),
+            reg(rm),
+            rotate
+        );
+        return R::new(name, text);
+    }
+
+    // The shifts by a register.
+    let name = match kind & 0b011 {
+        0b00 => "lsl",
+        0b01 => "lsr",
+        0b10 => "asr",
+        _ => "ror",
+    };
+    let mut full = String::from(name);
+    if s {
+        full.push('s');
+    }
+    full.push_str(".w");
+    let text = format!("{full} {}, {}, {}", reg(rd), reg(rn), reg(rm));
+    R::new(name, text)
+}
+
+/// The multiply family.
+///
+/// `1111 1011 op(4) Rn | Rd Ra ...` holds the multiplies, the long
+/// multiplies and the half-word multiplies. The operation field picks
+// which of them, and the four bits beside the registers pick the form.
+fn t32_multiply(hw1: u32, hw2: u32) -> R {
+    let rn = bits(hw1, 3, 0);
+    let rd = bits(hw2, 15, 12);
+    let rm = bits(hw2, 3, 0);
+    let ra = bits(hw2, 7, 4);
+    let rna = bits(hw2, 11, 8);
+    let op = bits(hw1, 7, 4);
+    let variant = bits(hw2, 5, 4);
+    match op {
+        // The multiply-accumulate and the multiply-long.
+        0b0000 => {
+            let name = if variant == 0 { "mla" } else { "mls" };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new(name, text)
+        }
+        // The half-word multiplies that add.
+        0b0001 => {
+            let name = match variant {
+                0b00 => "smlabb",
+                0b01 => "smlabt",
+                0b10 => "smlatb",
+                _ => return t32_undefined(hw1, hw2),
+            };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new(name, text)
+        }
+        // The half-word multiplies that add two products.
+        0b0010 => {
+            let name = match variant {
+                0b00 => "smlad",
+                0b01 => "smladx",
+                _ => return t32_undefined(hw1, hw2),
+            };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new(name, text)
+        }
+        // The half-word multiplies that subtract.
+        0b0100 => {
+            let name = match variant {
+                0b00 => "smlsd",
+                0b01 => "smlsdx",
+                _ => return t32_undefined(hw1, hw2),
+            };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new(name, text)
+        }
+        // The multiplies by half a word that accumulate.
+        0b0101 | 0b0110 => {
+            let name = if op == 0b0101 { "smmla" } else { "smmls" };
+            let name = match variant {
+                0b00 => name.to_string(),
+                0b01 => format!("{name}r"),
+                _ => return t32_undefined(hw1, hw2),
+            };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new(name, text)
+        }
+        // The accumulation of four products.
+        0b0111 => {
+            let text = format!(
+                "usada8 {}, {}, {}, {}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                reg(ra)
+            );
+            R::new("usada8", text)
+        }
+        // The long multiplies.
+        0b1000 | 0b1010 => {
+            let name = if op == 0b1000 { "smull" } else { "umull" };
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(rd),
+                reg(rna),
+                reg(rm),
+                reg(rn)
+            );
+            R::new(name, text)
+        }
+        _ => t32_undefined(hw1, hw2),
+    }
 }
 
 /// The undefined instruction in the 32-bit space.
@@ -2050,80 +2897,83 @@ fn t32_undefined(hw1: u32, hw2: u32) -> R {
     .flow(FlowKind::Exception)
 }
 
-
 /// Decode one 32-bit T32 instruction, assembled from two halfwords.
 ///
 /// The first halfword picks the class.  Most classes are picked by the
-/// high bits alone; the ones that share a space are separated by the top
-/// bit of the second halfword, and that bit was measured to be what
-/// separates them.
+/// high bits alone; the ones that share a space are separated by a bit of
+/// the second halfword, and that bit was measured to be what separates
+/// them.
 fn t32(w: u32, addr: Addr) -> R {
     let hw1 = w & 0xFFFF;
     let hw2 = (w >> 16) & 0xFFFF;
-    match hw1 >> 8 {
+    match hw1 >> 9 {
         // `1110100`: the load and store multiple family, the exclusive
         // accesses, and the table branch.
-        0xE8 | 0xE9 => t32_ldm(hw1, hw2),
+        0b1110100 => {
+            // The sixth bit says which of the two families this is: the
+            // load and store multiple, or the pair of registers that the
+            // exclusive accesses and the double loads share.
+            if bits(hw1, 6, 6) == 0 {
+                match (bits(hw1, 8, 8), bits(hw1, 7, 7)) {
+                    // The form that adds to the base, and the one that
+                    // takes from it.
+                    (0, 1) => t32_ldm(hw1, hw2),
+                    (1, 0) => t32_ldm(hw1, hw2),
+                    _ => t32_undefined(hw1, hw2),
+                }
+            } else if bits(hw1, 8, 8) == 0 && bits(hw1, 5, 5) == 0 {
+                t32_exclusive(hw1, hw2)
+            } else if bits(hw1, 8, 8) == 0 && bits(hw1, 7, 7) == 1 {
+                // The acquire and release forms and the table branch.
+                t32_undefined(hw1, hw2)
+            } else {
+                t32_ldrd(hw1, hw2)
+            }
+        }
         // `1110101`: the register-operand data processing.
-        0xEA | 0xEB => t32_dp_reg(hw1, hw2),
+        0b1110101 => t32_dp_reg(hw1, hw2),
         // `1110110` and `1110111`: the coprocessor and the vector space,
         // which this decoder does not cover.
-        0xEC | 0xED | 0xEE | 0xEF => t32_undefined(hw1, hw2),
-        // `1111 00`: the data processing with an immediate.
-        0xF0 | 0xF1 | 0xF2 | 0xF3 | 0xF4 | 0xF5 | 0xF6 | 0xF7 => {
-            t32_immediate(hw1, hw2, addr)
+        0b1110110 | 0b1110111 => {
+            R::new(
+                ".word",
+                format!(".word {} ; coprocessor (VFP/NEON)", hex(u64::from((hw2 << 16) | hw1))),
+            )
+            .flow(FlowKind::Exception)
         }
-        // `1111 10`: the single load and store.
-        0xF8 | 0xF9 => t32_load_store(hw1, hw2),
-        // `1111 11`: the extends, the multiplies, and the coprocessor.
-        0xFA | 0xFB => t32_undefined(hw1, hw2),
-        0xFC | 0xFD | 0xFE | 0xFF => t32_undefined(hw1, hw2),
-        _ => t32_undefined(hw1, hw2),
-    }
-}
-
-/// The data-processing class with an immediate, and the branches that
-/// share its space.
-///
-/// The top bit of the second halfword is what separates them: with it
-/// clear the instruction is a data-processing one, and with it set the
-/// first halfword's operation field is a condition and the instruction is
-/// a branch.
-fn t32_immediate(hw1: u32, hw2: u32, addr: Addr) -> R {
-    if bits(hw2, 15, 15) == 1 {
-        // A branch.  The condition is the field that the data-processing
-        // class uses for its operation.
-        let cond = bits(hw1, 9, 6);
-        if cond == 0b1110 {
-            // `1110`: the unconditional wide branch.
-            let amount = t32_branch_wide(hw1, hw2);
-            let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
-            return R::new("b", format!("b.w {}", hex(target.get())))
-                .flow(FlowKind::UnconditionalBranch)
-                .to(target);
+        // `11110xx`: the data processing with an immediate, and the
+        // branches that share its space.
+        //
+        // The four classes here are the modified immediate and the plain
+        // binary immediate, each with the top bit of the twelve-bit
+        // immediate clear or set.  The bit that tells them apart is the
+        // ninth: zero is the modified immediate, which is the one with
+        // the rotated eight-bit field.
+        0b1111000 | 0b1111001 | 0b1111010 | 0b1111011 => {
+            if bits(hw2, 15, 15) == 1 {
+                t32_branch(hw1, hw2, addr)
+            } else if bits(hw1, 9, 9) == 0 {
+                t32_dp_imm(hw1, hw2)
+            } else {
+                t32_wide_imm(hw1, hw2)
+            }
         }
-        if cond == 0b1111 {
-            // `1111`: the call.
-            let amount = t32_branch_wide(hw1, hw2);
-            let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
-            return R::new("bl", format!("bl {}", hex(target.get())))
-                .flow(FlowKind::Call)
-                .to(target);
-        }
-        let amount = t32_branch_cond(hw1, hw2);
-        let target = Addr((t_pc(addr) + i128::from(amount)) as u64);
-        let suffix = CONDS[cond as usize];
-        let text = format!("b{suffix}.w {}", hex(target.get()));
-        return R::new("b", text).flow(FlowKind::ConditionalBranch).to(target);
-    }
-    // A data-processing instruction with an immediate.  The operation
-    // field's top bit says which of the two families this is.
-    match bits(hw1, 9, 9) {
-        0 => t32_dp_imm(hw1, hw2),
-        _ => match bits(hw1, 9, 8) {
-            (0b10 | 0b11) if bits(hw1, 9, 9) == 1 => t32_movw(hw1, hw2),
-            _ => t32_undefined(hw1, hw2),
+        // `11111xx`: the single load and store, the register data
+        // processing, the multiplies, and the coprocessor space.
+        0b1111100 | 0b1111101 | 0b1111110 | 0b1111111 => match hw1 >> 8 {
+            0xF8 | 0xF9 => t32_load_store(hw1, hw2),
+            0xFA => t32_dp_reg2(hw1, hw2),
+            0xFB => t32_multiply(hw1, hw2),
+            _ => R::new(
+                ".word",
+                format!(
+                    ".word {} ; coprocessor (VFP/NEON)",
+                    hex(u64::from((hw2 << 16) | hw1))
+                ),
+            )
+            .flow(FlowKind::Exception),
         },
+        _ => t32_undefined(hw1, hw2),
     }
 }
 
