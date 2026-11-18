@@ -1,9 +1,15 @@
-//! x86-64 lifting: Intel-syntax text to [`Stmt`]s.
+//! x86 lifting: Intel-syntax text to [`Stmt`]s.
 //!
 //! The decoder renders every instruction to text; this module reads that text
 //! back. That sounds like a detour, and it is one, but it keeps a single source
 //! of truth for operand formatting and makes the lifter testable against the
 //! same strings a human sees.
+//!
+//! Both widths are modelled. The instruction set is the same one, and the
+//! differences that matter are a small, closed list: the registers are half as
+//! wide and named differently, the stack slots are four bytes instead of
+//! eight, there are no `r8`-`r15`, and every argument arrives on the stack
+//! instead of in a register. [`Mode`] carries that and the target reads it.
 //!
 //! What is modelled: general-purpose registers at all four widths, the stack
 //! frame (so `[rbp-0x8]` becomes `local_8`), flags as a pending comparison,
@@ -14,12 +20,41 @@
 use occ_core::{Addr, FlowKind, Instruction};
 
 use super::{
-    merge_write,
+    merge_write, slot_name,
     Core, Lifted, Operand, Parsed, Reg, Target, VecClass, parse_int, split_operands,
 };
 use crate::ir::{
     BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp, mask,
 };
+
+/// The register width a target models.
+///
+/// This is not a property of an instruction but of the image: the same
+/// `mov eax, [ebp+8]` means one thing to a 32-bit processor and does not
+/// exist for a 64-bit one, which spells the same operation `mov rax,
+/// [rbp+8]` and keeps its arguments in registers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// 64-bit: sixteen general-purpose registers, `rax` through `r15`.
+    Bits64,
+    /// 32-bit: eight general-purpose registers, `eax` through `edi`.
+    Bits32,
+}
+
+impl Mode {
+    /// The full width of a general-purpose register, in bytes.
+    pub const fn width(self) -> u8 {
+        match self {
+            Mode::Bits64 => 8,
+            Mode::Bits32 => 4,
+        }
+    }
+
+    /// True for the 32-bit mode.
+    pub const fn is_32(self) -> bool {
+        matches!(self, Mode::Bits32)
+    }
+}
 
 /// Registers by name: name, index, size, bit offset.
 const REG_TABLE: &[(&str, u8, u8, u8)] = &[
@@ -100,15 +135,77 @@ const REG64: [&str; 17] = [
     "r13", "r14", "r15", "rip",
 ];
 
+/// Canonical 32-bit names by index.
+///
+/// The eight names are the same registers, under the names a 32-bit
+/// processor gives them. Keeping a second table rather than truncating the
+/// first is what stops `mov eax, [ebp+8]` from being read as a write to
+/// `rax`: they are the same register, and a reader of one width's listing
+/// sees one width's names.
+const REG32: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
+
+/// Registers of the 32-bit mode: name, index, size, bit offset.
+///
+/// The high-byte forms (`ah`, `ch`, …) exist here as they do in 64-bit mode.
+/// The low-byte forms that need a REX prefix — `spl`, `bpl`, `sil`, `dil` —
+/// do not, because a 32-bit encoding has no REX prefix to spend on them.
+const REG32_TABLE: &[(&str, u8, u8, u8)] = &[
+    ("eax", 0, 4, 0),
+    ("ax", 0, 2, 0),
+    ("al", 0, 1, 0),
+    ("ah", 0, 1, 8),
+    ("ecx", 1, 4, 0),
+    ("cx", 1, 2, 0),
+    ("cl", 1, 1, 0),
+    ("ch", 1, 1, 8),
+    ("edx", 2, 4, 0),
+    ("dx", 2, 2, 0),
+    ("dl", 2, 1, 0),
+    ("dh", 2, 1, 8),
+    ("ebx", 3, 4, 0),
+    ("bx", 3, 2, 0),
+    ("bl", 3, 1, 0),
+    ("bh", 3, 1, 8),
+    ("esp", 4, 4, 0),
+    ("sp", 4, 2, 0),
+    ("ebp", 5, 4, 0),
+    ("bp", 5, 2, 0),
+    ("esi", 6, 4, 0),
+    ("si", 6, 2, 0),
+    ("edi", 7, 4, 0),
+    ("di", 7, 2, 0),
+];
+
 const RSP: u8 = 4;
 const RBP: u8 = 5;
 const RAX: u8 = 0;
 const RCX: u8 = 1;
 const RIP: u8 = 16;
 
-/// Registers a call may overwrite: every general-purpose register that is
-/// neither callee-saved nor the stack or frame pointer.
+/// Registers a call may overwrite, in 64-bit mode: every general-purpose
+/// register that is neither callee-saved nor the stack or frame pointer.
 const CALLER_SAVED: &[u8] = &[0, 1, 2, 6, 7, 8, 9, 10, 11];
+
+/// Registers a call may overwrite in 32-bit mode.
+///
+/// `esi` and `edi` are in the 64-bit list and not in this one, because the
+/// two conventions disagree about them: `cdecl` makes them callee-saved, and
+/// marking them clobbered turned a value the callee had to preserve into
+/// `<esi after a call>`.
+const CALLER_SAVED_32: &[u8] = &[0, 1, 2];
+
+/// Registers a callee has to preserve, by mode.
+///
+/// `push ebx` at the top of a function is the function saving a register it
+/// is about to borrow, and the same instruction in the middle of a body is
+/// an argument being pushed. The difference is the position, and this is the
+/// half of it that the mnemonic can answer.
+const fn is_callee_saved(mode: Mode, idx: u8) -> bool {
+    match mode {
+        Mode::Bits32 => matches!(idx, 3 | 5 | 6 | 7),
+        Mode::Bits64 => matches!(idx, 3 | 5 | 12 | 13 | 14 | 15),
+    }
+}
 
 /// Integer argument registers in System V order: `rdi`, `rsi`, `rdx`,
 /// `rcx`, `r8`, `r9`.
@@ -126,28 +223,75 @@ pub const WIN64_ARG_REGS: [u8; 4] = [1, 2, 8, 9];
 /// Which calling convention a binary's functions follow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Abi {
-    /// System V, used by Linux, the BSDs and macOS.
+    /// System V, used by Linux, the BSDs and macOS on x86-64.
     SysV,
     /// The Windows x64 convention.
     Win64,
+    /// 32-bit x86, arguments on the stack, caller removes them.
+    Cdecl,
+    /// 32-bit x86, arguments on the stack, callee removes them.
+    Stdcall,
 }
 
-/// The x86-64 target.
+impl Abi {
+    /// True when the callee removes the arguments from the stack.
+    ///
+    /// This shows up in the code as `ret 8` instead of `ret`, so the fact is
+    /// in the instruction stream and does not have to be guessed from the
+    /// container. It decides how a `ret imm` is read: a callee that removes
+    /// eight bytes takes two four-byte arguments, which is a fact about the
+    /// function's arity that the body may never mention.
+    pub const fn pops_arguments(self) -> bool {
+        matches!(self, Abi::Stdcall)
+    }
+}
+
+/// The x86 target.
 #[derive(Clone, Copy)]
 pub struct X86Target {
     /// Which convention its argument registers follow.
     abi: Abi,
+    /// Which register width it models.
+    mode: Mode,
 }
 
 impl X86Target {
-    /// The System V target.
+    /// The 64-bit System V target.
     pub const fn sysv() -> Self {
-        X86Target { abi: Abi::SysV }
+        X86Target {
+            abi: Abi::SysV,
+            mode: Mode::Bits64,
+        }
     }
 
-    /// The Windows x64 target.
+    /// The 64-bit Windows target.
     pub const fn win64() -> Self {
-        X86Target { abi: Abi::Win64 }
+        X86Target {
+            abi: Abi::Win64,
+            mode: Mode::Bits64,
+        }
+    }
+
+    /// The 32-bit System V target: every argument on the stack.
+    pub const fn cdecl() -> Self {
+        X86Target {
+            abi: Abi::Cdecl,
+            mode: Mode::Bits32,
+        }
+    }
+
+    /// The 32-bit Windows target: every argument on the stack, removed by
+    /// the callee.
+    pub const fn stdcall() -> Self {
+        X86Target {
+            abi: Abi::Stdcall,
+            mode: Mode::Bits32,
+        }
+    }
+
+    /// Which width this target models.
+    pub const fn mode(&self) -> Mode {
+        self.mode
     }
 }
 
@@ -159,24 +303,55 @@ fn lookup_reg(name: &str) -> Option<Reg> {
         .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset))
 }
 
+/// The register a name refers to in a given mode.
+///
+/// The two modes share a register file but not a spelling, and the names are
+/// not interchangeable: `rax` is not a register a 32-bit processor has, and
+/// `eax` in a 64-bit listing is a view of `rax` at half width. Reading a
+/// 32-bit instruction with the 64-bit table would turn `push eax` into a
+/// four-byte push of a name the body never uses.
+fn lookup_reg_in(mode: Mode, name: &str) -> Option<Reg> {
+    match mode {
+        Mode::Bits64 => lookup_reg(name),
+        Mode::Bits32 => REG32_TABLE
+            .iter()
+            .find(|(n, _, _, _)| *n == name)
+            .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset)),
+    }
+}
+
 impl Target for X86Target {
     fn lookup_reg(&self, name: &str) -> Option<Reg> {
-        lookup_reg(name)
+        lookup_reg_in(self.mode, name)
     }
 
     fn reg_name(&self, idx: u8) -> String {
-        REG64.get(usize::from(idx)).copied().unwrap_or("rax").to_string()
+        let table = match self.mode {
+            Mode::Bits64 => REG64.get(usize::from(idx)).copied(),
+            Mode::Bits32 => REG32.get(usize::from(idx)).copied(),
+        };
+        table.unwrap_or("rax").to_string()
     }
 
     fn reg_width(&self, _idx: u8) -> u8 {
-        8
+        self.mode.width()
     }
 
     fn arg_regs(&self) -> &[u8] {
         match self.abi {
             Abi::SysV => &ARG_REGS,
             Abi::Win64 => &WIN64_ARG_REGS,
+            // Every argument is pushed; there is no register to name.
+            Abi::Cdecl | Abi::Stdcall => &[],
         }
+    }
+
+    fn args_on_stack(&self) -> bool {
+        self.mode.is_32()
+    }
+
+    fn pops_arguments(&self) -> bool {
+        self.abi.pops_arguments()
     }
 
     fn ret_reg(&self) -> u8 {
@@ -222,7 +397,7 @@ impl Target for X86Target {
     }
 
     fn parse(&self, text: &str) -> Option<Parsed> {
-        parse(text)
+        parse_in(self.mode, text)
     }
 }
 
@@ -368,8 +543,13 @@ fn parity_flag(result: &Expr, bits: u8) -> Expr {
     }
 }
 
-/// Parse the decoder's textual form.
+/// Parse the decoder's textual form, reading register names as 64-bit ones.
 pub fn parse(text: &str) -> Option<Parsed> {
+    parse_in(Mode::Bits64, text)
+}
+
+/// Parse the decoder's textual form for one register width.
+pub fn parse_in(mode: Mode, text: &str) -> Option<Parsed> {
     // The decoder appends resolved addresses as comments and branch deltas in
     // parentheses; neither is part of the instruction.
     let mut body = text;
@@ -408,7 +588,7 @@ pub fn parse(text: &str) -> Option<Parsed> {
     let mut ops = Vec::new();
     if !rest.is_empty() {
         for part in split_operands(rest) {
-            ops.push(parse_operand(part.trim())?);
+            ops.push(parse_operand(mode, part.trim())?);
         }
     }
     Some(Parsed {
@@ -419,25 +599,42 @@ pub fn parse(text: &str) -> Option<Parsed> {
     })
 }
 
-fn parse_operand(s: &str) -> Option<Operand> {
+fn parse_operand(mode: Mode, s: &str) -> Option<Operand> {
     let (size_hint, rest) = split_size_prefix(s);
     let mut rest = rest.trim();
     let mut seg = None;
-    for (prefix, name) in [("fs:", "fs"), ("gs:", "gs"), ("cs:", "cs"), ("ss:", "ss")] {
+    // A segment prefix is not decoration: it says the operand is memory. The
+    // decoder prints one on every absolute operand, including the ones it
+    // renders without brackets, and `mov eax, ds:0xc0` is a load from 0xc0
+    // rather than the number 0xc0.
+    let mut addressed = false;
+    // Four of the six segments are the flat model's own: their base is zero,
+    // and `ds:0x40` is the address `0x40`. `fs` and `gs` really do point
+    // somewhere else, which is how a thread-local access is spelled, so those
+    // two are kept on the operand.
+    for (prefix, name) in [
+        ("fs:", Some("fs")),
+        ("gs:", Some("gs")),
+        ("ds:", None),
+        ("es:", None),
+        ("cs:", None),
+        ("ss:", None),
+    ] {
         if let Some(r) = rest.strip_prefix(prefix) {
-            seg = Some(name);
+            seg = name;
             rest = r.trim();
+            addressed = true;
             break;
         }
     }
     if let Some(inner) = rest.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-        let mut op = parse_memory(inner, size_hint.unwrap_or(0))?;
+        let mut op = parse_memory(mode, inner, size_hint.unwrap_or(0))?;
         if let Operand::Mem { seg: slot, .. } = &mut op {
             *slot = seg;
         }
         return Some(op);
     }
-    if let Some(reg) = lookup_reg(rest) {
+    if let Some(reg) = lookup_reg_in(mode, rest) {
         return Some(Operand::Reg(reg));
     }
     // A vector register is not a general-purpose register: it holds
@@ -461,7 +658,26 @@ fn parse_operand(s: &str) -> Option<Operand> {
     {
         return Some(Operand::Fpu(n));
     }
-    parse_int(rest).map(Operand::Imm)
+    // A bare number is an immediate, unless the instruction said what size
+    // the memory it addresses is or named a segment: `mov dword ptr ds:0xb4,
+    // 1` has no brackets, and reading it as two immediates drops the store
+    // entirely while still looking like an instruction that parsed.
+    if let Some(v) = parse_int(rest) {
+        if size_hint.is_some() || addressed {
+            return Some(Operand::Mem {
+                size: size_hint.unwrap_or(0),
+                base: None,
+                index: None,
+                scale: 1,
+                disp: v as i64,
+                abs: Some(v),
+                seg,
+                base_update: None,
+            });
+        }
+        return Some(Operand::Imm(v));
+    }
+    None
 }
 
 /// The register number in a vector register name, if the name is one.
@@ -492,7 +708,7 @@ fn split_size_prefix(s: &str) -> (Option<u8>, &str) {
     (None, s)
 }
 
-fn parse_memory(inner: &str, size: u8) -> Option<Operand> {
+fn parse_memory(mode: Mode, inner: &str, size: u8) -> Option<Operand> {
     let inner = inner.trim();
     let mut base = None;
     let mut index = None;
@@ -527,13 +743,19 @@ fn parse_memory(inner: &str, size: u8) -> Option<Operand> {
     }
 
     for (sign, term) in terms {
+        // `eiz` and `riz` are how the assembler spells "no index register"
+        // in an addressing form that has a place for one. They are not
+        // registers and hold nothing; the term that names them is absent.
+        if term == "eiz" || term == "riz" {
+            continue;
+        }
         if let Some((r, s)) = term.split_once('*') {
-            let reg = lookup_reg(r.trim())?;
+            let reg = lookup_reg_in(mode, r.trim())?;
             index = Some(reg);
             scale = parse_int(s).unwrap_or(1);
             continue;
         }
-        if let Some(reg) = lookup_reg(&term) {
+        if let Some(reg) = lookup_reg_in(mode, &term) {
             if base.is_none() {
                 base = Some(reg);
             } else {
@@ -589,7 +811,41 @@ pub struct Lifter<'a> {
     /// but a question about the counter and, for two of them, about the
     /// zero flag as well.
     loop_condition: Option<Expr>,
+    /// Which register width this lifter reads.
+    ///
+    /// Taken from the target rather than passed in: the register width *is*
+    /// the mode, and two sources for one fact drift.
+    mode: Mode,
+    /// Values pushed since the call being lifted, oldest first.
+    ///
+    /// A 32-bit call is `push arg2; push arg1; call f`, so the values
+    /// between one call and the next are that call's arguments, and the
+    /// last one pushed is the first one passed. The list is emptied when the
+    /// call is lifted, because the next call pushes its own.
+    pushed: Vec<Expr>,
+    /// True once the prologue is over.
+    ///
+    /// The prologue of a 32-bit function is a run of `push ebx`, `push esi`
+    /// and so on that saves callee-saved registers, and those pushes are not
+    /// arguments. The run ends at the first instruction that is not a push;
+    /// after that a push of a callee-saved register is a value the program
+    /// is passing.
+    frame_ready: bool,
+    /// Bytes of argument the epilogue removes, from `ret 8`.
+    ///
+    /// A callee that removes its own arguments states its arity in the
+    /// instruction, whether or not the body reads all of them.
+    pops: Option<u64>,
 }
+
+/// How many arguments a 32-bit function can be handed before the count stops
+/// being worth naming.
+///
+/// Reading past the ones the body mentions would invent parameters; stopping
+/// too early leaves a read of `arg_28_u32` unnamed. Eight is where the two
+/// errors meet for code a compiler produces, and a reader can still see the
+/// offset in the name beyond it.
+const MAX_STACK_ARGS: usize = 8;
 
 impl<'a> Lifter<'a> {
     /// Build a lifter.
@@ -607,6 +863,107 @@ impl<'a> Lifter<'a> {
             wrote_x87: false,
             float_width: 0,
             loop_condition: None,
+            mode: if target.reg_width(0) == 4 {
+                Mode::Bits32
+            } else {
+                Mode::Bits64
+            },
+            pushed: Vec::new(),
+            frame_ready: false,
+            pops: None,
+        }
+    }
+
+    /// The full width of a general-purpose register, in bytes.
+    fn width(&self) -> u8 {
+        self.mode.width()
+    }
+
+    /// The canonical name of a register at this target's width.
+    fn reg(&self, idx: u8) -> String {
+        self.core.name(idx)
+    }
+
+    /// Add a value to a register, in place.
+    ///
+    /// The string instructions move their pointers by the width of one
+    /// element, and both the name and the width of the arithmetic come from
+    /// the mode: `esi` and `edi` in 32-bit mode wrap at four bytes.
+    fn bump(&mut self, idx: u8, value: Expr, stmts: &mut Vec<Stmt>) {
+        let name = self.reg(idx);
+        let sum = Expr::Bin {
+            op: BinOp::Add,
+            lhs: Box::new(Expr::var(name.clone())),
+            rhs: Box::new(value),
+            bits: self.width(),
+        };
+        self.core.assign(&name, sum, stmts);
+    }
+
+    /// The arguments a call at this point passes.
+    ///
+    /// A 32-bit call passes the values pushed since the last one, and the
+    /// last value pushed is the first argument: the conventions that use the
+    /// stack push the arguments right to left. The register architectures
+    /// pass only the argument registers this function has already set, which
+    /// is what a call in the middle of a body needs.
+    fn args_for_call(&self) -> Vec<Expr> {
+        if self.core.target.args_on_stack() {
+            return self.pushed.iter().rev().cloned().collect();
+        }
+        self.core.call_args()
+    }
+
+    /// The arguments of the call being lifted, which consumes them.
+    ///
+    /// The next call in this block pushes its own arguments, and a list that
+    /// kept these would give it a phantom argument per call already made.
+    fn take_args_for_call(&mut self) -> Vec<Expr> {
+        if self.core.target.args_on_stack() {
+            return std::mem::take(&mut self.pushed).into_iter().rev().collect();
+        }
+        self.core.call_args()
+    }
+
+    /// The count register times the width of one element.
+    fn count_times(&self, width: u8) -> Expr {
+        let count = Expr::var(self.reg(RCX));
+        if width == 1 {
+            // A byte count is the count. Multiplying it by one says the same
+            // thing more slowly.
+            return count;
+        }
+        Expr::Bin {
+            op: BinOp::Mul,
+            lhs: Box::new(count),
+            rhs: Box::new(Expr::Const(u64::from(width))),
+            bits: self.width(),
+        }
+    }
+
+    /// Give every memory operand that states no width the width the
+    /// instruction works at.
+    ///
+    /// The decoder prints `dword ptr` when nothing else in the encoding says
+    /// how wide the access is, and leaves it out when a register operand
+    /// already says: `mov eax, ds:0xc0` loads four bytes because `eax` is
+    /// four bytes wide. A memory operand with no stated width and no register
+    /// to borrow one from is one machine word — that is what `push [esp+8]`
+    /// moves, and in 32-bit mode a word is four bytes, not eight. Reading it
+    /// at eight is how `return sink;` became `return *(u64*)0xc0;`.
+    fn size_operands(&self, ops: &mut [Operand]) {
+        let from_reg = ops.iter().find_map(|o| match o {
+            Operand::Reg(r) => Some(r.size),
+            Operand::Modified { reg, .. } => Some(reg.size),
+            _ => None,
+        });
+        let width = from_reg.unwrap_or_else(|| self.width());
+        for op in ops.iter_mut() {
+            if let Operand::Mem { size, .. } = op
+                && *size == 0
+            {
+                *size = width;
+            }
         }
     }
 
@@ -635,7 +992,7 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_insn(&mut self, insn: &Instruction, out: &mut Lifted) {
-        let Some(p) = self.core.target.parse(&insn.text) else {
+        let Some(mut p) = self.core.target.parse(&insn.text) else {
             out.stmts
                 .push(Stmt::Comment(format!("{} ; unparsed", insn.text)));
             return;
@@ -644,7 +1001,15 @@ impl<'a> Lifter<'a> {
             .pc_target
             .or_else(|| insn.mem_reads.first().map(|a| a.0))
             .or_else(|| insn.mem_writes.first().map(|a| a.0));
+        self.size_operands(&mut p.ops);
         let m = p.mnemonic.as_str();
+        // A push at the very front of a function is the function saving a
+        // register; once anything else has happened, a push is a value on
+        // its way to a call. The boundary markers a compiler emits at an
+        // entry point are not "anything else", so they keep it open.
+        if !matches!(m, "push" | "nop" | "endbr64" | "endbr32" | "pause" | "fnop") {
+            self.frame_ready = true;
+        }
         // The instructions whose shape the general-purpose path cannot
         // describe: vector registers, the x87 stack, atomic
         // read-modify-writes, and the string instructions with their
@@ -697,7 +1062,14 @@ impl<'a> Lifter<'a> {
             "push" => self.lift_push(&p.ops, &mut out.stmts),
             "pop" => self.lift_pop(&p.ops, &mut out.stmts),
             "leave" => {
-                self.core.sp_off = -8;
+                // `leave` is `mov rsp, rbp` followed by `pop rbp`, so the
+                // stack pointer ends one width above where the frame pointer
+                // was anchored — back at the frame base when the prologue was
+                // the usual `push rbp; mov rbp, rsp`.
+                self.core.sp_off = self
+                    .core
+                    .fp_off
+                    .map_or(0, |off| off + i64::from(self.width()));
                 self.core.fp_off = None;
             }
             "cdqe" => self.lift_cast(RAX, 4, 8, &mut out.stmts),
@@ -715,13 +1087,14 @@ impl<'a> Lifter<'a> {
             "div" | "idiv" => self.lift_div(m, &p.ops, &mut out.stmts),
             "shld" | "shrd" => self.lift_double_shift(m, &p.ops, &mut out.stmts),
             "syscall" | "sysenter" => self.lift_syscall(insn.addr, &mut out.stmts),
+            "int" => self.lift_int(&p.ops, insn.addr, &mut out.stmts),
             "rdtsc" | "rdtscp" => self.lift_timestamp(insn.addr, m, &mut out.stmts),
             "clc" | "stc" | "cmc" | "cld" | "std" | "sti" | "cli" => {
                 self.lift_flag_instruction(m, insn.addr, &mut out.stmts)
             }
             "call" => self.lift_call(insn, &p.ops, &mut out.stmts),
             "jmp" => self.lift_jmp(&p.ops, &mut out.stmts),
-            "ret" => {}
+            "ret" | "retn" => self.lift_ret(&p.ops, insn.addr, &mut out.stmts),
             other => {
                 if cond_of_jcc(other).is_some() {
                     // Handled by take_condition once the block ends.
@@ -1257,6 +1630,9 @@ impl<'a> Lifter<'a> {
                 // for the low half and wrong above it, which is where the
                 // answer to "did the product fit" lives.
                 let size = ops[0].size();
+                let full = self.reg(0);
+                let high_half = self.reg(2);
+                let width = self.width();
                 let accumulator = self.snapshot(&Operand::Reg(Reg::view(0, size, 0)), stmts);
                 let operand = self.snapshot(&ops[0], stmts);
                 let (lo, hi) = self.product(&accumulator, &operand, size, signed);
@@ -1275,33 +1651,37 @@ impl<'a> Lifter<'a> {
                         rhs: Box::new(high),
                         bits: 2,
                     };
-                    let written = merge_write("rax", combined, 2, 0, 8);
-                    self.core.assign("rax", written, stmts);
-                } else if size == 4 {
-                    // Writing `eax` clears the upper half of `rax`; a merged
-                    // write would keep the old bits and report a product the
-                    // instruction never produced.
-                    let low = Expr::Cast {
-                        kind: CastKind::Zext,
-                        arg: Box::new(lo),
-                        from: 4,
-                        to: 8,
+                    let written = merge_write(&full, combined, 2, 0, width);
+                    self.core.assign(&full, written, stmts);
+                } else if size == self.width() || size == 4 {
+                    // The product fills both registers, so each write replaces
+                    // the whole register. A dword product lands in `eax` and
+                    // `edx`; on a 64-bit target writing those clears the upper
+                    // halves of `rax` and `rdx`, and a merged write would keep
+                    // the old bits and report a product the instruction never
+                    // produced. On a 32-bit target `eax` *is* the register, so
+                    // there is nothing above it to clear.
+                    let widen = |value: Expr| {
+                        if size == 4 && width == 8 {
+                            Expr::Cast {
+                                kind: CastKind::Zext,
+                                arg: Box::new(value),
+                                from: 4,
+                                to: 8,
+                            }
+                        } else {
+                            value
+                        }
                     };
-                    self.core.assign("rax", low, stmts);
-                    let high = Expr::Cast {
-                        kind: CastKind::Zext,
-                        arg: Box::new(hi),
-                        from: 4,
-                        to: 8,
-                    };
-                    self.core.assign("rdx", high, stmts);
+                    self.core.assign(&full, widen(lo), stmts);
+                    self.core.assign(&high_half, widen(hi), stmts);
                 } else {
                     // A 16-bit product lands in `ax` and `dx`, which are views
                     // of two registers that keep their upper bits.
-                    let low = merge_write("rax", lo, size, 0, 8);
-                    self.core.assign("rax", low, stmts);
-                    let high = merge_write("rdx", hi, size, 0, 8);
-                    self.core.assign("rdx", high, stmts);
+                    let low = merge_write(&full, lo, size, 0, width);
+                    self.core.assign(&full, low, stmts);
+                    let high = merge_write(&high_half, hi, size, 0, width);
+                    self.core.assign(&high_half, high, stmts);
                 }
                 self.core.update_flags(FlagState {
                     cf,
@@ -1419,13 +1799,17 @@ impl<'a> Lifter<'a> {
     /// when the counter is zero and leaves it alone. The counter is
     /// decremented before the test, and the flags are not touched at all.
     fn lift_loop(&mut self, m: &str, stmts: &mut Vec<Stmt>) {
-        let counter = Operand::Reg(Reg::view(RCX, 8, 0));
+        // The counter is the register one below the return value, and its
+        // width decides how the decrement wraps: `ecx` from zero is
+        // `0xffffffff` and `rcx` from zero is `0xffff_ffff_ffff_ffff`.
+        let width = self.width();
+        let counter = Operand::Reg(Reg::view(RCX, width, 0));
         let value = self.core.read(&counter, stmts);
         let decremented = Expr::Bin {
             op: BinOp::Sub,
             lhs: Box::new(value.clone()),
             rhs: Box::new(Expr::Const(1)),
-            bits: 8,
+            bits: width,
         };
         // The test is against the counter after the decrement. The
         // counter's name is enough: the expression that computes the
@@ -1433,9 +1817,9 @@ impl<'a> Lifter<'a> {
         // branch asks about the value that is there now.
         let not_zero = Expr::Cond {
             op: CondOp::Ne,
-            lhs: Box::new(Expr::var("rcx")),
+            lhs: Box::new(Expr::var(self.reg(RCX))),
             rhs: Box::new(Expr::Const(0)),
-            bits: 8,
+            bits: width,
         };
         let condition = match m {
             "loop" => not_zero,
@@ -1629,46 +2013,81 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_cast(&mut self, reg: u8, from: u8, to: u8, stmts: &mut Vec<Stmt>) {
+        let name = self.reg(reg);
         let value = Expr::Cast {
             kind: CastKind::Sext,
-            arg: Box::new(Expr::var(REG64[usize::from(reg)])),
+            arg: Box::new(Expr::var(name.clone())),
             from,
             to,
         };
-        self.core.assign(REG64[usize::from(reg)], value, stmts);
+        self.core.assign(&name, value, stmts);
     }
 
+    /// `push`: a value goes on the stack, or a register is saved.
+    ///
+    /// The two are one instruction. What tells them apart is where the push
+    /// happens: the run of pushes at the front of a function saves the
+    /// registers the function is about to borrow, and a push after that is a
+    /// value on its way to a call. The stack pointer moves either way, which
+    /// is what keeps the frame slots right for the rest of the block — a
+    /// `push 1` that left the stack pointer alone put every later
+    /// `[esp+N]` one slot out.
     fn lift_push(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let Some(op) = ops.first() else { return };
-        // Saving a callee-saved register is frame bookkeeping.
+        self.core.adjust_sp(-i64::from(self.width()));
         if let Operand::Reg(r) = op {
-            self.core.adjust_sp(-8);
-            if r.idx == RBP {
+            // `push rbp` anchors the frame: the value saved is the caller's
+            // frame pointer, not a value the function computes.
+            if Some(r.idx) == self.core.target.fp_reg() {
                 return;
             }
-            let value = self.core.read(op, stmts);
-            stmts.push(Stmt::Comment(format!(
-                "push {} ; saved at frame{:+}",
-                REG64[usize::from(r.idx)],
-                self.core.sp_off
-            )));
-            let _ = value;
+            if !self.frame_ready && is_callee_saved(self.mode, r.idx) {
+                let name = self.reg(r.idx);
+                stmts.push(Stmt::Comment(format!(
+                    "push {name} ; saved at frame{:+}",
+                    self.core.sp_off
+                )));
+                return;
+            }
         }
+        if !self.core.target.args_on_stack() {
+            // A 64-bit call passes its arguments in registers, so a push here
+            // is a saved value or a spill and saying it is an argument would
+            // invent one.
+            if let Operand::Reg(r) = op {
+                let name = self.reg(r.idx);
+                stmts.push(Stmt::Comment(format!(
+                    "push {name} ; saved at frame{:+}",
+                    self.core.sp_off
+                )));
+            }
+            return;
+        }
+        // The value is named before it is pushed. The register it came from
+        // is about to be reused — `push eax; lea eax, [edx+edx*2]; push eax`
+        // is how a two-argument call is set up — and a bare name in the list
+        // would read whatever the register holds when the call is reached,
+        // turning two different arguments into two copies of the second.
+        let value = match op {
+            Operand::Imm(v) => Expr::Const(*v),
+            op => self.snapshot(op, stmts),
+        };
+        self.pushed.push(value);
     }
 
     fn lift_pop(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let Some(op) = ops.first() else { return };
-        self.core.adjust_sp(8);
+        self.core.adjust_sp(i64::from(self.width()));
         if let Operand::Reg(r) = op {
-            if r.idx == RBP {
+            if Some(r.idx) == self.core.target.fp_reg() {
                 self.core.fp_off = None;
                 return;
             }
             // The value came from a matching push; keeping the register name is
             // honest and avoids a fake load from an invented stack slot.
+            let name = self.reg(r.idx);
             stmts.push(Stmt::Comment(format!(
-                "pop {} ; restored from the frame",
-                REG64[usize::from(r.idx)]
+                "pop {name} ; restored from the frame"
             )));
         }
     }
@@ -2239,22 +2658,36 @@ impl<'a> Lifter<'a> {
         ));
     }
 
-    /// `syscall`: a call into the kernel.
+    /// `syscall`/`sysenter`/`int 0x80`: a call into the kernel.
     ///
-    /// The number is in `rax` and the arguments are in the registers the
-    /// kernel reads them from. The result comes back in `rax`, and the
-    /// kernel chooses it, so there is nothing to say about its value.
+    /// The number is in the accumulator and the arguments are in the
+    /// registers the kernel reads them from — the same six in a different
+    /// order, and the order is the one thing the width changes:
+    /// `rdi, rsi, rdx, r10, r8, r9` on a 64-bit kernel and
+    /// `ebx, ecx, edx, esi, edi, ebp` on a 32-bit one. The result comes back
+    /// in the accumulator, and the kernel chooses it, so there is nothing to
+    /// say about its value.
     fn lift_syscall(&mut self, addr: Addr, stmts: &mut Vec<Stmt>) {
-        let number = Expr::var("rax");
-        let args = vec![
-            number,
-            Expr::var("rdi"),
-            Expr::var("rsi"),
-            Expr::var("rdx"),
-            Expr::var("r10"),
-            Expr::var("r8"),
-            Expr::var("r9"),
-        ];
+        let args = match self.mode {
+            Mode::Bits64 => vec![
+                Expr::var(self.reg(RAX)),
+                Expr::var(self.reg(7)),
+                Expr::var(self.reg(6)),
+                Expr::var(self.reg(2)),
+                Expr::var(self.reg(10)),
+                Expr::var(self.reg(8)),
+                Expr::var(self.reg(9)),
+            ],
+            Mode::Bits32 => vec![
+                Expr::var(self.reg(RAX)),
+                Expr::var(self.reg(3)),
+                Expr::var(self.reg(RCX)),
+                Expr::var(self.reg(2)),
+                Expr::var(self.reg(6)),
+                Expr::var(self.reg(7)),
+                Expr::var(self.reg(RBP)),
+            ],
+        };
         stmts.push(Stmt::Call {
             name: "syscall".into(),
             args,
@@ -2262,8 +2695,70 @@ impl<'a> Lifter<'a> {
             addr,
             target: None,
         });
-        self.core
-            .write(&Operand::Reg(Reg::full(RAX, 8)), Expr::Unknown("syscall".into()), stmts);
+        let dest = Operand::Reg(Reg::full(RAX, self.width()));
+        let value = Expr::Unknown("syscall".into());
+        self.core.write(&dest, value, stmts);
+    }
+
+    /// `int imm`: a software interrupt.
+    ///
+    /// The only vector a compiler emits is `0x80`, the 32-bit system-call
+    /// gate, and `0x2e`/`0x2f` in the Windows world. Everything else is a
+    /// call into something this tool does not model, and saying so is better
+    /// than guessing which.
+    fn lift_int(&mut self, ops: &[Operand], addr: Addr, stmts: &mut Vec<Stmt>) {
+        match ops.first() {
+            Some(Operand::Imm(0x80)) if self.mode.is_32() => self.lift_syscall(addr, stmts),
+            Some(Operand::Imm(0x2e)) => {
+                stmts.push(Stmt::Call {
+                    name: "sysenter".into(),
+                    args: vec![Expr::var(self.reg(RAX))],
+                    ret: None,
+                    addr,
+                    target: None,
+                });
+                self.core.notes.push((
+                    addr,
+                    "int 0x2e: a system call through the Windows gate".into(),
+                ));
+            }
+            Some(Operand::Imm(3)) => {
+                stmts.push(Stmt::Comment("int 3 ; breakpoint".into()));
+            }
+            Some(Operand::Imm(n)) => {
+                let n = *n;
+                stmts.push(Stmt::Comment(format!(
+                    "int {n:#x} ; a software interrupt this tool does not model"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    /// `ret`: return, optionally removing the arguments first.
+    ///
+    /// `ret 8` pops the return address and then eight bytes of arguments, so
+    /// a callee that cleans up its own stack also states how many argument
+    /// bytes it takes. That count is a fact about the function's signature
+    /// the body may never mention: a function that ignores its second
+    /// argument still has one, and the callers still push it.
+    fn lift_ret(&mut self, ops: &[Operand], addr: Addr, stmts: &mut Vec<Stmt>) {
+        let _ = stmts;
+        let Some(Operand::Imm(bytes)) = ops.first() else {
+            return;
+        };
+        self.pops = Some(*bytes);
+        // A callee that removes its own arguments is stating its convention.
+        // Reading a `ret 8` in an image that was opened as `cdecl` means the
+        // image is mixed, which is worth saying once rather than per call.
+        if self.mode.is_32() && !self.core.target.pops_arguments() {
+            self.core.notes.push((
+                addr,
+                format!(
+                    "`ret {bytes}` removes {bytes} bytes of arguments: this function cleans up its own stack"
+                ),
+            ));
+        }
     }
 
     /// `rdtsc`: the time-stamp counter.
@@ -2352,16 +2847,18 @@ impl<'a> Lifter<'a> {
                 None => "(*?)".into(),
             },
         };
-        // Only pass the argument registers this function actually set: a call
-        // in the middle of a function has live values in earlier ones.
-        let args = self.core.call_args();
+        // Only pass the arguments this function actually set: a call in the
+        // middle of a function has live values in earlier ones, and a 32-bit
+        // call passes the values pushed since the last one.
+        let args = self.take_args_for_call();
         // The callee is free to write any flag.
         self.core.pending_cmp = None;
+        let ret_reg = self.reg(RAX);
         if !matches!(insn.flow, FlowKind::Return) {
             stmts.push(Stmt::Call {
                 name,
                 args,
-                ret: Some("rax".into()),
+                ret: Some(ret_reg),
                 addr: insn.addr,
                 target: direct,
             });
@@ -2376,7 +2873,11 @@ impl<'a> Lifter<'a> {
             // value is a call's result has to return it: without this the
             // body printed `return;` and the caller's argument disappeared.
             self.core.ever_written.insert(RAX);
-            self.core.clobber(CALLER_SAVED, RAX);
+            let caller_saved = match self.mode {
+                Mode::Bits64 => CALLER_SAVED,
+                Mode::Bits32 => CALLER_SAVED_32,
+            };
+            self.core.clobber(caller_saved, RAX);
         } else {
             stmts.push(Stmt::Call {
                 name,
@@ -2394,9 +2895,9 @@ impl<'a> Lifter<'a> {
         let Some(op) = ops.first() else { return };
         if let Operand::Reg(r) = op {
             let value = self.core.read_reg(*r);
+            let name = self.reg(r.idx);
             stmts.push(Stmt::Comment(format!(
-                "jmp {} ; computed jump target",
-                REG64[usize::from(r.idx)]
+                "jmp {name} ; computed jump target"
             )));
             let _ = value;
         }
@@ -3680,7 +4181,7 @@ impl<'a> Lifter<'a> {
                     // leaves behind.
                     let source = self.elem_address(&ops[0], 0, stmts);
                     let destination = self.elem_address(&ops[1], 0, stmts);
-                    let count = count_times(width);
+                    let count = self.count_times(width);
                     stmts.push(Stmt::Call {
                         name: "memcpy".into(),
                         args: vec![destination, source, count.clone()],
@@ -3688,9 +4189,10 @@ impl<'a> Lifter<'a> {
                         addr,
                         target: None,
                     });
-                    self.core.assign("rsi", add_to("rsi", count.clone()), stmts);
-                    self.core.assign("rdi", add_to("rdi", count), stmts);
-                    self.core.assign("rcx", Expr::Const(0), stmts);
+                    self.bump(6, count.clone(), stmts);
+                    self.bump(7, count, stmts);
+                    let count_reg = self.reg(RCX);
+                    self.core.assign(&count_reg, Expr::Const(0), stmts);
                 } else {
                     let source = self.elem_address(&ops[0], 0, stmts);
                     let destination = self.elem_address(&ops[1], 0, stmts);
@@ -3704,8 +4206,8 @@ impl<'a> Lifter<'a> {
                         size: width,
                     });
                     let step = Expr::Const(u64::from(width));
-                    self.core.assign("rsi", add_to("rsi", step.clone()), stmts);
-                    self.core.assign("rdi", add_to("rdi", step), stmts);
+                    self.bump(6, step.clone(), stmts);
+                    self.bump(7, step, stmts);
                 }
                 self.core.notes.push((
                     addr,
@@ -3720,38 +4222,31 @@ impl<'a> Lifter<'a> {
                 let destination = self.elem_address(&ops[0], 0, stmts);
                 // The value stored is the accumulator, whose width the
                 // instruction's operand size selects.
-                let accumulator = match width {
-                    1 => "al",
-                    2 => "ax",
-                    8 => "rax",
-                    _ => "eax",
-                };
+                // The value stored is the accumulator, read at the width the
+                // instruction works on: `al` is the low byte of `rax`, not a
+                // variable of its own.
+                let accumulator =
+                    self.core
+                        .read(&Operand::Reg(Reg::view(0, width, 0)), stmts);
                 if repeated {
-                    let count = count_times(width);
+                    let count = self.count_times(width);
                     stmts.push(Stmt::Call {
                         name: "memset".into(),
-                        args: vec![
-                            destination,
-                            Expr::var(accumulator),
-                            count.clone(),
-                        ],
+                        args: vec![destination, accumulator, count.clone()],
                         ret: None,
                         target: None,
                         addr,
                     });
-                    self.core.assign("rdi", add_to("rdi", count), stmts);
-                    self.core.assign("rcx", Expr::Const(0), stmts);
+                    self.bump(7, count, stmts);
+                    let count_reg = self.reg(RCX);
+                    self.core.assign(&count_reg, Expr::Const(0), stmts);
                 } else {
                     stmts.push(Stmt::Store {
                         addr: destination,
-                        value: Expr::var(accumulator),
+                        value: accumulator,
                         size: width,
                     });
-                    self.core.assign(
-                        "rdi",
-                        add_to("rdi", Expr::Const(u64::from(width))),
-                        stmts,
-                    );
+                    self.bump(7, Expr::Const(u64::from(width)), stmts);
                 }
                 self.core.notes.push((
                     addr,
@@ -3768,30 +4263,7 @@ impl<'a> Lifter<'a> {
     }
 }
 
-/// A register's value plus something.
-fn add_to(reg: &str, value: Expr) -> Expr {
-    Expr::Bin {
-        op: BinOp::Add,
-        lhs: Box::new(Expr::var(reg)),
-        rhs: Box::new(value),
-        bits: 8,
-    }
-}
 
-/// The count register times an element width.
-fn count_times(width: u8) -> Expr {
-    if width == 1 {
-        // A byte count is the count. Multiplying it by one says the same
-        // thing more slowly.
-        return Expr::var("rcx");
-    }
-    Expr::Bin {
-        op: BinOp::Mul,
-        lhs: Box::new(Expr::var("rcx")),
-        rhs: Box::new(Expr::Const(u64::from(width))),
-        bits: 8,
-    }
-}
 
 /// The name of one element of a vector register.
 ///
@@ -3827,6 +4299,11 @@ impl super::Lifter for Lifter<'_> {
         // registers: that made `puts(leaked, spilled)` where the callee
         // takes one argument.
         self.core.written.clear();
+        // The values pushed for a call are per block for the same reason: a
+        // push and the call it feeds are always adjacent, and carrying the
+        // list across a block boundary would give the next call arguments
+        // that belong to a path this block cannot see.
+        self.pushed.clear();
         for insn in insns {
             let before = out.stmts.len();
             self.lift_insn(insn, &mut out);
@@ -3869,7 +4346,35 @@ impl super::Lifter for Lifter<'_> {
     }
 
     fn call_args(&self) -> Vec<Expr> {
-        self.core.call_args()
+        self.args_for_call()
+    }
+
+    fn take_call_args(&mut self) -> Vec<Expr> {
+        self.take_args_for_call()
+    }
+
+    fn memory_args(&self) -> Vec<String> {
+        if !self.mode.is_32() {
+            return Vec::new();
+        }
+        // A 32-bit function reads its arguments at fixed offsets above the
+        // return address, so they are the slots at 4, 8, 12 and so on from
+        // the frame base. The frame slot naming already calls those `arg_N`,
+        // which is what makes them findable here without another table.
+        (0..MAX_STACK_ARGS)
+            .map(|i| slot_name(4 + 4 * i as i64, self.width()))
+            .collect()
+    }
+
+    fn declared_args(&self) -> Option<usize> {
+        // `ret imm` states the argument bytes a callee removes. Only the
+        // 32-bit mode has a fixed argument width for that to be a count
+        // rather than a lower bound.
+        let bytes = self.pops?;
+        if !self.mode.is_32() || bytes % u64::from(self.width()) != 0 {
+            return None;
+        }
+        Some((bytes / u64::from(self.width())) as usize)
     }
 
     fn ret_reg(&self) -> String {
@@ -3880,7 +4385,7 @@ impl super::Lifter for Lifter<'_> {
         // does say is where the function left its last value, so that is
         // what decides.
         if self.core.ever_written.contains(&RAX) {
-            return REG64[usize::from(RAX)].to_string();
+            return self.reg(RAX);
         }
         if self.wrote_vector {
             return "xmm0_0".to_string();
@@ -3891,12 +4396,15 @@ impl super::Lifter for Lifter<'_> {
         if self.wrote_x87 && self.fpu_top < 8 {
             return fpu_slot_name(self.fpu_top);
         }
-        REG64[usize::from(RAX)].to_string()
+        self.reg(RAX)
     }
 
     fn ret_type(&self) -> Option<&'static str> {
         if self.core.ever_written.contains(&RAX) {
-            return Some("u64");
+            // A 32-bit function returns what fits in `eax`, and calling that
+            // `u64` would tell a caller the value has an upper half it has
+            // never held.
+            return Some(if self.mode.is_32() { "u32" } else { "u64" });
         }
         if self.wrote_vector {
             return Some(match self.float_width {
@@ -3927,7 +4435,7 @@ impl super::Lifter for Lifter<'_> {
             .target
             .arg_regs()
             .iter()
-            .map(|r| REG64[usize::from(*r)].to_string())
+            .map(|r| self.reg(*r))
             .collect()
     }
     fn sp_alias(&self) -> &'static str {
@@ -3935,7 +4443,7 @@ impl super::Lifter for Lifter<'_> {
     }
 
     fn sp_reg_name(&self) -> String {
-        REG64[usize::from(RSP)].to_string()
+        self.reg(RSP)
     }
 
     fn notes(&mut self) -> Vec<(Addr, String)> {
@@ -3962,7 +4470,7 @@ fn with_imm(ops: &[Operand], value: u64) -> Vec<Operand> {
     v
 }
 
-/// Register name by index.
+/// Register name by index, at 64-bit width.
 pub fn reg_name(idx: u8) -> &'static str {
     REG64.get(usize::from(idx)).copied().unwrap_or("rax")
 }

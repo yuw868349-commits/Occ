@@ -117,11 +117,12 @@ impl Renderer {
                 self.line(&line);
             }
             Node::Call { name: callee, args, ret } => {
-                let call = format!(
-                    "{}({})",
-                    callee,
-                    args.iter().map(expr).collect::<Vec<_>>().join(", ")
-                );
+                // The arguments go through this renderer's renaming table,
+                // not the free function: an argument that is still an
+                // incoming parameter reads `a0` in the signature and has to
+                // read `a0` here too.
+                let rendered: Vec<String> = args.iter().map(|a| self.ex(a)).collect();
+                let call = format!("{}({})", callee, rendered.join(", "));
                 match ret {
                     Some(dest) => {
                         let at = self.out.len();
@@ -185,10 +186,8 @@ impl Renderer {
                     && *v == *dest
                 {
                     self.out.truncate(at);
-                    let call = format!(
-                        "{callee}({})",
-                        args.iter().map(expr).collect::<Vec<_>>().join(", ")
-                    );
+                    let rendered: Vec<String> = args.iter().map(|a| self.ex(a)).collect();
+                    let call = format!("{callee}({})", rendered.join(", "));
                     self.line(&format!("return {call};"));
                     return;
                 }

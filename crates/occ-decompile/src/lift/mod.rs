@@ -348,6 +348,27 @@ pub trait Target {
     /// Registers that carry integer arguments, in ABI order.
     fn arg_regs(&self) -> &[u8];
 
+    /// True when a call's arguments are pushed on the stack instead of being
+    /// placed in registers.
+    ///
+    /// The two x86 conventions disagree here, and reading one as the other
+    /// loses every argument: a 32-bit call site `push 2; push 1; call add`
+    /// passes two values, and a model that only looks at registers reports a
+    /// call with none.
+    fn args_on_stack(&self) -> bool {
+        false
+    }
+
+    /// True when the callee, not the caller, removes the arguments.
+    ///
+    /// It shows up in the code as `ret 8` instead of `ret`, so the fact is
+    /// read from the instruction stream rather than assumed from the
+    /// container; what the target supplies is whether that is the convention
+    /// the image is expected to follow.
+    fn pops_arguments(&self) -> bool {
+        false
+    }
+
     /// The register that carries the return value.
     fn ret_reg(&self) -> u8;
 
@@ -1397,6 +1418,17 @@ pub trait Lifter {
     /// function has already set.
     fn call_args(&self) -> Vec<Expr>;
 
+    /// The arguments of the call being lifted, consumed as they are read.
+    ///
+    /// An architecture that passes arguments on the stack has to forget them
+    /// once the call is made: the next call in the same block pushes its own,
+    /// and a list that keeps the old ones grows a phantom argument per call.
+    /// The architectures that pass arguments in registers have nothing to
+    /// consume, so the default is the plain read.
+    fn take_call_args(&mut self) -> Vec<Expr> {
+        self.call_args()
+    }
+
     /// The register a function returns its value in.
     fn ret_reg(&self) -> String;
 
@@ -1422,6 +1454,27 @@ pub trait Lifter {
 
     /// The argument registers, in ABI order, by name.
     fn arg_reg_names(&self) -> Vec<String>;
+
+    /// Variables that hold incoming arguments the ABI passes in memory, in
+    /// argument order.
+    ///
+    /// A function that is handed its arguments on the stack reads them from
+    /// fixed frame slots, and those slots are named like locals. Naming them
+    /// as parameters is the difference between `f(a0, a1)` and
+    /// `f(arg_4_u32, arg_8_u32)`, and a caller reading the second one has to
+    /// work out the calling convention to use it.
+    fn memory_args(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// How many arguments the function takes, when the code states it.
+    ///
+    /// A callee-cleanup epilogue removes the argument bytes itself (`ret 8`),
+    /// so the count is in the instruction stream even when the body never
+    /// reads the second argument.
+    fn declared_args(&self) -> Option<usize> {
+        None
+    }
 
     /// The name the stack pointer is printed under.
     fn sp_alias(&self) -> &'static str;

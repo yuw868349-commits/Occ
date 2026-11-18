@@ -254,7 +254,14 @@ fn the_string_path_survives_a_real_compilation() {
     // is, so the memory effect is not lost.
     let copy = decompile(&loaded, &function(&loaded, "copy_rep"));
     assert!(copy.contains("memcpy("), "{copy}");
-    assert!(copy.contains("rdi") && copy.contains("rsi"), "{copy}");
+    // Destination, source and count are the three incoming parameters, in
+    // the order the instruction uses them. The `add rdi, n` / `add rsi, n`
+    // that follow write caller-saved registers nothing reads afterwards, so
+    // they are dead and the pass drops them rather than printing them.
+    assert!(
+        copy.contains("memcpy(a0, a1, a2)"),
+        "the copy takes the arguments the ABI gives it:\n{copy}"
+    );
     // The count is in elements, so a wider element moves more bytes.
     let copyq = decompile(&loaded, &function(&loaded, "copy_repq"));
     assert!(copyq.contains("memcpy("), "{copyq}");

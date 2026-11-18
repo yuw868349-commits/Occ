@@ -103,8 +103,9 @@ pub fn decompile(
         .unwrap_or_else(|| func.display_name());
     let ret_type = dbg
         .and_then(|d| d.return_type.clone())
-        .or_else(|| program.ret_type.clone());
-    let param_types = dbg.map(debug::DebugInfo::param_types).unwrap_or_default();
+        .or_else(|| program.ret_type.clone())
+        .or_else(|| Some(word_type(image.arch).to_string()));
+    let param_types = parameter_types(dbg, program.params.len(), word_type(image.arch));
     let source = dbg.and_then(|d| d.source_range(d.file.as_deref()));
     if program.blocks.is_empty() {
         return Decompiled {
@@ -140,11 +141,53 @@ pub fn decompile(
     }
 }
 
+/// The architectures whose instructions this decompiler lifts.
+///
+/// One list, used by both the gate and the message that names what is
+/// missing: two copies of it drift, and a note that lists the wrong
+/// architectures is worse than no note.
+const LIFTABLE: &str = "x86-64, x86-32, AArch64 and RISC-V";
+
+/// The name the machine's general-purpose word has in the output.
+///
+/// A signature that says nothing about a type still states a width: the
+/// register the value arrives in is four bytes wide on a 32-bit target and
+/// eight on a 64-bit one, and printing `u64` for both tells a reader the
+/// upper half exists.
+fn word_type(arch: occ_core::Arch) -> &'static str {
+    match arch {
+        occ_core::Arch::X86 | occ_core::Arch::Arm | occ_core::Arch::RiscV32 => "u32",
+        _ => "u64",
+    }
+}
+
+/// The types of the parameters, with the machine word where nothing else
+/// says.
+///
+/// Debug information types the parameters it knows about and leaves the rest
+/// untyped; an empty slot is not "no type", it is "this one is the width of
+/// a register".
+fn parameter_types(
+    dbg: Option<&debug::DebugInfo>,
+    count: usize,
+    word: &str,
+) -> Vec<Option<String>> {
+    let mut types = vec![Some(word.to_string()); count];
+    if let Some(d) = dbg {
+        for (i, t) in d.param_types().into_iter().enumerate() {
+            if let (Some(t), Some(slot)) = (t, types.get_mut(i)) {
+                *slot = Some(t);
+            }
+        }
+    }
+    types
+}
+
 /// Whether the decompiler can lift this architecture's instructions.
 pub fn is_liftable(arch: occ_core::Arch) -> bool {
     matches!(
         arch,
-        occ_core::Arch::X86_64
+        occ_core::Arch::X86 | occ_core::Arch::X86_64
             | occ_core::Arch::Aarch64
             | occ_core::Arch::RiscV32
             | occ_core::Arch::RiscV64
@@ -165,6 +208,20 @@ fn lifter_for<'a>(
     symbols: &'a dyn Fn(&str) -> Option<u64>,
 ) -> Option<Box<dyn lift::Lifter + 'a>> {
     match arch {
+        // 32-bit x86: the same instruction set at half the width, and the
+        // one place where that changes the meaning of a call is the
+        // arguments, which every convention but `fastcall` puts on the
+        // stack. `stdcall` is the Windows convention, where the callee
+        // removes them; on every other container the caller does.
+        occ_core::Arch::X86 => {
+            static CDECL: lift::x86::X86Target = lift::x86::X86Target::cdecl();
+            static STDCALL: lift::x86::X86Target = lift::x86::X86Target::stdcall();
+            let target = match format {
+                occ_core::Format::Pe | occ_core::Format::Coff => &STDCALL,
+                _ => &CDECL,
+            };
+            Some(Box::new(lift::x86::Lifter::new(target, name_of, symbols)))
+        }
         occ_core::Arch::X86_64 => {
             static SYSV: lift::x86::X86Target = lift::x86::X86Target::sysv();
             static WIN64: lift::x86::X86Target = lift::x86::X86Target::win64();
@@ -310,7 +367,7 @@ pub fn build_program(
     let symbols = symbol_lookup(image);
     let Some(mut lifter) = lifter_for(image.arch, image.format, name_of, &symbols) else {
         notes.push(format!(
-            "lifting is implemented for x86-64, AArch64 and RISC-V, this is {}",
+            "lifting is implemented for {LIFTABLE}, this is {}",
             image.arch.label()
         ));
         return Program {
@@ -698,7 +755,12 @@ pub fn build_program(
             }
         }
     }
-    let (params, param_regs) = parameter_names(&cfg.blocks, &arg_reg_names);
+    let (params, param_regs) = parameter_names(
+        &cfg.blocks,
+        &arg_reg_names,
+        &lifter.memory_args(),
+        lifter.declared_args(),
+    );
     let mut param_aliases: Vec<(String, String)> = param_regs
         .iter()
         .cloned()
@@ -955,65 +1017,106 @@ fn redirect(term: &mut Term, from: BlockId, to: BlockId) {
     }
 }
 
-/// Which incoming registers the body actually reads.
+/// A variable's name without the version SSA gave it.
 ///
-/// The registers are the architecture's argument registers in ABI order; the
-/// names come from the architecture, not from a table here.
-fn parameter_names(blocks: &[Block], arg_regs: &[String]) -> (Vec<String>, Vec<String>) {
-    let mut used = vec![false; arg_regs.len()];
-    fn scan(e: &Expr, used: &mut [bool], arg_regs: &[String]) {
+/// `arg_4_u32.2` is the second value the slot held. The argument itself is
+/// the first one, and a function that stores to an argument slot before
+/// reading it back still takes that argument.
+fn base_name(v: &str) -> &str {
+    match v.find('.') {
+        Some(i) => &v[..i],
+        None => v,
+    }
+}
+
+/// Which incoming registers and stack slots the body actually reads.
+///
+/// The locations are the architecture's argument registers in ABI order,
+/// followed by the memory slots it passes arguments in; the names come from
+/// the architecture, not from a table here. `declared` is the count the
+/// epilogue states, when it states one.
+fn parameter_names(
+    blocks: &[Block],
+    arg_regs: &[String],
+    memory_args: &[String],
+    declared: Option<usize>,
+) -> (Vec<String>, Vec<String>) {
+    let locations: Vec<String> = arg_regs.iter().chain(memory_args).cloned().collect();
+    let index_of = |v: &str| -> Option<usize> {
+        // A register counts only as the incoming value: `rdi.2` was written
+        // inside the function. A frame slot is the argument itself however
+        // many times the body overwrites it, so its versions still name it.
+        if let Some(i) = arg_regs.iter().position(|r| r == v) {
+            return Some(i);
+        }
+        let base = base_name(v);
+        memory_args
+            .iter()
+            .position(|m| m == base)
+            .map(|i| arg_regs.len() + i)
+    };
+    let mut used = vec![false; locations.len()];
+    fn scan(e: &Expr, used: &mut [bool], index_of: &dyn Fn(&str) -> Option<usize>) {
         let mut vars = Vec::new();
         e.vars(&mut vars);
         for v in vars {
-            for (i, reg) in arg_regs.iter().enumerate() {
-                // Only the incoming value counts: `rdi.2` was written inside
-                // the function.
-                if v == *reg {
-                    used[i] = true;
-                }
+            if let Some(i) = index_of(&v) {
+                used[i] = true;
             }
         }
     }
-    fn walk(nodes: &[Stmt], used: &mut [bool], arg_regs: &[String], term: &Term) {
+    fn walk(
+        nodes: &[Stmt],
+        used: &mut [bool],
+        index_of: &dyn Fn(&str) -> Option<usize>,
+        term: &Term,
+    ) {
         for s in nodes {
             match s {
-                Stmt::Assign { value, .. } => scan(value, used, arg_regs),
+                Stmt::Assign { value, .. } => scan(value, used, index_of),
                 Stmt::Store { addr, value, .. } => {
-                    scan(addr, used, arg_regs);
-                    scan(value, used, arg_regs);
+                    scan(addr, used, index_of);
+                    scan(value, used, index_of);
                 }
                 Stmt::Call { args, .. } => {
                     for a in args {
-                        scan(a, used, arg_regs);
+                        scan(a, used, index_of);
                     }
                 }
                 Stmt::Comment(_) => {}
             }
         }
         if let Term::Branch { cond, .. } = term {
-            scan(cond, used, arg_regs);
+            scan(cond, used, index_of);
         }
         if let Term::Switch { index, .. } = term {
-            scan(index, used, arg_regs);
+            scan(index, used, index_of);
         }
         if let Term::Ret(Some(v)) = term {
-            scan(v, used, arg_regs);
+            scan(v, used, index_of);
         }
     }
     for b in blocks {
-        walk(&b.stmts, &mut used, arg_regs, &b.term);
+        walk(&b.stmts, &mut used, &index_of, &b.term);
     }
     // A parameter is a position, not a set: a function that reads the third
     // argument register takes three arguments, whether or not the body says
     // anything about the first two. Listing only the registers the body reads
     // printed `f(a2)` for a two-argument function, and a caller reading that
     // prototype passes its argument in the wrong register.
-    let arity = used.iter().rposition(|u| *u).map_or(0, |i| i + 1);
+    // An epilogue that removes its own arguments states the count even when
+    // the body never mentions the last one: a function that ignores its
+    // second argument still has one, and its callers still push it.
+    let mut arity = used.iter().rposition(|u| *u).map_or(0, |i| i + 1);
+    if let Some(n) = declared {
+        arity = arity.max(n);
+    }
+    let arity = arity.min(locations.len());
     let mut params = Vec::with_capacity(arity);
     let mut regs = Vec::with_capacity(arity);
-    for (i, reg) in arg_regs.iter().enumerate().take(arity) {
+    for (i, loc) in locations.iter().enumerate().take(arity) {
         params.push(format!("a{i}"));
-        regs.push(reg.clone());
+        regs.push(loc.clone());
     }
     (params, regs)
 }
@@ -1022,7 +1125,7 @@ fn parameter_names(blocks: &[Block], arg_regs: &[String]) -> (Vec<String>, Vec<S
 fn outline(func: &Function, name_of: &dyn Fn(Addr) -> String, arch: occ_core::Arch) -> Decompiled {
     let mut body: Vec<ir::Node> = Vec::new();
     body.push(ir::Node::Comment(format!(
-        "body not lifted: the decompiler models x86-64, AArch64 and RISC-V, this is {}",
+        "body not lifted: the decompiler models {LIFTABLE}, this is {}",
         arch.label()
     )));
     let mut unstructured = 0;
@@ -1053,7 +1156,7 @@ fn outline(func: &Function, name_of: &dyn Fn(Addr) -> String, arch: occ_core::Ar
         params: Vec::new(),
         param_types: Vec::new(),
         param_aliases: Vec::new(),
-        ret_type: None,
+        ret_type: Some(word_type(arch).to_string()),
         body,
         unstructured,
         notes: vec![format!(

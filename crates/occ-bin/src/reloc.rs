@@ -449,8 +449,17 @@ fn patch_x86(
             }
         }
         // R_386_PC32: displacement from the field.
+        //
+        // The addend is in the field, and it is *signed*: a `call` writes
+        // `-4`, because the displacement is measured from the end of the
+        // four bytes rather than their start. Reading those four bytes as an
+        // unsigned number turns the addend into 4294967292, and every call in
+        // an unlinked 32-bit object then lands four gigabytes away and is
+        // reported as out of range.
         2 => {
-            let inplace = get_u32(data, off, endian).map(i64::from).unwrap_or(0);
+            let inplace = get_u32(data, off, endian)
+                .map(|v| i64::from(v as i32))
+                .unwrap_or(0);
             let d = delta(value, addend.wrapping_add(inplace), place);
             if d < i128::from(i32::MIN) || d > i128::from(i32::MAX) {
                 return Outcome::OutOfRange;
@@ -974,8 +983,31 @@ pub fn encodable(arch: Arch, raw: u32) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use occ_core::{Addr, RelocKind};
+
+    /// A `call` in an unlinked 32-bit object states its own addend.
+    ///
+    /// The displacement is measured from the end of the four-byte field, so
+    /// the assembler writes `-4` into it and the relocation has nothing else
+    /// to go on. Reading that field as unsigned puts the target four
+    /// gigabytes before the call, and every call in every 32-bit object is
+    /// then refused as out of range — which is exactly what happened before
+    /// the field was read as signed.
+    #[test]
+    fn a_32_bit_call_relocation_reads_its_addend_as_signed() {
+        // `call rel32` at 0x1000 to a target at 0x1000: the field holds -4.
+        let mut data = vec![0u8; 0x1010];
+        data[0x1004..0x1008].copy_from_slice(&(-4i32).to_le_bytes());
+        let outcome = patch_x86(&mut data, 2, 0x1004, 0x1004, 0x1000, 0, Endian::Little);
+        assert!(
+            matches!(outcome, Outcome::Patched),
+            "the displacement fits"
+        );
+        let written = i32::from_le_bytes(data[0x1004..0x1008].try_into().unwrap());
+        assert_eq!(written, -8, "target minus the end of the field");
+    }
 
     #[test]
     fn adr_immediate_round_trips() {

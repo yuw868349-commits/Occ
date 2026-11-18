@@ -1119,7 +1119,7 @@ fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
     }
     if !d.params.is_empty() && opts.debug.is_none() {
         notes.push(Value::from(
-            "parameters are inferred from the registers the body reads; the count is a lower bound",
+            "parameters are inferred from the registers and frame slots the body reads; the count is a lower bound",
         ));
     }
     let mut e = Envelope::ok(format!(
