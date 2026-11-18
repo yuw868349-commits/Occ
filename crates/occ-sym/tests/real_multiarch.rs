@@ -296,6 +296,7 @@ fn every_architecture_taints_the_global_store() {
             &name_of,
             &[Source::Name(reg)],
             &TaintConfig::default(),
+            &loaded.analysis.functions,
         );
         // The argument decides which arm runs, so it reaches every branch.
         assert!(

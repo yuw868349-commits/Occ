@@ -23,7 +23,7 @@
 //! a flow that may exist, while a flow missed would be a false negative presented
 //! as a clean bill of health.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use occ_core::{Addr, Function, Image};
 use occ_decompile::ir::{BlockId, Expr, Stmt, Term};
@@ -169,6 +169,11 @@ pub struct Report {
     pub iterations: usize,
     /// False when the iteration cap stopped the analysis early.
     pub converged: bool,
+    /// True when a source reaches the value the function returns.
+    ///
+    /// A caller that follows this call can then treat the return as tainted
+    /// without looking at the callee's body again.
+    pub ret_tainted: bool,
     /// Notes about approximations.
     pub notes: Vec<String>,
     /// Leftovers from lifting.
@@ -254,6 +259,110 @@ pub fn trace(
     name_of: &dyn Fn(Addr) -> String,
     sources: &[Source],
     cfg: &Config,
+    functions: &[Function],
+) -> Report {
+    trace_with(image, func, opts, name_of, sources, cfg, functions, 0)
+}
+
+/// What one callee does with one tainted argument.
+#[derive(Clone, Debug, Default)]
+struct CalleeSummary {
+    /// The argument reaches the value the callee returns.
+    ret: bool,
+    /// Sinks the argument reaches, by the label the callee's own run gave
+    /// them.
+    sinks: Vec<(String, Addr)>,
+}
+
+/// State the cross-function part of the analysis carries.
+struct Calls<'a> {
+    image: &'a Image,
+    opts: &'a Options,
+    name_of: &'a dyn Fn(Addr) -> String,
+    sinks: SinkFilter,
+    /// Lifted callees, by entry address.
+    programs: HashMap<Addr, std::rc::Rc<Program>>,
+    /// Summaries already computed, by callee and argument position.
+    cache: HashMap<(Addr, usize), Option<CalleeSummary>>,
+    /// Callees being summarised, outermost first.
+    active: Vec<Addr>,
+    depth: usize,
+    /// True once one callee was summarised, for the run's notes.
+    used: bool,
+}
+
+impl Calls<'_> {
+    /// The callee's lifted program, lifted once per run.
+    fn program(&mut self, callee: &Function) -> std::rc::Rc<Program> {
+        if let Some(p) = self.programs.get(&callee.entry) {
+            return p.clone();
+        }
+        let lifted = std::rc::Rc::new(build_program(self.image, callee, self.opts, self.name_of));
+        self.programs.insert(callee.entry, lifted.clone());
+        lifted
+    }
+
+    /// Summarise `callee` for a tainted argument at `arg`.
+    ///
+    /// `None` means the callee's body is not available, or that summarising
+    /// it would recurse: the caller then keeps the conservative rule that a
+    /// tainted argument makes the result tainted.
+    fn summary(
+        &mut self,
+        functions: &[Function],
+        callee: &Function,
+        arg: usize,
+    ) -> Option<CalleeSummary> {
+        if self.depth >= 2 || self.active.contains(&callee.entry) {
+            return None;
+        }
+        if let Some(hit) = self.cache.get(&(callee.entry, arg)) {
+            return hit.clone();
+        }
+        let program = self.program(callee);
+        let Some(reg) = program.param_regs.get(arg).cloned() else {
+            self.cache.insert((callee.entry, arg), None);
+            return None;
+        };
+        self.active.push(callee.entry);
+        let report = trace_with(
+            self.image,
+            callee,
+            self.opts,
+            self.name_of,
+            &[Source::Name(reg)],
+            &Config {
+                max_iterations: 64,
+                sinks: self.sinks.clone(),
+            },
+            functions,
+            self.depth + 1,
+        );
+        self.active.pop();
+        let summary = CalleeSummary {
+            ret: report.ret_tainted,
+            sinks: report
+                .flows
+                .iter()
+                .map(|f| (f.sink.clone(), f.at))
+                .collect(),
+        };
+        self.used = true;
+        self.cache.insert((callee.entry, arg), Some(summary.clone()));
+        Some(summary)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trace_with(
+    image: &Image,
+    func: &Function,
+    opts: &Options,
+    name_of: &dyn Fn(Addr) -> String,
+    sources: &[Source],
+    cfg: &Config,
+    functions: &[Function],
+    depth: usize,
 ) -> Report {
     let program = build_program(image, func, opts, name_of);
     let lift_notes = program.notes.clone();
@@ -264,6 +373,7 @@ pub fn trace(
         param_regs: program.param_regs.clone(),
         sources: sources.iter().map(|s| s.label()).collect(),
         flows: Vec::new(),
+        ret_tainted: false,
         blocks: program.blocks.len(),
         iterations: 0,
         converged: true,
@@ -304,6 +414,18 @@ pub fn trace(
     // the witness path points at the block rather than the instruction.
     let mut found: BTreeMap<FlowKey, (Flow, BlockId)> = BTreeMap::new();
 
+    let mut calls = Calls {
+        image,
+        opts,
+        name_of,
+        sinks: cfg.sinks.clone(),
+        programs: HashMap::new(),
+        cache: HashMap::new(),
+        active: vec![func.entry],
+        depth,
+        used: false,
+    };
+
     let mut converged = false;
     for round in 0..cfg.max_iterations.max(1) {
         report.iterations = round + 1;
@@ -320,6 +442,8 @@ pub fn trace(
                 &mut out,
                 sources,
                 &cfg.sinks,
+                functions,
+                &mut calls,
                 &mut |flow| {
                     let key = (
                         flow.source.clone(),
@@ -352,6 +476,28 @@ pub fn trace(
         ));
     }
 
+    // Whether a source reaches the returned value. Asked after the fixpoint
+    // and with a sink that does nothing: this pass is about the value, and
+    // re-reporting the same stores would double every flow.
+    for b in 0..program.blocks.len() {
+        if let occ_decompile::ir::Term::Ret(Some(value)) = &program.blocks[b].term {
+            let mut out = state_in[b].clone();
+            transfer(
+                &program.blocks[b],
+                &mut out,
+                sources,
+                &cfg.sinks,
+                functions,
+                &mut calls,
+                &mut |_| {},
+            );
+            if !labels_of(value, &out).is_empty() {
+                report.ret_tainted = true;
+                break;
+            }
+        }
+    }
+
     let reach = reachable_from_entry(&program);
     let mut flows: Vec<Flow> = Vec::with_capacity(found.len());
     for (mut flow, block) in found.into_values() {
@@ -374,6 +520,8 @@ fn transfer(
     state: &mut Taint,
     sources: &[Source],
     filter: &SinkFilter,
+    functions: &[Function],
+    calls: &mut Calls<'_>,
     sink: &mut dyn FnMut(Flow),
 ) {
     for stmt in &block.stmts {
@@ -419,15 +567,30 @@ fn transfer(
                 args,
                 ret,
                 addr,
-                ..
+                target,
             } => {
                 let mut joined = Labels::new();
-                for (i, a) in args.iter().enumerate() {
+                let callee = target.and_then(|t| functions.iter().find(|f| f.entry == t));
+                // The call lists only the registers its block wrote, so a
+                // call that passes an argument the function never touched
+                // reads as a call with no arguments. The callee's own
+                // parameter registers are where those arguments live.
+                let mut bound: Vec<Expr> = args.clone();
+                if bound.is_empty()
+                    && let Some(c) = callee
+                {
+                    bound = calls
+                        .program(c)
+                        .param_regs
+                        .iter()
+                        .map(Expr::var)
+                        .collect();
+                }
+                for (i, a) in bound.iter().enumerate() {
                     let labels = labels_of(a, state);
                     if labels.is_empty() {
                         continue;
                     }
-                    joined.extend(labels.iter().copied());
                     if filter.wants_call(name) {
                         for bit in &labels {
                             sink(Flow {
@@ -439,6 +602,29 @@ fn transfer(
                                 path: Vec::new(),
                             });
                         }
+                    }
+                    // A callee whose body is available says what it does with
+                    // this argument. Without one, the conservative rule
+                    // stands: a tainted argument makes the result tainted.
+                    match callee.and_then(|c| calls.summary(functions, c, i)) {
+                        Some(sum) => {
+                            if sum.ret {
+                                joined.extend(labels.iter().copied());
+                            }
+                            for (sink_name, at) in &sum.sinks {
+                                for bit in &labels {
+                                    sink(Flow {
+                                        source: sources[usize::from(*bit)].label(),
+                                        sink: sink_name.clone(),
+                                        at: *at,
+                                        arg: Some(i),
+                                        value: a.to_string(),
+                                        path: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                        None => joined.extend(labels.iter().copied()),
                     }
                 }
                 if let Some(dest) = ret {

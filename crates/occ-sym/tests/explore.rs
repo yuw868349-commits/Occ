@@ -277,6 +277,7 @@ fn a_parameter_reaching_a_call_is_reported_with_its_argument_index() {
         },
         &[Source::Name("rdi".into())],
         &cfg,
+        &[func.clone()],
     );
     let call = report
         .flows
@@ -304,6 +305,7 @@ fn a_tainted_branch_is_a_flow_of_its_own() {
         &|a| format!("sub_{:x}", a.get()),
         &[Source::Name("rdi".into())],
         &TaintConfig::default(),
+        &[func.clone()],
     );
     let branch = report
         .flows
@@ -326,6 +328,7 @@ fn nothing_is_tainted_when_nothing_is_a_source() {
         &|a| format!("sub_{:x}", a.get()),
         &[],
         &TaintConfig::default(),
+        &[func.clone()],
     );
     assert!(report.flows.is_empty());
     assert!(!report.notes.is_empty(), "an empty result is explained");
@@ -411,5 +414,98 @@ fn a_recursive_call_is_not_interpreted() {
         report.notes.iter().any(|n| n.contains("recursive")),
         "recursion is named rather than followed: {:?}",
         report.notes
+    );
+}
+
+/// Two functions: one returns its argument, one stores it through a pointer.
+///
+/// 1000: call 1010   e8 0b 00 00 00
+/// 1005: ret         c3
+/// 1010: mov rax,rdi 48 89 f8
+/// 1013: ret         c3
+fn identity_pair() -> Vec<u8> {
+    vec![
+        0xe8, 0x0b, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x48, 0x89, 0xf8, 0xc3,
+    ]
+}
+
+#[test]
+fn a_summary_says_the_return_carries_the_argument() {
+    let code = identity_pair();
+    let image = image_with_code(&code);
+    let view = View::new(&image, &code);
+    let rec = recover(
+        &view,
+        &RecoverOptions {
+            max_functions: 16,
+            max_insns: 4096,
+            follow_calls: true,
+            ..RecoverOptions::default()
+        },
+    );
+    let caller = rec
+        .functions
+        .iter()
+        .find(|f| f.entry == Addr(0x1000))
+        .expect("caller");
+    let report = trace(
+        &image,
+        caller,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &[Source::Name("rdi".into())],
+        &TaintConfig::default(),
+        &rec.functions,
+    );
+    assert!(
+        report.ret_tainted,
+        "the callee returns its argument, so the call's result carries it: {:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn a_summary_reports_the_sink_inside_the_callee() {
+    // 1000: call 1010     e8 0b 00 00 00
+    // 1005: ret           c3
+    // 1010: mov [rdi],esi 89 37
+    // 1012: ret           c3
+    let code: &[u8] = &[
+        0xe8, 0x0b, 0x00, 0x00, 0x00, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x89, 0x37, 0xc3,
+    ];
+    let image = image_with_code(code);
+    let view = View::new(&image, code);
+    let rec = recover(
+        &view,
+        &RecoverOptions {
+            max_functions: 16,
+            max_insns: 4096,
+            follow_calls: true,
+            ..RecoverOptions::default()
+        },
+    );
+    let caller = rec
+        .functions
+        .iter()
+        .find(|f| f.entry == Addr(0x1000))
+        .expect("caller");
+    let report = trace(
+        &image,
+        caller,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &[Source::Name("rdi".into())],
+        &TaintConfig::default(),
+        &rec.functions,
+    );
+    assert!(
+        report
+            .flows
+            .iter()
+            .any(|f| f.sink.contains("store through a pointer")),
+        "the callee writes the argument through the pointer: {:?}",
+        report.flows.iter().map(|f| &f.sink).collect::<Vec<_>>()
     );
 }

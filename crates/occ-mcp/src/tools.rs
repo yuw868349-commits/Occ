@@ -1425,6 +1425,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
             max_iterations: 64,
             sinks,
         },
+        &file.analysis.functions,
     );
     let flows: Vec<Value> = report
         .flows
