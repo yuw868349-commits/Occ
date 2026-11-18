@@ -116,3 +116,33 @@ fn truncated_input_never_panics() {
         let _ = occ_bin::load(&data[..cut.min(data.len())], "cut", ImageId(0));
     }
 }
+
+#[test]
+fn eh_frame_states_function_extents() {
+    let Some(img) = load_ls() else {
+        eprintln!("no /bin/ls on this host");
+        return;
+    };
+    let bounds: Vec<_> = img
+        .function_bounds
+        .iter()
+        .filter(|b| b.source == "eh_frame")
+        .collect();
+    assert!(
+        bounds.len() > 50,
+        "a dynamically linked binary states its functions in .eh_frame, got {}",
+        bounds.len()
+    );
+    for b in &bounds {
+        assert!(b.end.0 > b.start.0, "{:#x} has no extent", b.start.0);
+        // An FDE covers code. It may be the PLT rather than `.text` — the
+        // dynamic linker needs unwind rows for the stubs too — so the check
+        // is that the start lands in a section the loader may execute.
+        let section = img
+            .sections
+            .iter()
+            .filter(|s| s.perm.exec())
+            .find(|s| b.start.0 >= s.addr.0 && b.start.0 < s.addr.0 + s.size);
+        assert!(section.is_some(), "{:#x} is outside every code section", b.start.0);
+    }
+}

@@ -198,7 +198,8 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
 
     let symbols = read_symbols(&r, &h, &shdrs, &names, data, object);
     let (mut imports, exports) = split_dynamic(&symbols);
-    let relocations = read_relocations(&r, &h, &shdrs, &names, &symbols, data);
+    let (relocations, debug_relocations) =
+        read_relocations(&r, &h, &shdrs, &names, &symbols, data);
     bind_import_slots(&mut imports, &relocations);
     let needed = read_needed(&r, &shdrs, &names, data, &mut warnings);
 
@@ -263,6 +264,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         imports,
         exports,
         relocations,
+        debug_relocations,
         fingerprint,
         interpreter,
         warnings,
@@ -762,8 +764,14 @@ fn read_relocations(
     names: &[String],
     symbols: &[Symbol],
     data: &[u8],
-) -> Vec<Relocation> {
+) -> (Vec<Relocation>, Vec<Relocation>) {
     let mut out = Vec::new();
+    // Debug sections are not allocated, so their relocation offsets are file
+    // offsets. They still have to be applied: without them every string
+    // reference in a `.o` reads as offset zero and every code pointer as
+    // zero. They are returned separately so nothing mistakes a file offset
+    // for an address.
+    let mut debug = Vec::new();
     let arch = map_machine(h.machine, h.bits);
     for (i, s) in shdrs.iter().enumerate() {
         if s.kind != SHT_RELA && s.kind != SHT_REL {
@@ -792,12 +800,7 @@ fn read_relocations(
             || shdrs
                 .get(s.info as usize)
                 .is_some_and(|t| t.flags & SHF_ALLOC != 0);
-        if !target_alloc {
-            // Relocations against a non-allocated section address file offsets,
-            // not virtual addresses. Emitting them would put entries at
-            // addresses that belong to no section.
-            continue;
-        }
+        let bucket = if target_alloc { &mut out } else { &mut debug };
         let count = bytes.len() / ent;
         let table_base = s.offset as usize;
         for k in 0..count {
@@ -840,7 +843,7 @@ fn read_relocations(
                 .get(sym_idx)
                 .filter(|sym| sym.defined)
                 .map(|sym| sym.addr);
-            out.push(Relocation {
+            bucket.push(Relocation {
                 offset: Addr(offset),
                 kind: reloc_kind(arch, r_type),
                 symbol,
@@ -853,7 +856,7 @@ fn read_relocations(
         let _ = i;
     }
     let _ = (names, data);
-    out
+    (out, debug)
 }
 
 fn read_needed(

@@ -50,6 +50,7 @@ fn main() {
             keep_comments: false,
             keep_dead: true,
             debug: None,
+            source_lines: false,
         },
         &|a: Addr| format!("sub_{:x}", a.0),
     );

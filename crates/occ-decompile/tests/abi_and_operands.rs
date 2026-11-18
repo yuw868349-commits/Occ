@@ -175,8 +175,10 @@ fn aarch64_shifted_and_extended_operands_survive_lifting() {
     );
     // The extension is a sign extension of the low word, so it reads as a
     // 64-bit value, and the shift stays outside it.
+    // The register is the second parameter, so it prints under its
+    // argument name; the extension and the shift are what the test is about.
     assert!(
-        code.contains("(i64)x1 << 2"),
+        code.contains("(i64)a1 << 2"),
         "the `sxtw #2` operand lost its extension or its shift:\n{code}"
     );
     assert!(

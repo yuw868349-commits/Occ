@@ -179,6 +179,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         imports,
         exports,
         relocations,
+        debug_relocations: Vec::new(),
         fingerprint,
         interpreter: None,
         warnings,
@@ -872,6 +873,7 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         imports: Vec::new(),
         exports: Vec::new(),
         relocations: Vec::new(),
+        debug_relocations: Vec::new(),
         fingerprint: {
             let mut fp = Fingerprint::unknown(id);
             fp.linkage = Linkage::Relocatable;

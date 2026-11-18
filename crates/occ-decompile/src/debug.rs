@@ -205,7 +205,7 @@ pub fn apply(program: &mut Program, info: &DebugInfo, frame_base_slot: Option<i6
     let mut aliases: HashMap<String, String> = program.param_aliases.iter().cloned().collect();
     let mut alias_order: Vec<String> = program.param_aliases.iter().map(|(r, _)| r.clone()).collect();
 
-    for p in &info.params {
+    for (i, p) in info.params.iter().enumerate() {
         match &p.loc {
             DebugLoc::Reg(reg) => {
                 if aliases.contains_key(reg) {
@@ -222,6 +222,19 @@ pub fn apply(program: &mut Program, info: &DebugInfo, frame_base_slot: Option<i6
                     for width in [1u8, 2, 4, 8, 10] {
                         renames.push((slot_name(slot, width), p.name.clone()));
                     }
+                }
+                // A parameter the debug info places in a frame slot arrived in
+                // an argument register: the body starts with `mov [rbp-0x24],
+                // edi`, and the slot is what the code reads afterwards. Naming
+                // only the slot leaves `a = (u32)rdi` in the output, and the
+                // copy pass folds `a` away, so the parameter loses its name at
+                // exactly the place a reader looks first. The ABI register the
+                // parameter occupies is known, and it is the same value.
+                if let Some(reg) = program.param_regs.get(i) {
+                    if !aliases.contains_key(reg) {
+                        alias_order.push(reg.clone());
+                    }
+                    aliases.insert(reg.clone(), p.name.clone());
                 }
             }
             DebugLoc::Unknown => {}
@@ -296,23 +309,36 @@ pub fn apply(program: &mut Program, info: &DebugInfo, frame_base_slot: Option<i6
     }
 
     // Member accesses last: the base now carries its source name, which is the
-    // name the type table keys on.
+    // name the type table keys on. The expression still holds the register
+    // name — aliases are applied at render time — so the lookup goes through
+    // the same table the renderer will use.
+    let alias_of = |v: &str| -> String {
+        if let Some(a) = aliases.get(v) {
+            return a.clone();
+        }
+        if let Some((base, rest)) = v.split_once('.')
+            && let Some(a) = aliases.get(base)
+        {
+            return format!("{a}.{rest}");
+        }
+        v.to_string()
+    };
     for b in &mut program.blocks {
         for s in &mut b.stmts {
             match s {
                 Stmt::Assign { value, .. } => {
-                    if let Some(m) = rewrite_member_load(info, value) {
+                    if let Some(m) = rewrite_member_load(info, value, &alias_of) {
                         *value = m;
                     }
                 }
                 Stmt::Store { value, .. } => {
-                    if let Some(m) = rewrite_member_load(info, value) {
+                    if let Some(m) = rewrite_member_load(info, value, &alias_of) {
                         *value = m;
                     }
                 }
                 Stmt::Call { args, .. } => {
                     for a in args.iter_mut() {
-                        if let Some(m) = rewrite_member_load(info, a) {
+                        if let Some(m) = rewrite_member_load(info, a, &alias_of) {
                             *a = m;
                         }
                     }
@@ -415,30 +441,38 @@ pub fn member_access<'a>(
 ///
 /// This is the expression-level form of [`member_access`]: `*(u32 *)(p + 4)`
 /// where `p` points at `struct point` and `y` sits at offset 4 is `p->y`.
-pub fn rewrite_member_load(info: &DebugInfo, e: &Expr) -> Option<Expr> {
+pub fn rewrite_member_load(
+    info: &DebugInfo,
+    e: &Expr,
+    alias: &dyn Fn(&str) -> String,
+) -> Option<Expr> {
     let Expr::Load { addr, size, signed } = e else {
         return None;
     };
-    let Expr::Bin {
-        op: crate::ir::BinOp::Add,
-        lhs,
-        rhs,
-        ..
-    } = addr.as_ref()
-    else {
-        return None;
+    // `p->x` where `x` is the first member loads through the pointer itself:
+    // there is no `+ 0` in the machine code to key on, so the bare variable is
+    // the zero-offset case rather than a different shape.
+    let (base, off) = match addr.as_ref() {
+        Expr::Var(v) => (v, 0u64),
+        Expr::Bin {
+            op: crate::ir::BinOp::Add,
+            lhs,
+            rhs,
+            ..
+        } => match (lhs.as_ref(), rhs.as_ref()) {
+            (Expr::Var(base), Expr::Const(off)) => (base, *off),
+            _ => return None,
+        },
+        _ => return None,
     };
-    let (Expr::Var(base), Expr::Const(off)) = (lhs.as_ref(), rhs.as_ref()) else {
-        return None;
-    };
-    let (member, _) = member_access(info, base, *off)?;
+    let (member, _) = member_access(info, &alias(base), off)?;
     if member.size.is_some_and(|s| u64::from(*size) != s) {
         return None;
     }
     let _ = signed;
     Some(Expr::Member {
         base: Box::new(Expr::Var(base.clone())),
-        offset: *off,
+        offset: off,
         size: *size,
         name: member.name.clone(),
     })

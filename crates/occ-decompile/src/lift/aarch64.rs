@@ -1178,7 +1178,11 @@ impl super::Lifter for Lifter<'_> {
         let mut out = Lifted::default();
         self.core.written.clear();
         for insn in insns {
+            let before = out.stmts.len();
             self.lift_insn(insn, &mut out);
+            for _ in before..out.stmts.len() {
+                out.stmt_at.push(insn.addr);
+            }
         }
         let last = insns.last();
         if let Some(insn) = last {

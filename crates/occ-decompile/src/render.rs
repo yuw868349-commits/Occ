@@ -67,6 +67,13 @@ struct Renderer {
 }
 
 impl Renderer {
+    /// Render an expression with this function's aliases.
+    fn ex(&self, e: &Expr) -> String {
+        let mut out = String::new();
+        self.fmt_expr(e, &mut out, 0);
+        out
+    }
+
     fn line(&mut self, text: &str) {
         for _ in 0..self.indent {
             self.out.push_str("    ");
@@ -97,15 +104,15 @@ impl Renderer {
         let previous_call = self.last_call.take();
         match node {
             Node::Assign { dest, value } => {
-                let line = format!("{} = {};", name(dest), expr(value));
+                let line = format!("{} = {};", name(dest), self.ex(value));
                 self.line(&line);
             }
             Node::Store { addr, value, size } => {
                 let line = format!(
                     "*({}*){} = {};",
                     type_name(*size, false),
-                    expr(addr),
-                    expr(value)
+                    self.ex(addr),
+                    self.ex(value)
                 );
                 self.line(&line);
             }
@@ -130,7 +137,7 @@ impl Renderer {
                 then_body,
                 else_body,
             } => {
-                self.open(&format!("if ({})", expr(cond)));
+                self.open(&format!("if ({})", self.ex(cond)));
                 self.nodes(then_body);
                 self.indent = self.indent.saturating_sub(1);
                 if else_body.is_empty() {
@@ -144,21 +151,21 @@ impl Renderer {
                 }
             }
             Node::While { cond, body } => {
-                self.open(&format!("while ({})", expr(cond)));
+                self.open(&format!("while ({})", self.ex(cond)));
                 self.nodes(body);
                 self.close("");
             }
             Node::DoWhile { body, cond } => {
                 self.open("do");
                 self.nodes(body);
-                self.close(&format!(" while ({});", expr(cond)));
+                self.close(&format!(" while ({});", self.ex(cond)));
             }
             Node::Switch {
                 expr: e,
                 cases,
                 default,
             } => {
-                self.open(&format!("switch ({})", expr(e)));
+                self.open(&format!("switch ({})", self.ex(e)));
                 for (value, body) in cases {
                     self.indent = self.indent.saturating_sub(1);
                     self.line(&format!("case {value:#x}:"));
@@ -185,7 +192,7 @@ impl Renderer {
                     self.line(&format!("return {call};"));
                     return;
                 }
-                let line = format!("return {};", expr(value));
+                let line = format!("return {};", self.ex(value));
                 self.line(&line);
             }
             Node::Return(None) => self.line("return;"),
@@ -193,7 +200,7 @@ impl Renderer {
             // A jump through a value has no label to name, and printing the
             // value is the only honest thing left: the reader can see which
             // register or cell the dispatch went through.
-            Node::ComputedGoto(e) => self.line(&format!("goto *({});", expr(e))),
+            Node::ComputedGoto(e) => self.line(&format!("goto *({});", self.ex(e))),
             Node::Label(l) => {
                 self.indent = self.indent.saturating_sub(1);
                 self.line(&format!("{l}:"));

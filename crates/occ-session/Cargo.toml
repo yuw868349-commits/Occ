@@ -13,4 +13,5 @@ occ-bin.workspace = true
 occ-analyze.workspace = true
 occ-json.workspace = true
 occ-dwarf.workspace = true
+occ-decompile.workspace = true
 occ-dynamic.workspace = true

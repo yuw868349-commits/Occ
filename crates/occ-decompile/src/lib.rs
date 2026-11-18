@@ -60,6 +60,13 @@ pub struct Options {
     /// mechanical names the lifter chose. An empty value is not the same
     /// thing: it says debug info exists but says nothing about this function.
     pub debug: Option<debug::DebugInfo>,
+    /// Mark each statement with the source line it came from.
+    ///
+    /// The line table is keyed by instruction address, so this needs debug
+    /// information; without it the body is unchanged. Off by default because
+    /// a caller that reads the body as code, rather than as a listing, does
+    /// not want a comment between every pair of statements.
+    pub source_lines: bool,
 }
 
 impl Default for Options {
@@ -69,6 +76,7 @@ impl Default for Options {
             keep_comments: true,
             keep_dead: false,
             debug: None,
+            source_lines: false,
         }
     }
 }
@@ -241,6 +249,45 @@ fn indirect(lifted: &Lifted) -> Term {
             .clone()
             .unwrap_or_else(|| Expr::Unknown("indirect target".into())),
     }
+}
+
+/// Label each statement with the source line the instruction came from.
+///
+/// A run of statements an instruction or a source line produced is labelled
+/// once, at the first statement: a comment before every assignment would say
+/// the same thing repeatedly and bury the body. The file name is printed when
+/// it changes, which is what makes inlined and multi-file functions readable.
+fn with_source_lines(
+    stmts: Vec<Stmt>,
+    at: &[Addr],
+    dbg: Option<&debug::DebugInfo>,
+) -> Vec<Stmt> {
+    let Some(dbg) = dbg else {
+        return stmts;
+    };
+    if dbg.lines.is_empty() {
+        return stmts;
+    }
+    let mut out = Vec::with_capacity(stmts.len() + 8);
+    let mut last: Option<(String, u32)> = None;
+    for (i, s) in stmts.into_iter().enumerate() {
+        let addr = at.get(i).copied().unwrap_or(Addr::NULL);
+        if let Some((file, line)) = dbg.line_at(addr) {
+            let same_file = last.as_ref().is_some_and(|(f, _)| f == file);
+            let same_line = last.as_ref().is_some_and(|(_, l)| *l == line);
+            if !same_file || !same_line {
+                let text = if same_file {
+                    format!("line {line}")
+                } else {
+                    format!("{file}:{line}")
+                };
+                out.push(Stmt::Comment(text));
+                last = Some((file.to_string(), line));
+            }
+        }
+        out.push(s);
+    }
+    out
 }
 
 fn show(stage: &str, blocks: &[Block]) {
@@ -449,9 +496,30 @@ pub fn build_program(
             },
         };
         let mut stmts = lifted.stmts;
+        // Statements the terminator produced come from the last instruction,
+        // which is the address the block ends at.
+        let mut stmt_at = lifted.stmt_at;
+        stmt_at.resize(stmts.len(), bb.end);
+        let tail_len = tail.len();
         stmts.append(&mut tail);
+        for _ in 0..tail_len {
+            stmt_at.push(bb.end);
+        }
         if !opts.keep_comments {
-            stmts.retain(|s| !matches!(s, Stmt::Comment(_)));
+            // The two vectors are parallel, so they are filtered together.
+            let mut kept_stmts = Vec::with_capacity(stmts.len());
+            let mut kept_at = Vec::with_capacity(stmt_at.len());
+            for (s, a) in stmts.into_iter().zip(stmt_at) {
+                if !matches!(s, Stmt::Comment(_)) {
+                    kept_stmts.push(s);
+                    kept_at.push(a);
+                }
+            }
+            stmts = kept_stmts;
+            stmt_at = kept_at;
+        }
+        if opts.source_lines {
+            stmts = with_source_lines(stmts, &stmt_at, opts.debug.as_ref());
         }
         if std::env::var("OCC_DEBUG_LIFT").is_ok() {
             eprintln!("lift {:#x} term={term:?}", bb.start.0);

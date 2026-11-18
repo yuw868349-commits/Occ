@@ -314,6 +314,14 @@ pub struct Parsed {
 pub struct Lifted {
     /// Straight-line statements.
     pub stmts: Vec<Stmt>,
+    /// Address of the instruction each statement came from, parallel to
+    /// [`stmts`](Self::stmts).
+    ///
+    /// One instruction can lift to several statements and to none, so the
+    /// addresses repeat and skip. The line table is keyed by address, which
+    /// is why the mapping is kept instead of recomputed from instruction
+    /// offsets.
+    pub stmt_at: Vec<Addr>,
     /// Condition of a trailing conditional branch.
     pub branch: Option<Expr>,
     /// Target expression of a trailing indirect jump.

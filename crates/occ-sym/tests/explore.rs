@@ -37,6 +37,7 @@ fn image_with_code(code: &[u8]) -> Image {
         imports: Vec::new(),
         exports: Vec::new(),
         relocations: Vec::new(),
+        debug_relocations: Vec::new(),
         fingerprint: Fingerprint::unknown(ImageId(0)),
         interpreter: None,
         warnings: Vec::new(),

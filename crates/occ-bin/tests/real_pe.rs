@@ -139,3 +139,30 @@ fn a_truncated_pe_never_panics() {
         let _ = occ_bin::load(&data[..cut.min(data.len())], "cut", ImageId(0));
     }
 }
+
+#[test]
+fn pdata_states_function_extents() {
+    let Some(img) = load() else {
+        eprintln!("no PE fixture on this host");
+        return;
+    };
+    let text = img.section_by_name(".text").expect(".text");
+    let bounds: Vec<_> = img
+        .function_bounds
+        .iter()
+        .filter(|b| b.source == "pdata")
+        .collect();
+    assert!(
+        bounds.len() > 10,
+        "the exception directory names every function, got {}",
+        bounds.len()
+    );
+    for b in &bounds {
+        assert!(b.end.0 > b.start.0, "{:#x} has no extent", b.start.0);
+        assert!(
+            b.start.0 >= text.addr.0 && b.start.0 < text.addr.0 + text.size,
+            "{:#x} is outside .text",
+            b.start.0
+        );
+    }
+}

@@ -28,6 +28,8 @@ use occ_core::{Arch, Endian, Image, Linkage, Relocation};
 pub struct Applied {
     /// Relocations whose bytes were rewritten.
     pub applied: usize,
+    /// Relocations in debug sections whose bytes were rewritten.
+    pub debug_applied: usize,
     /// Relocations left alone because this build cannot encode their effect
     /// (GOT slots, TLS offsets, debug-only arithmetic).
     pub deferred: usize,
@@ -41,7 +43,8 @@ pub struct Applied {
 
 /// True when the image is one whose placeholders still need filling in.
 pub fn needed(image: &Image) -> bool {
-    image.fingerprint.linkage == Linkage::Relocatable && !image.relocations.is_empty()
+    image.fingerprint.linkage == Linkage::Relocatable
+        && !(image.relocations.is_empty() && image.debug_relocations.is_empty())
 }
 
 /// Apply every relocation this build understands.
@@ -133,6 +136,73 @@ pub fn apply(data: &mut [u8], image: &Image) -> Option<Applied> {
         }
     }
 
+    // Debug tables carry placeholders of their own: a `.debug_info` full of
+    // zero string offsets and zero code pointers is what an unlinked object
+    // holds, and reading it that way names every function after the first
+    // string in the file. Their offsets are file offsets, and a relocatable
+    // object's section address is its file offset, so the same arithmetic
+    // applies; they get their own counter because a reader asking about code
+    // should not see them.
+    for r in &image.debug_relocations {
+        let Some(section_index) = r.section else {
+            report.deferred += 1;
+            continue;
+        };
+        let Some(&(sec_addr, sec_file, sec_size)) = sections.get(&section_index) else {
+            report.deferred += 1;
+            continue;
+        };
+        if r.offset.0 >= sec_size {
+            report.deferred += 1;
+            continue;
+        }
+        let place = sec_addr.wrapping_add(r.offset.0);
+        let off = (sec_file as usize).wrapping_add(r.offset.0 as usize);
+        if off >= data.len() {
+            report.deferred += 1;
+            continue;
+        }
+        let value = match r.symbol_addr {
+            Some(a) => Some(a.0),
+            None => match r.symbol.as_deref().filter(|n| !n.is_empty()) {
+                Some(name) => {
+                    let next = external_base + (external.len() as u64) * 16;
+                    Some(*external.entry(name).or_insert(next))
+                }
+                None => None,
+            },
+        };
+        let Some(value) = value else {
+            report.deferred += 1;
+            continue;
+        };
+        // A DWARF reference into another debug section is an offset from that
+        // section's start, not an address. The symbol's synthetic address is
+        // the section's file offset, so subtracting it back out is what makes
+        // the string tables readable. A reference into an allocated section —
+        // `DW_AT_low_pc` — is a real address and keeps the value.
+        let value = match r.symbol_addr {
+            Some(a) => debug_section_offset(image, a.0).unwrap_or(value),
+            None => value,
+        };
+        match patch_one(data, image.arch, r, place, off, value, endian, &mut pcrel_hi) {
+            Outcome::Patched => report.debug_applied += 1,
+            Outcome::Deferred => {
+                report.deferred += 1;
+                if !unsupported.contains(&r.raw_type) {
+                    unsupported.push(r.raw_type);
+                }
+            }
+            Outcome::OutOfRange => report.out_of_range += 1,
+        }
+    }
+    if report.debug_applied > 0 {
+        report.notes.push(format!(
+            "applied {} relocation(s) to debug sections so names and code pointers in the DWARF resolve",
+            report.debug_applied
+        ));
+    }
+
     report.externals = external.len();
     if report.applied > 0 {
         report.notes.push(format!(
@@ -193,6 +263,20 @@ enum Outcome {
 /// one half of a two-entry computation that describes an unwind or debug table:
 /// neither entry names an address on its own, and the tables they build are not
 /// code, so applying one side would write a number that means nothing.
+/// Turn a synthetic address that points into a debug section back into the
+/// section-relative offset DWARF stores there.
+fn debug_section_offset(image: &Image, addr: u64) -> Option<u64> {
+    image
+        .sections
+        .iter()
+        .find(|s| {
+            s.name.starts_with(".debug")
+                && addr >= s.addr.0
+                && addr < s.addr.0 + s.file_size
+        })
+        .map(|s| addr - s.addr.0)
+}
+
 fn is_linker_hint(arch: Arch, raw: u32) -> bool {
     match arch {
         Arch::RiscV32 | Arch::RiscV64 => matches!(raw, 33..=40 | 43 | 51 | 52..=54),

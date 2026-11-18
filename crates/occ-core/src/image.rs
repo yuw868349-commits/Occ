@@ -650,6 +650,15 @@ pub struct Image {
     pub exports: Vec<Export>,
     /// Relocations.
     pub relocations: Vec<Relocation>,
+    /// Relocations that patch debug sections.
+    ///
+    /// Kept apart from [`Self::relocations`] because their offsets are file
+    /// offsets, not addresses: a linker never assigns a `.debug_info` byte an
+    /// address, so an entry here must not be read as a place in the image.
+    /// They exist so a relocatable object's DWARF can be read the way the
+    /// linker would have left it, instead of every string and code pointer
+    /// reading as zero.
+    pub debug_relocations: Vec<Relocation>,
     /// Derived structural summary.
     pub fingerprint: Fingerprint,
     /// Requested program interpreter, verbatim (ELF `PT_INTERP`). The path
@@ -828,6 +837,7 @@ mod tests {
             }],
             exports: Vec::new(),
             relocations: Vec::new(),
+            debug_relocations: Vec::new(),
             fingerprint: Fingerprint {
                 compiler: CompilerFamily::Gcc,
                 compiler_claim: Claim::new(crate::handle::Handle::image(0), "gcc"),

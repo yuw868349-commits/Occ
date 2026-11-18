@@ -8,6 +8,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod dbginfo;
 pub mod diff;
 pub mod pattern;
 pub mod persist;

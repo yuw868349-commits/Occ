@@ -255,6 +255,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         imports,
         exports,
         relocations: Vec::new(),
+        debug_relocations: Vec::new(),
         fingerprint: fp,
         interpreter: None,
         warnings,

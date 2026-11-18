@@ -490,6 +490,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         imports,
         exports,
         relocations,
+        debug_relocations: Vec::new(),
         fingerprint: fp,
         interpreter: None,
         warnings,
@@ -791,11 +792,25 @@ fn read_chained_fixups(
             continue;
         }
         let at = starts_off as usize + info_off as usize;
-        let Some(page_size) = rd(at) else { continue };
-        let Some(format) = chunk.get(at + 4..at + 6).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        // `dyld_chained_starts_in_segment`: size (4), page_size (2),
+        // pointer_format (2), segment_offset (8), max_valid_pointer (4),
+        // page_count (2), then one page_start per page.
+        let Some(page_size) = chunk
+            .get(at + 4..at + 6)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        else {
             continue;
         };
-        let Some(page_count) = chunk.get(at + 6..at + 8).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        let Some(format) = chunk
+            .get(at + 6..at + 8)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        else {
+            continue;
+        };
+        let Some(page_count) = chunk
+            .get(at + 20..at + 22)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        else {
             continue;
         };
         // 1 = PTR_64, 2 = PTR_64_OFFSET; both use the same 64-bit layout.
@@ -805,7 +820,7 @@ fn read_chained_fixups(
         let Some(seg) = segs.get(s) else { continue };
         for page in 0..page_count as usize {
             let Some(start) = chunk
-                .get(at + 8 + page * 2..at + 10 + page * 2)
+                .get(at + 22 + page * 2..at + 24 + page * 2)
                 .map(|b| u16::from_le_bytes([b[0], b[1]]))
             else {
                 break;
@@ -821,7 +836,10 @@ fn read_chained_fixups(
                     break;
                 }
                 let file_at = (seg.fileoff + (cursor - seg.vmaddr)) as usize;
-                let Some(raw) = chunk.get(file_at..file_at + 8).map(|b| {
+                // The chain pointer lives in the segment's bytes, not in the
+                // fixups blob: `chunk` holds the table that describes the
+                // chains, and the pointers themselves are in the image.
+                let Some(raw) = data.get(base + file_at..base + file_at + 8).map(|b| {
                     u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
                 }) else {
                     break;
@@ -1123,6 +1141,238 @@ mod tests {
         assert_eq!(img.sections[0].kind, SectionKind::Code);
         assert!(img.sections[0].perm.exec());
         assert_eq!(img.fingerprint.linkage, Linkage::Pie);
+    }
+
+    /// A 64-bit executable whose entry comes from `LC_UNIXTHREAD` and whose
+    /// function list comes from `LC_FUNCTION_STARTS`.
+    fn minimal_with_thread_and_starts() -> Vec<u8> {
+        let thread_cmdsize = 16 + 42 * 4;
+        let total = 72 + 152 + thread_cmdsize + 16;
+        let mut d = Vec::new();
+        d.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+        d.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // x86_64
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&2u32.to_le_bytes()); // MH_EXECUTE
+        d.extend_from_slice(&3u32.to_le_bytes()); // ncmds
+        d.extend_from_slice(&(total as u32).to_le_bytes());
+        d.extend_from_slice(&0x0020_0000u32.to_le_bytes()); // PIE
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // LC_SEGMENT_64 __TEXT, one section, no content on disk.
+        d.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        d.extend_from_slice(&152u32.to_le_bytes());
+        d.extend_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_0000u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&5u32.to_le_bytes());
+        d.extend_from_slice(&5u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(b"__text\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_0400u64.to_le_bytes());
+        d.extend_from_slice(&0x100u64.to_le_bytes());
+        d.extend_from_slice(&0x400u32.to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0x8000_0400u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // LC_UNIXTHREAD x86_THREAD_STATE64: rip is the 17th register.
+        d.extend_from_slice(&LC_UNIXTHREAD.to_le_bytes());
+        d.extend_from_slice(&(thread_cmdsize as u32).to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes()); // x86_THREAD_STATE64
+        d.extend_from_slice(&42u32.to_le_bytes()); // 32-bit word count
+        for i in 0..21u64 {
+            let value: u64 = if i == 16 { 0x1_0000_0420 } else { 0 };
+            d.extend_from_slice(&value.to_le_bytes());
+        }
+        // LC_FUNCTION_STARTS: deltas 0x400 and 0x20 from the __TEXT base.
+        d.extend_from_slice(&LC_FUNCTION_STARTS.to_le_bytes());
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&0x500u32.to_le_bytes());
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.resize(0x510, 0);
+        // ULEB128: 0x400, 0x20, 0.
+        let mut pos = 0x500;
+        for value in [0x400u32, 0x20, 0] {
+            let mut v = value;
+            loop {
+                let byte = (v & 0x7f) as u8;
+                v >>= 7;
+                d[pos] = if v != 0 { byte | 0x80 } else { byte };
+                pos += 1;
+                if v == 0 {
+                    break;
+                }
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn the_thread_state_names_the_entry_point() {
+        let img = parse(&minimal_with_thread_and_starts(), "t", ImageId(0)).expect("parse");
+        assert_eq!(img.entry, Addr(0x1_0000_0420));
+    }
+
+    #[test]
+    fn function_starts_become_exact_bounds() {
+        let img = parse(&minimal_with_thread_and_starts(), "t", ImageId(0)).expect("parse");
+        let bounds: Vec<_> = img
+            .function_bounds
+            .iter()
+            .filter(|b| b.source == "function_starts")
+            .collect();
+        assert_eq!(bounds.len(), 2, "two deltas, so two functions");
+        assert_eq!(bounds[0].start, Addr(0x1_0000_0400));
+        assert_eq!(bounds[0].end, Addr(0x1_0000_0420));
+        assert_eq!(bounds[1].start, Addr(0x1_0000_0420));
+        // The last function runs to the end of __TEXT when nothing follows it.
+        assert_eq!(bounds[1].end, Addr(0x1_0000_1000));
+    }
+
+    /// A 64-bit arm64-style executable whose only record of an import is a
+    /// chained fixup in `__DATA`.
+    fn minimal_with_chained_fixups() -> Vec<u8> {
+        const DYLIB: &[u8] = b"/usr/lib/libSystem.B.dylib\0";
+        let dylib_cmdsize = (24 + DYLIB.len() + 7) & !7;
+        let sizeofcmds = 72 + 152 + 152 + dylib_cmdsize + 16;
+        let mut d = Vec::new();
+        d.extend_from_slice(&MH_MAGIC_64.to_le_bytes());
+        d.extend_from_slice(&0x0100_000cu32.to_le_bytes()); // arm64
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&2u32.to_le_bytes()); // MH_EXECUTE
+        d.extend_from_slice(&5u32.to_le_bytes()); // ncmds
+        d.extend_from_slice(&(sizeofcmds as u32).to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // __PAGEZERO
+        d.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        d.extend_from_slice(&72u32.to_le_bytes());
+        d.extend_from_slice(b"__PAGEZERO\0\0\0\0\0\0");
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&0x1_0000_0000u64.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // __TEXT with __text
+        d.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        d.extend_from_slice(&152u32.to_le_bytes());
+        d.extend_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_0000u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&0u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&5u32.to_le_bytes());
+        d.extend_from_slice(&5u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(b"__text\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(b"__TEXT\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_0400u64.to_le_bytes());
+        d.extend_from_slice(&0x100u64.to_le_bytes());
+        d.extend_from_slice(&0x400u32.to_le_bytes());
+        d.extend_from_slice(&4u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0x8000_0400u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // __DATA with __data
+        d.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        d.extend_from_slice(&152u32.to_le_bytes());
+        d.extend_from_slice(b"__DATA\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_2000u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&0x2000u64.to_le_bytes());
+        d.extend_from_slice(&0x1000u64.to_le_bytes());
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&3u32.to_le_bytes());
+        d.extend_from_slice(&1u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(b"__data\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(b"__DATA\0\0\0\0\0\0\0\0\0\0");
+        d.extend_from_slice(&0x1_0000_3000u64.to_le_bytes());
+        d.extend_from_slice(&0x100u64.to_le_bytes());
+        d.extend_from_slice(&0x3000u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        // LC_LOAD_DYLIB, so the ordinal has a library name.
+        d.extend_from_slice(&LC_LOAD_DYLIB.to_le_bytes());
+        d.extend_from_slice(&(dylib_cmdsize as u32).to_le_bytes());
+        d.extend_from_slice(&24u32.to_le_bytes()); // name offset
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(&0u32.to_le_bytes());
+        d.extend_from_slice(DYLIB);
+        d.resize(d.len() + (dylib_cmdsize - 24 - DYLIB.len()), 0);
+        // LC_DYLD_CHAINED_FIXUPS pointing at 0x500.
+        d.extend_from_slice(&LC_DYLD_CHAINED_FIXUPS.to_le_bytes());
+        d.extend_from_slice(&16u32.to_le_bytes());
+        d.extend_from_slice(&0x500u32.to_le_bytes());
+        d.extend_from_slice(&0x100u32.to_le_bytes());
+        d.resize(0x2018, 0);
+
+        // The bind pointer: lib_ordinal 0, next 0, bind 1.
+        let slot = 0x2010usize;
+        let raw: u64 = 1 << 63;
+        d[slot..slot + 8].copy_from_slice(&raw.to_le_bytes());
+
+        // The fixups blob.
+        let b = 0x500usize;
+        let put32 = |d: &mut Vec<u8>, at: usize, v: u32| {
+            d[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put32(&mut d, b, 0); // fixups_version
+        put32(&mut d, b + 4, 28); // starts_offset
+        put32(&mut d, b + 8, 68); // imports_offset
+        put32(&mut d, b + 12, 72); // symbols_offset
+        put32(&mut d, b + 16, 1); // imports_count
+        put32(&mut d, b + 20, 1); // imports_format = IMPORT
+        put32(&mut d, b + 24, 0); // symbols_format
+        // dyld_chained_starts_in_image
+        put32(&mut d, b + 28, 3); // seg_count
+        put32(&mut d, b + 32, 0); // __PAGEZERO
+        put32(&mut d, b + 36, 0); // __TEXT
+        put32(&mut d, b + 40, 16); // __DATA -> 28 + 16 = 44
+        // dyld_chained_starts_in_segment for __DATA
+        put32(&mut d, b + 44, 24); // size
+        d[b + 48..b + 50].copy_from_slice(&0x1000u16.to_le_bytes()); // page_size
+        d[b + 50..b + 52].copy_from_slice(&1u16.to_le_bytes()); // PTR_64
+        d[b + 52..b + 60].copy_from_slice(&0x1_0000_2000u64.to_le_bytes());
+        put32(&mut d, b + 60, 0); // max_valid_pointer
+        d[b + 64..b + 66].copy_from_slice(&1u16.to_le_bytes()); // page_count
+        d[b + 66..b + 68].copy_from_slice(&0x10u16.to_le_bytes()); // page_start
+        // import record: lib_ordinal 1, weak 0, name_offset 1
+        put32(&mut d, b + 68, 1);
+        // symbol pool
+        d[b + 72..b + 78].copy_from_slice(b"\0puts\0");
+        d
+    }
+
+    #[test]
+    fn chained_fixups_name_the_imported_symbol() {
+        let img = parse(&minimal_with_chained_fixups(), "t", ImageId(0)).expect("parse");
+        let puts = img
+            .imports
+            .iter()
+            .find(|i| i.name == "puts")
+            .unwrap_or_else(|| panic!("imports: {:?}", img.imports));
+        assert_eq!(puts.slot, Some(Addr(0x1_0000_2010)));
+        assert_eq!(puts.library.as_deref(), Some("/usr/lib/libSystem.B.dylib"));
     }
 
     #[test]

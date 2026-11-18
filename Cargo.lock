@@ -106,6 +106,7 @@ dependencies = [
  "occ-analyze",
  "occ-bin",
  "occ-core",
+ "occ-decompile",
  "occ-dwarf",
  "occ-dynamic",
  "occ-json",

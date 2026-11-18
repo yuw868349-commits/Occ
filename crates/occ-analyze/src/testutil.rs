@@ -35,6 +35,7 @@ pub fn image_with_sections(sections: Vec<Section>) -> Image {
         imports: Vec::new(),
         exports: Vec::new(),
         relocations: Vec::new(),
+        debug_relocations: Vec::new(),
         fingerprint: Fingerprint::unknown(ImageId(0)),
         interpreter: None,
         warnings: Vec::new(),
