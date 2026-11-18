@@ -142,6 +142,7 @@ pub(super) fn decode(origin: Addr, word: u32) -> R {
 fn group_a(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x04 => integer_04(origin, word),
+        0x44 => super::sve_tab44::decode_44(origin, word),
         0x24 => compare_24(origin, word),
         0x64 => float_64_65(origin, word),
         0x84 => gather_84_85(origin, word),
@@ -157,6 +158,7 @@ fn group_a(origin: Addr, word: u32) -> R {
 fn group_b(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x05 => permute_05(origin, word),
+        0x45 => super::sve_tab45::decode_45(origin, word),
         0x25 => integer_25(origin, word),
         0x65 => float_64_65(origin, word),
         0x85 => gather_84_85(origin, word),
@@ -1117,7 +1119,7 @@ fn permuting_05(origin: Addr, word: u32) -> R {
             0b00000 => R::new("mov", format!("mov {}, {}", zt(zd, t), gpr_sp(zn, wide))),
             0b00100 => R::new("insr", format!("insr {}, {}", zt(zd, t), gpr(zn, wide))),
             0b10100 => R::new("insr", format!("insr {}, {}", zt(zd, t), scalar(t, zn))),
-            0b10000 | 0b10001 | 0b10010 | 0b10011 => {
+            0b10000..=0b10011 => {
                 if sz == 0 {
                     return undefined(origin, word, "SVE unpack (unallocated)");
                 }
@@ -3640,7 +3642,7 @@ fn cont_load_a45_text(word: u32) -> GatherText {
                     let n = 1 + sz as usize;
                     (ldq_mnemonic(n), 'q', n)
                 }
-                0b001 | 0b010 | 0b011 => {
+                0b001..=0b011 => {
                     let n = nregs as usize + 1;
                     let (suf, elem, _acc) = eld_opc(bits(word, 24, 23));
                     (ld_mnemonic(n, suf), elem, n)
@@ -4452,7 +4454,7 @@ fn with_comment(prefix: &str, comment: Option<&str>) -> String {
         return prefix.to_string();
     };
     let mn_len = prefix
-        .find(|c: char| c == ' ' || c == '\t')
+        .find([' ', '\t'])
         .unwrap_or(prefix.len());
     let col = (mn_len + 25).max(prefix.len() + 1);
     format!("{prefix}{}// ={comment}", " ".repeat(col - prefix.len()))

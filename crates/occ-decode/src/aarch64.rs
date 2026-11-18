@@ -21,6 +21,9 @@ use crate::Decoded;
 
 mod simd;
 mod sve;
+mod sve_tab;
+mod sve_tab44;
+mod sve_tab45;
 
 /// Registers 0..30, plus the zero register.
 const XZR: [&str; 32] = [
