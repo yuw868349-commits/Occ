@@ -162,7 +162,8 @@ fn cond_of_suffix(suffix: &str) -> Option<FlagCond> {
 
 /// The instructions this lifter understands, without condition or `s`.
 const BASES: &[&str] = &[
-    "adc", "add", "and", "asr", "b", "bic", "bl", "blx", "bx", "clz", "cmn", "cmp", "eor", "ldm",
+    "adc", "add", "and", "asr", "b", "bic", "bl", "blx", "blxns", "bx", "bxns", "clz", "cmn", "cmp",
+    "eor", "ldm",
     "ldr", "ldrb", "ldrd", "ldrh", "ldrsb", "ldrsh", "lsl", "lsr", "mla", "mov", "movw", "movt", "mul",
     "mvn", "nop", "orr", "pop", "push", "ror", "rrx", "rsb", "sbc", "sdiv", "stm", "str", "strb",
     "strh", "strd", "sub", "svc", "swi", "teq", "tst", "udiv", "umull", "smull", "umlal", "smlal",
@@ -998,12 +999,14 @@ impl<'a> Lifter<'a> {
             "ldr" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "str" | "strb" | "strh" => {
                 self.transfer(base, ops, insn.addr, guard, &mut out.stmts);
             }
-            "bx" => {
+            "bx" | "bxns" => {
                 // `bx lr` is a return, and the decoder already said so in the
                 // flow. `bx r3` is a computed jump the block terminator
-                // carries; there is no statement to emit.
+                // carries; there is no statement to emit.  `bxns` is the
+                // same exchange with the security state changed as well,
+                // and it is a jump in the same way.
             }
-            "blx" => {
+            "blx" | "blxns" => {
                 let Some(target) = ops.first().and_then(reg_of) else {
                     return;
                 };
@@ -1689,7 +1692,7 @@ impl<'a> Lifter<'a> {
         // `bxne lr` is the conditional return compilers use for one arm of a
         // guard. It is a branch for the block, and the condition it tests is
         // the same one `bne` would.
-        if base != "b" && base != "bx" {
+        if base != "b" && base != "bx" && base != "bxns" {
             return Expr::Unknown("condition".into());
         }
         match cond {
@@ -1722,7 +1725,10 @@ fn reg_at(ops: &[Operand], i: usize) -> Option<u8> {
 /// between it and the instruction.
 fn is_conditional_return(text: &str) -> bool {
     let text = text.trim();
-    let Some(rest) = text.strip_prefix("bx") else {
+    let Some(rest) = text
+        .strip_prefix("bx")
+        .or_else(|| text.strip_prefix("bxns"))
+    else {
         return false;
     };
     let rest = rest.trim();
