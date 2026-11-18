@@ -318,11 +318,43 @@ static TOOLS: [ToolDef; 38] = [
 
 fn summary_of(file: &ImageFile) -> String {
     format!(
-        "{} — {} functions, {} strings, {:.1}% of code decoded",
+        "{} — {} functions, {} strings, {:.1}% of executable bytes decoded as instructions",
         file.image.headline(),
         file.analysis.coverage.functions,
         file.analysis.strings.len(),
         f64::from(file.analysis.coverage.fraction()) * 100.0
+    )
+}
+
+/// Coverage, as every reply reports it.
+///
+/// One helper rather than a copy per tool: the two `binary_*` replies used to
+/// build this object inline and drifted — one listed `insn_bytes` twice and
+/// left out `code_bytes`, which hid the denominator of both percentages.
+///
+/// The three byte counts answer three different questions and none of them can
+/// be inferred from the others:
+///
+/// * `insn_bytes` — understood. This is the numerator of `fraction`.
+/// * `unparsed_bytes` — read as `.word` because no encoding matched.
+/// * `hole_bytes` — inside a recovered body, and nothing covers it at all.
+///
+/// `covered_bytes` is the union of function ranges, so
+/// `hole_bytes = covered_bytes - (bytes in those ranges that some unit covers)`.
+fn static_coverage_json(c: &occ_analyze::Coverage) -> Value {
+    obj!(
+        "code_bytes" => Value::from(c.code_bytes),
+        "insn_bytes" => Value::from(c.insn_bytes),
+        "unparsed_bytes" => Value::from(c.unparsed_bytes),
+        "decoded_bytes" => Value::from(c.decoded_bytes),
+        "covered_bytes" => Value::from(c.covered_bytes),
+        "hole_bytes" => Value::from(c.hole_bytes),
+        "functions" => Value::from(c.functions),
+        "insns" => Value::from(c.insns),
+        "blocks" => Value::from(c.blocks),
+        "fraction" => f64::from(c.fraction()),
+        "accounted_fraction" => f64::from(c.accounted_fraction()),
+        "body_fraction" => f64::from(c.body_fraction()),
     )
 }
 
@@ -459,20 +491,7 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
         .field("fingerprint", fp)
         .field(
             "coverage",
-            obj!(
-                "code_bytes" => Value::from(file.analysis.coverage.code_bytes),
-                "insn_bytes" => Value::from(file.analysis.coverage.insn_bytes),
-                "unparsed_bytes" => Value::from(file.analysis.coverage.unparsed_bytes),
-                "decoded_bytes" => Value::from(file.analysis.coverage.decoded_bytes),
-                "covered_bytes" => Value::from(file.analysis.coverage.covered_bytes),
-                "functions" => Value::from(file.analysis.coverage.functions),
-                "insns" => Value::from(file.analysis.coverage.insns),
-                "blocks" => Value::from(file.analysis.coverage.blocks),
-                "insn_bytes" => Value::from(file.analysis.coverage.insn_bytes),
-                "unparsed_bytes" => Value::from(file.analysis.coverage.unparsed_bytes),
-                "fraction" => f64::from(file.analysis.coverage.fraction()),
-                "accounted_fraction" => f64::from(file.analysis.coverage.accounted_fraction()),
-            ),
+            static_coverage_json(&file.analysis.coverage),
         )
         .field(
             "notes",
@@ -564,17 +583,7 @@ fn binary_info(session: &Session, args: &Args) -> Result<Value, String> {
         .field("identity", image_json(&file.image))
         .field("segments", Value::Array(segments))
         .field("fingerprint", fingerprint_json(&file.analysis.fingerprint))
-        .field(
-            "coverage",
-            obj!(
-                "functions" => Value::from(file.analysis.coverage.functions),
-                "insns" => Value::from(file.analysis.coverage.insns),
-                "blocks" => Value::from(file.analysis.coverage.blocks),
-                "insn_bytes" => Value::from(file.analysis.coverage.insn_bytes),
-                "unparsed_bytes" => Value::from(file.analysis.coverage.unparsed_bytes),
-                "fraction" => f64::from(file.analysis.coverage.fraction()),
-            ),
-        )
+        .field("coverage", static_coverage_json(&file.analysis.coverage))
         .field(
             "notes",
             Value::Array(file.analysis.notes.iter().cloned().map(Value::String).collect()),
@@ -3043,5 +3052,49 @@ mod tests {
     fn list_payload_matches_the_registry() {
         let v = list_json();
         assert_eq!(v.as_array().unwrap().len(), all().len());
+    }
+
+    #[test]
+    fn coverage_names_every_byte_count_exactly_once() {
+        // The reply used to list `insn_bytes` twice and omit `code_bytes`, so a
+        // reader could not check the percentage against its denominator. A
+        // duplicate key in a JSON object is either dropped silently or emitted
+        // twice depending on the writer; both are bugs worth a test.
+        let c = occ_analyze::Coverage {
+            code_bytes: 0x1000,
+            insn_bytes: 0x100,
+            unparsed_bytes: 0x20,
+            decoded_bytes: 0x120,
+            covered_bytes: 0x200,
+            hole_bytes: 0x100,
+            functions: 1,
+            insns: 64,
+            blocks: 8,
+        };
+        let text = occ_json::to_string(&static_coverage_json(&c));
+        for key in [
+            "code_bytes",
+            "insn_bytes",
+            "unparsed_bytes",
+            "decoded_bytes",
+            "covered_bytes",
+            "hole_bytes",
+            "functions",
+            "insns",
+            "blocks",
+            "fraction",
+            "accounted_fraction",
+            "body_fraction",
+        ] {
+            assert_eq!(
+                text.matches(&format!("\"{key}\"")).count(),
+                1,
+                "{key} should appear once in {text}"
+            );
+        }
+        // The percentage is checkable against the numbers beside it.
+        assert!(text.contains("\"insn_bytes\":256"), "{text}");
+        assert!(text.contains("\"code_bytes\":4096"), "{text}");
+        assert!(text.contains("\"body_fraction\":0.5"), "{text}");
     }
 }

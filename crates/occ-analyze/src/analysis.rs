@@ -78,6 +78,17 @@ pub struct Coverage {
     pub decoded_bytes: u64,
     /// Bytes inside a recovered function's range, holes included.
     pub covered_bytes: u64,
+    /// Bytes inside a recovered function's range that no decoded unit covers.
+    ///
+    /// A body can claim a range and then jump over a chunk the recovery never
+    /// followed, or the decoder can stop at the first byte it cannot read.
+    /// Those bytes are neither understood nor accounted for: they sit in the
+    /// function, nothing reads them, and no count above shows them. Reporting
+    /// them is what stops `covered_bytes` from being read as "decoded".
+    ///
+    /// `insn_bytes + unparsed_bytes + hole_bytes >= covered_bytes` — the sum
+    /// can exceed it because a decoded unit may reach past its own body.
+    pub hole_bytes: u64,
     /// Functions recovered.
     pub functions: usize,
     /// Instructions decoded.
@@ -109,6 +120,23 @@ impl Coverage {
             0.0
         } else {
             (self.decoded_bytes as f32 / self.code_bytes as f32).min(1.0)
+        }
+    }
+
+    /// Fraction of the bytes inside recovered functions that a decoded unit
+    /// covers, `0.0..=1.0`.
+    ///
+    /// [`fraction`](Self::fraction) measures the whole executable section and
+    /// so punishes a file for holding code nobody identified. This one asks a
+    /// narrower question — of the code that was identified, how much was read —
+    /// and it is the honest number to quote when comparing two files whose
+    /// recovery found different amounts of code.
+    pub fn body_fraction(&self) -> f32 {
+        if self.covered_bytes == 0 {
+            0.0
+        } else {
+            let read = self.covered_bytes.saturating_sub(self.hole_bytes);
+            (read as f32 / self.covered_bytes as f32).min(1.0)
         }
     }
 }
@@ -167,7 +195,7 @@ impl Analysis {
         // mis-recovered bound) must not push coverage past 100%. Instructions
         // and data directives are counted separately so that a `.word` cannot
         // pass for understanding.
-        let (insn_bytes, unparsed_bytes) = byte_accounting(&functions);
+        let (insn_bytes, unparsed_bytes, hole_bytes) = byte_accounting(&functions);
         let decoded_bytes = insn_bytes + unparsed_bytes;
         let covered_bytes = union_len(&functions);
         let blocks = functions.iter().map(|f| f.blocks.len()).sum();
@@ -186,6 +214,7 @@ impl Analysis {
                 unparsed_bytes,
                 decoded_bytes,
                 covered_bytes,
+                hole_bytes,
                 functions: functions.len(),
                 insns,
                 blocks,
@@ -281,9 +310,13 @@ impl Analysis {
     }
 
     /// One-line summary used in reports.
+    ///
+    /// The percentage is instruction bytes over executable bytes, so it says
+    /// "decoded as instructions" rather than "covered": a build whose code is
+    /// half `.word` would otherwise read as complete.
     pub fn summary(&self) -> String {
         format!(
-            "{} functions, {} instructions, {} blocks, {:.1}% of {} code bytes",
+            "{} functions, {} instructions, {} blocks, {:.1}% of {} executable bytes decoded as instructions",
             self.coverage.functions,
             self.coverage.insns,
             self.coverage.blocks,
@@ -319,8 +352,14 @@ fn union_len(functions: &[Function]) -> u64 {
 /// tail with another that mis-read it as data), the instruction wins: something
 /// did understand that byte.
 ///
-/// Returns `(instruction bytes, data-directive bytes)`.
-fn byte_accounting(functions: &[Function]) -> (u64, u64) {
+/// Holes are the third count and they matter as much as the other two: a body
+/// that ends in an unconditional jump leaves the rest of its declared range
+/// with nothing in it, and those bytes belong to no unit at all. Only bytes
+/// inside a function range can be holes, so the sweep tracks body depth as a
+/// third layer.
+///
+/// Returns `(instruction bytes, data-directive bytes, hole bytes)`.
+fn byte_accounting(functions: &[Function]) -> (u64, u64, u64) {
     // (start, end, is_data)
     let mut ranges: Vec<(u64, u64, bool)> = functions
         .iter()
@@ -335,29 +374,40 @@ fn byte_accounting(functions: &[Function]) -> (u64, u64) {
         })
         .filter(|(a, b, _)| b > a)
         .collect();
-    if ranges.is_empty() {
-        return (0, 0);
+    let bodies: Vec<(u64, u64)> = functions
+        .iter()
+        .map(|f| (f.entry.0, f.entry.0 + f.size))
+        .filter(|(a, b)| b > a)
+        .collect();
+    if ranges.is_empty() && bodies.is_empty() {
+        return (0, 0, 0);
     }
     ranges.sort_unstable_by_key(|r| r.0);
 
     // Sweep the endpoints. Depths are per kind; a byte is understood when at
     // least one instruction covers it, whatever else also covers it.
-    let mut events: Vec<(u64, i32, i32)> = Vec::with_capacity(ranges.len() * 2);
+    let mut events: Vec<(u64, i32, i32, i32)> = Vec::with_capacity(ranges.len() * 2 + bodies.len() * 2);
     for (a, b, is_data) in ranges {
         if is_data {
-            events.push((a, 1, 0));
-            events.push((b, -1, 0));
+            events.push((a, 1, 0, 0));
+            events.push((b, -1, 0, 0));
         } else {
-            events.push((a, 0, 1));
-            events.push((b, 0, -1));
+            events.push((a, 0, 1, 0));
+            events.push((b, 0, -1, 0));
         }
+    }
+    for (a, b) in bodies {
+        events.push((a, 0, 0, 1));
+        events.push((b, 0, 0, -1));
     }
     events.sort_unstable_by_key(|e| e.0);
 
     let mut insn_depth = 0i64;
     let mut data_depth = 0i64;
+    let mut body_depth = 0i64;
     let mut understood = 0u64;
     let mut unparsed = 0u64;
+    let mut holes = 0u64;
     let mut prev = events[0].0;
     let mut i = 0;
     while i < events.len() {
@@ -368,16 +418,19 @@ fn byte_accounting(functions: &[Function]) -> (u64, u64) {
                 understood += len;
             } else if data_depth > 0 {
                 unparsed += len;
+            } else if body_depth > 0 {
+                holes += len;
             }
         }
         while i < events.len() && events[i].0 == at {
             data_depth += i64::from(events[i].1);
             insn_depth += i64::from(events[i].2);
+            body_depth += i64::from(events[i].3);
             i += 1;
         }
         prev = at;
     }
-    (understood, unparsed)
+    (understood, unparsed, holes)
 }
 
 fn span_union(ranges: Vec<(u64, u64)>) -> u64 {
@@ -403,6 +456,7 @@ fn span_union(ranges: Vec<(u64, u64)>) -> u64 {
 mod tests {
     use super::*;
     use crate::testutil::image_with_code;
+    use occ_core::{FlowKind, Instruction, MAX_INSN_LEN};
 
     #[test]
     fn builds_an_empty_analysis_for_a_non_code_image() {
@@ -412,5 +466,98 @@ mod tests {
         let a = Analysis::build(&v, &AnalysisOptions::default());
         assert_eq!(a.coverage.functions, 0);
         assert!(a.functions.is_empty());
+    }
+
+    fn unit(addr: u64, len: u32, mnemonic: &str) -> Instruction {
+        Instruction {
+            addr: Addr(addr),
+            len,
+            bytes: [0; MAX_INSN_LEN],
+            text: mnemonic.to_string(),
+            mnemonic: mnemonic.into(),
+            flow: FlowKind::Next,
+            target: None,
+            mem_reads: Vec::new(),
+            mem_writes: Vec::new(),
+        }
+    }
+
+    fn body(entry: u64, size: u64, insns: Vec<Instruction>) -> Function {
+        let mut f = Function::new(Addr(entry));
+        f.size = size;
+        f.insns = insns;
+        f
+    }
+
+    #[test]
+    fn a_body_that_stops_early_reports_the_gap_as_a_hole() {
+        // Four bytes read out of a sixteen-byte body: the remaining twelve are
+        // not decoded, not unparsed, and not visible in any other count.
+        let f = body(0x1000, 0x10, vec![unit(0x1000, 4, "mov")]);
+        let (insn, unparsed, holes) = byte_accounting(&[f]);
+        assert_eq!((insn, unparsed, holes), (4, 0, 12));
+    }
+
+    #[test]
+    fn a_data_directive_is_accounted_for_not_a_hole() {
+        // The decoder stopped understanding at 0x1004 and emitted twelve bytes
+        // as `.byte`: read, aligned, but not understood.
+        let f = body(
+            0x1000,
+            0x10,
+            vec![unit(0x1000, 4, "mov"), unit(0x1004, 12, ".byte")],
+        );
+        let (insn, unparsed, holes) = byte_accounting(&[f]);
+        assert_eq!((insn, unparsed, holes), (4, 12, 0));
+    }
+
+    #[test]
+    fn a_shared_range_is_counted_once() {
+        // Two bodies overlap on 0x1008..0x1010. The union is 0x18 bytes, four
+        // of them understood, so the hole is 0x14 — not the 0x1c a sum of the
+        // two per-function gaps would give.
+        let a = body(0x1000, 0x10, vec![unit(0x1000, 4, "mov")]);
+        let b = body(0x1008, 0x10, Vec::new());
+        let (insn, unparsed, holes) = byte_accounting(&[a, b]);
+        assert_eq!((insn, unparsed, holes), (4, 0, 0x14));
+        assert_eq!(union_len(&[body(0x1000, 0x10, Vec::new()), body(0x1008, 0x10, Vec::new())]), 0x18);
+    }
+
+    #[test]
+    fn body_fraction_measures_the_code_that_was_found() {
+        let coverage = Coverage {
+            code_bytes: 0x1000,
+            insn_bytes: 0x100,
+            unparsed_bytes: 0x20,
+            decoded_bytes: 0x120,
+            covered_bytes: 0x200,
+            hole_bytes: 0x100,
+            functions: 1,
+            insns: 64,
+            blocks: 8,
+        };
+        // A tenth of the file's executable bytes, but half of the code that was
+        // identified: two honest numbers that answer different questions.
+        assert!((coverage.fraction() - 0.0625).abs() < 1e-6);
+        assert!((coverage.body_fraction() - 0.5).abs() < 1e-6);
+        assert!((coverage.accounted_fraction() - 0.070_312_5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_empty_body_does_not_divide_by_zero() {
+        let coverage = Coverage {
+            code_bytes: 0,
+            insn_bytes: 0,
+            unparsed_bytes: 0,
+            decoded_bytes: 0,
+            covered_bytes: 0,
+            hole_bytes: 0,
+            functions: 0,
+            insns: 0,
+            blocks: 0,
+        };
+        assert_eq!(coverage.fraction(), 0.0);
+        assert_eq!(coverage.body_fraction(), 0.0);
+        assert_eq!(coverage.accounted_fraction(), 0.0);
     }
 }

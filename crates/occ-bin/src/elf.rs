@@ -1297,6 +1297,77 @@ mod tests {
         d
     }
 
+    /// Build a minimal 32-bit little-endian RISC-V ELF.
+    ///
+    /// Same machine number as RV64 — 243 — so the ELF class is the only thing
+    /// that says which width this is.
+    fn minimal_elf32_riscv() -> Vec<u8> {
+        let mut d = vec![0u8; 0x400];
+        d[0..4].copy_from_slice(b"\x7fELF");
+        d[4] = 1; // ELFCLASS32
+        d[5] = 1; // little endian
+        d[6] = 1; // version
+        d[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
+        d[18..20].copy_from_slice(&243u16.to_le_bytes()); // EM_RISCV
+        d[0x18..0x1c].copy_from_slice(&0x10000u32.to_le_bytes()); // e_entry
+        d[0x1c..0x20].copy_from_slice(&0u32.to_le_bytes()); // e_phoff
+        d[0x20..0x24].copy_from_slice(&0x200u32.to_le_bytes()); // e_shoff
+        d[0x28..0x2a].copy_from_slice(&52u16.to_le_bytes()); // e_ehsize
+        d[0x2e..0x30].copy_from_slice(&40u16.to_le_bytes()); // e_shentsize
+        d[0x30..0x32].copy_from_slice(&3u16.to_le_bytes()); // e_shnum
+        d[0x32..0x34].copy_from_slice(&2u16.to_le_bytes()); // e_shstrndx
+
+        // Section 1: .text, 8 bytes at file 0x100 mapped to 0x10000.
+        let s1 = 0x200 + 40;
+        d[s1..s1 + 4].copy_from_slice(&1u32.to_le_bytes()); // sh_name
+        d[s1 + 4..s1 + 8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
+        d[s1 + 8..s1 + 12]
+            .copy_from_slice(&((SHF_ALLOC | SHF_EXECINSTR) as u32).to_le_bytes());
+        d[s1 + 12..s1 + 16].copy_from_slice(&0x10000u32.to_le_bytes()); // sh_addr
+        d[s1 + 16..s1 + 20].copy_from_slice(&0x100u32.to_le_bytes()); // sh_offset
+        d[s1 + 20..s1 + 24].copy_from_slice(&8u32.to_le_bytes()); // sh_size
+        d[s1 + 32..s1 + 36].copy_from_slice(&2u32.to_le_bytes()); // sh_addralign
+
+        // Section 2: .shstrtab at file 0x180.
+        let s2 = 0x200 + 80;
+        d[s2..s2 + 4].copy_from_slice(&7u32.to_le_bytes());
+        d[s2 + 4..s2 + 8].copy_from_slice(&SHT_STRTAB.to_le_bytes());
+        d[s2 + 16..s2 + 20].copy_from_slice(&0x180u32.to_le_bytes());
+        d[s2 + 20..s2 + 24].copy_from_slice(&14u32.to_le_bytes());
+
+        d[0x180..0x180 + 16].copy_from_slice(b"\0.text\0.shstrtab");
+
+        // li a0, 1 ; ret
+        d[0x100..0x104].copy_from_slice(&0x0010_0513u32.to_le_bytes());
+        d[0x104..0x108].copy_from_slice(&0x0000_8067u32.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn riscv_width_follows_the_elf_class() {
+        let img = parse(&minimal_elf32_riscv(), "rv32", ImageId(0)).expect("parse");
+        assert_eq!(img.format, Format::Elf);
+        assert_eq!(img.bits, 32);
+        assert_eq!(img.arch, Arch::RiscV32);
+        assert_eq!(img.arch.label(), "riscv32");
+        // Compressed instructions make 2 the only safe alignment, at both
+        // widths: a 4-byte rule would reject valid branch targets.
+        assert_eq!(img.arch.insn_align(), 2);
+        assert_eq!(img.entry, Addr(0x10000));
+        assert_eq!(img.sections[1].name, ".text");
+        assert_eq!(img.sections[1].kind, SectionKind::Code);
+    }
+
+    #[test]
+    fn the_same_machine_number_is_two_architectures() {
+        // EM_RISCV carries no width, so this mapping cannot be a plain match
+        // on the machine number. Reporting an RV32 object as `riscv64` with
+        // `bits = 32` next to it is the failure this asserts against.
+        assert_eq!(map_machine(243, 32), Arch::RiscV32);
+        assert_eq!(map_machine(243, 64), Arch::RiscV64);
+        assert_ne!(map_machine(243, 32), map_machine(243, 64));
+    }
+
     #[test]
     fn parses_a_minimal_elf() {
         let data = minimal_elf64();

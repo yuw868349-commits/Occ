@@ -28,7 +28,9 @@ pub enum FlowKind {
     IndirectCall,
     /// Function return.
     Return,
-    /// Software interrupt (`int3`, `syscall`, `int 0x80`).
+    /// Software interrupt or syscall (`int3`, `syscall`, `int 0x80`, `svc`).
+    ///
+    /// These return to the following instruction, so they do not end a block.
     Interrupt,
     /// Traps, `ud2`, and other faulting instructions.
     Exception,
@@ -36,6 +38,13 @@ pub enum FlowKind {
 
 impl FlowKind {
     /// True when execution does not continue at the following address.
+    ///
+    /// Interrupts are deliberately absent. `syscall`, `svc` and `ecall` return
+    /// to the next instruction — that is the whole shape of a syscall wrapper,
+    /// and calling them terminal cut every glibc wrapper in half: the recovery
+    /// ended the body at the trap and left everything after it unreached.
+    /// Instructions that truly do not return (`ud2`, `hlt`) decode as
+    /// [`FlowKind::Exception`].
     pub const fn terminates_block(self) -> bool {
         matches!(
             self,
@@ -43,7 +52,6 @@ impl FlowKind {
                 | FlowKind::ConditionalBranch
                 | FlowKind::Return
                 | FlowKind::IndirectBranch
-                | FlowKind::Interrupt
                 | FlowKind::Exception
         )
     }
@@ -405,6 +413,17 @@ mod tests {
             mem_reads: Vec::new(),
             mem_writes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_syscall_continues_and_a_trap_does_not() {
+        // `syscall`/`svc`/`ecall` return to the next instruction; treating
+        // them as terminal cut every syscall wrapper in half. `ud2` and `hlt`
+        // do not return and are decoded as `Exception`.
+        assert!(!FlowKind::Interrupt.terminates_block());
+        assert!(FlowKind::Exception.terminates_block());
+        assert!(FlowKind::Return.terminates_block());
+        assert!(!FlowKind::Call.terminates_block());
     }
 
     fn two_block_function() -> Function {

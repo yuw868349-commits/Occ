@@ -597,7 +597,10 @@ fn decode_function(
                     }
                     break;
                 }
-                FlowKind::Return | FlowKind::Interrupt | FlowKind::Exception => break,
+                // A syscall returns to the next instruction; only a trap that
+                // never comes back ends the walk.
+                FlowKind::Interrupt => {}
+                FlowKind::Return | FlowKind::Exception => break,
             }
         }
     }

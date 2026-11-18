@@ -277,7 +277,7 @@ fn a_parameter_reaching_a_call_is_reported_with_its_argument_index() {
         },
         &[Source::Name("rdi".into())],
         &cfg,
-        &[func.clone()],
+        std::slice::from_ref(&func),
     );
     let call = report
         .flows
@@ -305,7 +305,7 @@ fn a_tainted_branch_is_a_flow_of_its_own() {
         &|a| format!("sub_{:x}", a.get()),
         &[Source::Name("rdi".into())],
         &TaintConfig::default(),
-        &[func.clone()],
+        std::slice::from_ref(&func),
     );
     let branch = report
         .flows
@@ -328,7 +328,7 @@ fn nothing_is_tainted_when_nothing_is_a_source() {
         &|a| format!("sub_{:x}", a.get()),
         &[],
         &TaintConfig::default(),
-        &[func.clone()],
+        std::slice::from_ref(&func),
     );
     assert!(report.flows.is_empty());
     assert!(!report.notes.is_empty(), "an empty result is explained");
@@ -407,7 +407,7 @@ fn a_recursive_call_is_not_interpreted() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
-        &[func.clone()],
+        std::slice::from_ref(&func),
         &ExecConfig::default(),
     );
     assert!(

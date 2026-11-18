@@ -123,7 +123,9 @@ fn branch_target(insn: &Instruction) -> Option<Addr> {
 fn edges_of(last: &Instruction, fallthrough: Addr, cases: Option<&Vec<Addr>>) -> Vec<Edge> {
     let mut edges = Vec::with_capacity(2);
     match last.flow {
-        FlowKind::Next | FlowKind::Call | FlowKind::IndirectCall => {
+        // A trap returns, so what follows is reachable. Leaving it
+        // unconnected stranded every instruction after a syscall.
+        FlowKind::Next | FlowKind::Call | FlowKind::IndirectCall | FlowKind::Interrupt => {
             edges.push(Edge {
                 to: fallthrough,
                 kind: EdgeKind::FallThrough,
@@ -170,7 +172,7 @@ fn edges_of(last: &Instruction, fallthrough: Addr, cases: Option<&Vec<Addr>>) ->
                 kind: EdgeKind::Indirect,
             }),
         },
-        FlowKind::Return | FlowKind::Interrupt | FlowKind::Exception => {}
+        FlowKind::Return | FlowKind::Exception => {}
     }
     edges
 }

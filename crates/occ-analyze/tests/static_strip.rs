@@ -177,7 +177,7 @@ fn stripping_does_not_halve_the_function_count() {
     );
     assert!(
         stripped_analysis.coverage.fraction() > 0.75,
-        "only {:.1}% of code decoded after stripping",
+        "only {:.1}% of executable bytes decoded as instructions after stripping",
         stripped_analysis.coverage.fraction() * 100.0
     );
 }
@@ -221,4 +221,19 @@ fn recovered_functions_never_overlap_and_sizes_are_accounted_for() {
             pair[1].entry.0
         );
     }
+
+    // Bodies do not escape their own range, so every byte count has to add up:
+    // what was understood, what was emitted as a directive, and what nothing
+    // covers at all is exactly the union of the ranges.
+    let c = &analysis.coverage;
+    assert_eq!(
+        c.insn_bytes + c.unparsed_bytes + c.hole_bytes,
+        c.covered_bytes,
+        "coverage does not account for every byte in the recovered bodies"
+    );
+    assert!(
+        c.body_fraction() > 0.9,
+        "only {:.1}% of the recovered bodies was read",
+        c.body_fraction() * 100.0
+    );
 }

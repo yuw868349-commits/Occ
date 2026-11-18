@@ -66,7 +66,7 @@ Trimmed output from a real session against `/bin/ls`.
 {
   "ok": true,
   "handle": "img:0",
-  "summary": "elf x86_64 64-bit pie (/bin/ls) — 372 functions, 700 strings, 88.6% of code decoded",
+  "summary": "elf x86_64 64-bit pie (/bin/ls) — 405 functions, 700 strings, 89.3% of executable bytes decoded as instructions",
   "data": {
     "identity": { "format": "elf", "arch": "x86_64", "bits": 64, "entry": "0x6d30",
                   "image_base": "0x0", "linkage": "pie", "imports": 120,
@@ -74,7 +74,11 @@ Trimmed output from a real session against `/bin/ls`.
                   "sha256": "0148f5ab3062a905281d8deb9645363da5131011c9e7b6dcaa38b504e41b68ea" },
     "fingerprint": { "compiler": "unknown", "language": "c", "linkage": "pie",
                      "runtime": "glibc", "stripped": false, "has_dwarf": false },
-    "coverage": { "code_bytes": 85818, "decoded_bytes": 76017, "covered_bytes": 82620, "fraction": 0.8858 }
+    "coverage": { "code_bytes": 85818, "insn_bytes": 76659, "unparsed_bytes": 0,
+                  "decoded_bytes": 76659, "covered_bytes": 83188, "hole_bytes": 6529,
+                  "functions": 405, "insns": 18947, "blocks": 4121,
+                  "fraction": 0.8933, "accounted_fraction": 0.8933,
+                  "body_fraction": 0.9215 }
   },
   "next": ["code.functions with image=0, sort=insns, limit=20", "binary.strings ..."]
 }
@@ -536,7 +540,13 @@ What a dependency would have been, and what replaced it:
 
 The trade is deliberate and has a cost: the decoders cover what this tool needs
 to answer questions about real binaries, not every encoding in the vendor manual.
-Where coverage stops, the answer says so rather than guessing.
+Where coverage stops, the answer says so rather than guessing — and the counts
+say which kind of stop it was. `insn_bytes` is what the decoder understood.
+`unparsed_bytes` is what it had to emit as `.word`: read, aligned, not
+understood. `hole_bytes` is inside a recovered body with no unit covering it at
+all — the gap a body jumps over. `fraction` is the first over `code_bytes`;
+`body_fraction` asks the narrower question, how much of the code that was found
+was actually read.
 
 ## Install
 

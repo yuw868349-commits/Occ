@@ -1340,7 +1340,8 @@ impl Decoder {
                     vec![Operand::Rel(v)],
                 ))
             }
-            0xf4 => Some(("hlt", FlowKind::Interrupt, None, vec![])),
+            // `hlt` does not come back; `syscall` does.
+            0xf4 => Some(("hlt", FlowKind::Exception, None, vec![])),
             0xf6 | 0xf7 => {
                 let size = if op == 0xf6 { Size::B } else { os };
                 let m = self.modrm(p, size, asz, b, i)?;

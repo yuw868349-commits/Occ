@@ -387,7 +387,7 @@ pub unsafe extern "C" fn occ_info(
             .map(|e| Value::from(e.name.as_str()))
             .collect();
         let env = Envelope::ok(format!(
-            "{} {:?} {:?} entry {} · {} functions · {:.1}% of code recovered",
+            "{} {:?} {:?} entry {} · {} functions · {:.1}% of executable bytes decoded as instructions",
             img.path,
             img.format,
             img.arch,
@@ -418,12 +418,21 @@ pub unsafe extern "C" fn occ_info(
             "coverage",
             object(vec![
                 ("code_bytes", Value::from(a.coverage.code_bytes)),
+                // The three byte counts travel together. `fraction` is
+                // `insn_bytes / code_bytes`, so a reply that carried only
+                // `decoded_bytes` left callers unable to check the percentage
+                // against the numbers next to it.
+                ("insn_bytes", Value::from(a.coverage.insn_bytes)),
+                ("unparsed_bytes", Value::from(a.coverage.unparsed_bytes)),
                 ("decoded_bytes", Value::from(a.coverage.decoded_bytes)),
                 ("covered_bytes", Value::from(a.coverage.covered_bytes)),
+                ("hole_bytes", Value::from(a.coverage.hole_bytes)),
                 ("functions", Value::from(a.coverage.functions as u64)),
                 ("instructions", Value::from(a.coverage.insns as u64)),
                 ("blocks", Value::from(a.coverage.blocks as u64)),
                 ("fraction", Value::from(a.coverage.fraction() as f64)),
+                ("accounted_fraction", Value::from(a.coverage.accounted_fraction() as f64)),
+                ("body_fraction", Value::from(a.coverage.body_fraction() as f64)),
             ]),
         )
         .field("sections", Value::Array(sections))

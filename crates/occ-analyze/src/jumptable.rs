@@ -287,60 +287,78 @@ fn shape(
     jmp: &Instruction,
 ) -> Option<(Addr, u8, bool, Option<String>)> {
     let operand = jmp.text.strip_prefix("jmp ")?;
+    let before = &window[..window.len().saturating_sub(1)];
 
     // `jmp qword ptr [0x4020 + rax*8]`: the table address is in the operand.
     if operand.contains('[') {
         let mem = Mem::parse(operand)?;
-        let base = mem.disp?;
         let width = match mem.scale {
             4 => 4,
             8 => 8,
             _ => return None,
         };
-        return Some((Addr(base as u64), width, false, mem.index));
+        // The address is usually a displacement, but position-independent code
+        // loads it into a register first:
+        //
+        //     lea     rax, [rip + 0x85741]   # 0x4a61a0
+        //     jmp     qword ptr [rax + rdx*8]
+        //
+        // Following the `lea` is the only way to reach that table, and a
+        // switch whose table is never found leaves every case body unvisited.
+        let base = match mem.disp {
+            Some(disp) => Addr(disp as u64),
+            None => lea_into(before, mem.base.as_deref()?)?,
+        };
+        return Some((base, width, false, mem.index));
     }
 
-    // `jmp rax`: walk back for the three instructions that built the target.
+    // `jmp rax`, with the target computed or loaded into the register first.
     let reg = operand.trim();
     if reg.is_empty() || !reg.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
     let start = window.len().saturating_sub(MAX_LOOKBACK);
-    let slice = &window[start..window.len().saturating_sub(1)];
+    let slice = &window[start..before.len()];
 
-    let mut base_reg: Option<&str> = None;
-    for insn in slice.iter().rev() {
-        if let Some((dst, src)) = add_pair(&insn.text)
-            && dst == reg
-        {
-            base_reg = Some(src);
-            break;
-        }
+    // Computed comes first and must win: a relative table is also loaded into
+    // the register before the `add` that rebases it, so the load shape alone
+    // cannot tell the two apart. Reading a relative table as absolute yields
+    // no targets at all, which used to cost the whole switch body.
+    if let Some(found) = computed_target(slice, reg) {
+        return Some(found);
     }
-    let base_reg = base_reg?;
+    loaded_target(slice, reg)
+}
 
-    let mut base = None;
-    for insn in slice.iter().rev() {
-        if let Some((dst, addr)) = lea_target(&insn.text)
-            && dst == base_reg
-        {
-            base = Some(addr);
-            break;
-        }
-    }
-    let base = base?;
+/// `movsxd rcx, dword ptr [r10 + rax*4]` then `add rcx, r10` then `jmp rcx`:
+/// the entries are 32-bit offsets from the table base, so `relative` is true.
+///
+/// The rebase has two spellings and both occur in glibc's string routines:
+///
+/// ```text
+/// add  rcx, r10          ; table entry in rcx
+/// lea  r10, [r10 + r9]   ; entry in r9, rebased in place
+/// ```
+///
+/// The `lea` form is an `add` that writes the base register, and a table behind
+/// it is just as real; missing it left `__strcasecmp_l_sse2` with a 7 KiB hole
+/// in a 7.6 KiB body.
+fn computed_target(slice: &[&Instruction], reg: &str) -> Option<(Addr, u8, bool, Option<String>)> {
+    let (base_reg, entry_reg, at) = rebase(slice, reg)?;
+
+    let base = lea_into(&slice[..at], base_reg)?;
 
     // Confirm the entry width rather than assuming it: a scaled load into the
-    // jumped register with scale 4 means 32-bit relative offsets.
+    // entry register means 32-bit relative offsets when the scale is 4.
     let mut entry = None;
-    for (at, insn) in slice.iter().enumerate().rev() {
+    for (at, insn) in slice[..at].iter().enumerate().rev() {
         if let Some((dst, mem)) = load_pair(&insn.text)
-            && dst == reg
+            && dst == entry_reg
             && mem.base.as_deref() == Some(base_reg)
             && matches!(mem.scale, 4 | 8)
         {
-            // The load itself overwrites the index register with the entry, so
-            // the value the cases count is whatever it held before this
+            // The load overwrites the index register with the entry, so the
+            // value the cases count is whatever it held before this
             // instruction — trace it through the copies before the load, not
             // through the load.
             let index = mem.index.map(|r| traced_index(&slice[..at], &r));
@@ -350,6 +368,90 @@ fn shape(
     }
     let (entry_bytes, index) = entry?;
     Some((base, entry_bytes, true, index))
+}
+
+/// How the table entry reached the jumped register.
+///
+/// Returns the register holding the table base, the register the entry was
+/// loaded into, and the index of the rebasing instruction so the search for the
+/// base stops before it.
+fn rebase<'a>(slice: &[&'a Instruction], reg: &'a str) -> Option<(&'a str, &'a str, usize)> {
+    for (at, insn) in slice.iter().enumerate().rev() {
+        if let Some((dst, src)) = add_pair(&insn.text)
+            && dst == reg
+        {
+            // `add rcx, r10`: the entry is in rcx, the base in r10.
+            return Some((src, reg, at));
+        }
+        if let Some((base, index)) = rebase_lea(&insn.text, reg) {
+            return Some((base, index, at));
+        }
+        if writes_register(&insn.text, reg) {
+            return None;
+        }
+    }
+    None
+}
+
+/// `lea r10, [r10 + r9]` → ("r10", "r9"): the base register and the entry
+/// register, when the destination is the jumped register and one of the two
+/// operands is that same register.
+fn rebase_lea<'a>(text: &'a str, reg: &str) -> Option<(&'a str, &'a str)> {
+    let rest = text.strip_prefix("lea ")?;
+    let (dst, src) = rest.split_once(", ")?;
+    if dst.trim() != reg {
+        return None;
+    }
+    let open = src.find('[')?;
+    let close = src[open..].find(']')? + open;
+    let mut regs: Vec<&str> = Vec::new();
+    for term in src[open + 1..close].split(['+', '-']) {
+        let term = term.trim();
+        if term.is_empty() || term == "rip" || term.contains('*') {
+            continue;
+        }
+        if term.starts_with(|c: char| c.is_ascii_digit()) || term.starts_with("0x") {
+            continue;
+        }
+        regs.push(term);
+    }
+    if regs.len() != 2 {
+        return None;
+    }
+    if regs[0] == reg {
+        Some((regs[0], regs[1]))
+    } else if regs[1] == reg {
+        Some((regs[1], regs[0]))
+    } else {
+        None
+    }
+}
+
+/// `mov rax, qword ptr [table + rdx*8]` then `jmp rax`: the entry is a pointer,
+/// so `relative` is false.
+///
+/// A function-pointer call looks similar — `mov rax, [rbp - 8]; jmp rax` — and
+/// is not a table: it has no index and no scale, which is what the checks below
+/// reject.
+fn loaded_target(slice: &[&Instruction], reg: &str) -> Option<(Addr, u8, bool, Option<String>)> {
+    for (at, insn) in slice.iter().enumerate().rev() {
+        let Some((dst, mem)) = load_pair(&insn.text) else {
+            continue;
+        };
+        if dst != reg {
+            continue;
+        }
+        if !matches!(mem.scale, 4 | 8) || mem.index.is_none() {
+            continue;
+        }
+        let base = match mem.disp {
+            Some(disp) => Addr(disp as u64),
+            None => lea_into(&slice[..at], mem.base.as_deref()?)?,
+        };
+        let index = mem.index.map(|r| traced_index(&slice[..at], &r));
+        return Some((base, mem.scale as u8, false, index));
+    }
+    None
 }
 
 fn read_targets(
@@ -472,6 +574,51 @@ fn lea_target(text: &str) -> Option<(&str, Addr)> {
     Some((dst.trim(), Addr(value)))
 }
 
+/// Address the nearest preceding `lea` loaded into `reg`.
+///
+/// The walk stops at the first instruction that overwrites the register
+/// without being a `lea`. An intervening `add rax, rdx` means the register
+/// holds something else by the time the table is indexed, and naming the
+/// older address would read the wrong table — or a table that is not there.
+fn lea_into(before: &[&Instruction], reg: &str) -> Option<Addr> {
+    for insn in before.iter().rev() {
+        if let Some((dst, addr)) = lea_target(&insn.text) {
+            if family(dst) == family(reg) {
+                return Some(addr);
+            }
+            continue;
+        }
+        if writes_register(&insn.text, reg) {
+            return None;
+        }
+    }
+    None
+}
+
+/// True when the instruction's first operand is `reg`, i.e. it writes it.
+///
+/// Text-level and deliberately conservative: comparisons, tests, pushes and
+/// branches do not write their first operand, and a memory destination is not
+/// a register. The one case that matters here is distinguishing `mov rax, ...`
+/// from `cmp rax, ...` while walking back to a `lea`.
+fn writes_register(text: &str, reg: &str) -> bool {
+    let Some((op, rest)) = text.split_once(' ') else {
+        return false;
+    };
+    if matches!(
+        op,
+        "cmp" | "test" | "push" | "pop" | "call" | "jmp" | "nop" | "ret" | "leave"
+    ) || op.starts_with('j')
+    {
+        return false;
+    }
+    let dst = rest.split(',').next().unwrap_or("").trim();
+    if dst.is_empty() || !dst.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    family(dst) == family(reg)
+}
+
 /// `movsxd rax, dword ptr [rdx + rdi*4]` → ("rax", mem).
 fn load_pair(text: &str) -> Option<(&str, Mem)> {
     let (_, rest) = text.split_once(' ')?;
@@ -495,6 +642,58 @@ mod tests {
         assert_eq!(m.disp, None);
         let m = Mem::parse("qword ptr [rip+0xea4]").unwrap();
         assert_eq!(m.disp, Some(0xea4));
+    }
+
+    #[test]
+    fn a_table_loaded_into_a_register_is_found_through_its_lea() {
+        // Position-independent code loads the address first, so the jump
+        // operand has no displacement of its own:
+        //     lea rax, [rip + 0x85741]   # 0x4a61a0
+        //     jmp qword ptr [rax + rdx*8]
+        let owned = [
+            insn("movzx edx, byte ptr [rsi + rax]"),
+            insn("lea rax, qword ptr [rip+0x85741]  # 0x4a61a0"),
+            insn("jmp qword ptr [rax + rdx*8]"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(
+            shape(&window, window.last().unwrap()),
+            Some((Addr(0x4a61a0), 8, false, Some("rdx".to_string())))
+        );
+    }
+
+    #[test]
+    fn a_lea_rebase_keeps_the_table_relative() {
+        // glibc's string routines rebase with `lea` instead of `add`:
+        //     lea    r10, [rip + 0x277ff]   # 0x488500
+        //     movslq r9, [r10 + r9*4]
+        //     lea    r10, [r10 + r9]
+        //     jmp    r10
+        // The entries are 32-bit offsets from the table base, so reading them
+        // as absolute addresses yields no targets at all.
+        let owned = [
+            insn("lea r10, qword ptr [rip+0x277ff]  # 0x488500"),
+            insn("movslq r9, dword ptr [r10 + r9*4]"),
+            insn("lea r10, qword ptr [r10 + r9]"),
+            insn("jmp r10"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(
+            shape(&window, window.last().unwrap()),
+            Some((Addr(0x488500), 4, true, Some("r9".to_string())))
+        );
+    }
+
+    #[test]
+    fn a_function_pointer_load_is_not_a_table() {
+        // `mov rax, [rbp - 8]; jmp rax` is a call through a local, not a
+        // switch: no index and no scale.
+        let owned = [
+            insn("mov rax, qword ptr [rbp - 0x8]"),
+            insn("jmp rax"),
+        ];
+        let window: Vec<&Instruction> = owned.iter().collect();
+        assert_eq!(shape(&window, window.last().unwrap()), None);
     }
 
     #[test]
