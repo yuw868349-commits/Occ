@@ -74,6 +74,22 @@ fn xreg(n: u32) -> String {
     }
 }
 
+/// `X<x>`/`XZR` for the operands that read the general register as the
+/// zero register in its thirty-first encoding.
+fn zreg(n: u32, wide: bool) -> String {
+    if wide {
+        if n & 31 == 31 {
+            "xzr".to_string()
+        } else {
+            format!("x{}", n & 31)
+        }
+    } else if n & 31 == 31 {
+        "wzr".to_string()
+    } else {
+        format!("w{}", n & 31)
+    }
+}
+
 /// `index`'s general-register operands: 64-bit elements use X names, the
 /// rest use W names.
 fn gpr(n: u32, wide: bool) -> String {
@@ -127,7 +143,9 @@ fn group_a(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x04 => integer_04(origin, word),
         0x24 => compare_24(origin, word),
+        0x64 => float_64_65(origin, word),
         0x84 => gather_84_85(origin, word),
+        0xA4 => cont_load_a45(origin, word),
         0xC4 => gather_c45(origin, word),
         0xE4 => store_e45(origin, word),
         _ => undefined(origin, word, "SVE (unimplemented family)"),
@@ -140,7 +158,9 @@ fn group_b(origin: Addr, word: u32) -> R {
     match bits(word, 31, 24) {
         0x05 => permute_05(origin, word),
         0x25 => integer_25(origin, word),
+        0x65 => float_64_65(origin, word),
         0x85 => gather_84_85(origin, word),
+        0xA5 => cont_load_a45(origin, word),
         0xC5 => gather_c45(origin, word),
         0xE5 => store_e45(origin, word),
         _ => undefined(origin, word, "SVE (unimplemented family)"),
@@ -555,9 +575,12 @@ fn index_vl_04(origin: Addr, word: u32, sz: usize) -> R {
             let imm = simm(bits(word, 10, 5), 6);
             let rn_txt = if rm & 31 == 31 { "sp".to_string() } else { format!("x{}", rm) };
             if one_reg {
-                R::new(mn, format!("{mn} {}, {}", scalar('x', rd), imm))
+                // `rdvl` reads a general register, which spells 31 as the
+                // zero register, where `addvl` reads a base that spells it
+                // as the stack pointer
+                R::new(mn, format!("{mn} {}, {}", zreg(rd, true), imm))
             } else {
-                R::new(mn, format!("{mn} {}, {}, {}", scalar('x', rd), rn_txt, imm))
+                R::new(mn, format!("{mn} {}, {}, {}", sp_reg(rd), rn_txt, imm))
             }
         }
     }
@@ -680,7 +703,10 @@ fn scalar_misc_04(origin: Addr, word: u32, sz: usize) -> R {
 fn pattern_text(pat: u32, mul: u32) -> Option<String> {
     Some(match pat {
         0 => "pow2".into(),
-        1..=13 => format!("vl{}", 1 << (pat - 1)),
+        // the pattern names the number of vector lengths the operation
+        // covers: the first eight count up, the rest double from 16
+        1..=8 => format!("vl{pat}"),
+        9..=13 => format!("vl{}", 1 << (pat - 5)),
         14..=28 => format!("#0x{:x}", pat),
         29 => "mul4".into(),
         30 => "mul3".into(),
@@ -808,12 +834,12 @@ fn scalar_incdec_04(origin: Addr, word: u32, sz: usize) -> R {
         _ => opc + 1,
     };
     let dest = match sel {
-        0b000 | 0b001 => format!("x{}", rd),
+        0b000 | 0b001 => zreg(rd, true),
         // sel 4-6 with opc < 16 are destructive (print X and W names); with
         // opc >= 16 they update a single X register.
-        0b100 | 0b110 if opc < 16 => format!("x{rd}, w{rd}"),
-        0b101 | 0b111 if opc < 16 => format!("w{rd}"),
-        _ => format!("x{rd}"),
+        0b100 | 0b110 if opc < 16 => format!("{}, {}", zreg(rd, true), zreg(rd, false)),
+        0b101 | 0b111 if opc < 16 => zreg(rd, false),
+        _ => zreg(rd, true),
     };
     let mut text = format!("{mn} {dest},");
     match pattern_text(bits(word, 9, 5), mul) {
@@ -1326,9 +1352,13 @@ fn pmov_05(origin: Addr, word: u32, l: u32) -> R {
     let hi = bits(word, 23, 22);
     let lo = bits(word, 18, 17);
     let to_vector = l & 1 == 1;
-    // The predicate-to-vector form reserves bit 9; the vector-to-predicate
-    // form spends it on the source register.
+    // The predicate-to-vector form reserves bit 9 and has a four-bit
+    // destination predicate; the vector-to-predicate form spends bit 9 on
+    // the source register and has a five-bit vector destination.
     if to_vector && bits(word, 9, 9) != 0 {
+        return undefined(origin, word, "SVE PMOV (unallocated)");
+    }
+    if !to_vector && bits(word, 4, 4) != 0 {
         return undefined(origin, word, "SVE PMOV (unallocated)");
     }
     match hi {
@@ -1631,6 +1661,11 @@ fn integer_25(origin: Addr, word: u32) -> R {
         return while_rr2_25(word, t);
     }
     if bits(word, 15, 14) == 0b01 {
+        // the counter forms of this row carry bit 4, and the initial
+        // counter sits in the mnemonic slot PSEL leaves at zero
+        if bits(word, 4, 4) == 1 {
+            return while_pn_25(origin, word);
+        }
         return psel_25(origin, word);
     }
     match byte & 0x38 {
@@ -1737,7 +1772,7 @@ fn pred_log_25(origin: Addr, word: u32) -> R {
     let (out, text) = match opc {
         // `SEL` carries no predication qualifier, and a self-move prints as
         // the merging form of `MOV`.
-        0b0011 if pg == pn && pn == pm && pg == pd => {
+        0b0011 if pm == pd => {
             ("mov", format!("mov\tp{pd}.b, p{pg}/m, p{pn}.b"))
         }
         0b0011 => ("sel", format!("sel\tp{pd}.b, p{pg}, p{pn}.b, p{pm}.b")),
@@ -1791,30 +1826,27 @@ fn break_25(origin: Addr, word: u32, byte: u32) -> R {
     if bits(word, 9, 9) != 0 {
         return undefined(origin, word, "SVE break (unallocated)");
     }
-    let opc = (bits(word, 23, 23) << 2) | (bits(word, 22, 22) << 1) | bits(word, 4, 4);
-    let (mn, destructive) = match opc {
-        0b000 => ("brka", false),
-        0b001 => ("brka", true),
-        0b010 => ("brkas", false),
-        0b100 => ("brkb", false),
-        0b101 => ("brkb", true),
-        0b110 => ("brkbs", false),
+    let (mn, sett) = match (bits(word, 23, 23), bits(word, 22, 22)) {
+        (0, 0) => ("brka", false),
+        (0, 1) => ("brkas", true),
+        (1, 0) => ("brkb", false),
+        (1, 1) => ("brkbs", true),
         _ => return undefined(origin, word, "SVE break (unallocated)"),
     };
+    // The sett forms only have the zeroing qualifier.
+    if sett && bits(word, 4, 4) == 1 {
+        return undefined(origin, word, "SVE break (unallocated)");
+    }
+    let qual = if bits(word, 4, 4) == 1 { 'm' } else { 'z' };
     let pd = bits(word, 3, 0);
     let pg = bits(word, 13, 10);
     let pn = bits(word, 8, 5) & 0xF;
-    let text = if destructive {
-        format!("{mn}\tp{pd}.b, p{pg}/m, p{pn}.b, p{pd}.b")
-    } else {
-        format!("{mn}\tp{pd}.b, p{pg}/z, p{pn}.b")
-    };
-    R::new(mn, text)
+    R::new(mn, format!("{mn}\tp{pd}.b, p{pg}/{qual}, p{pn}.b"))
 }
 
 /// `BRKN` and `BRKNS`.
 fn brkn_25(origin: Addr, word: u32, byte: u32) -> R {
-    if byte & 0x3F != 0x18 || bits(word, 23, 23) != 0 {
+    if byte & 0x3F != 0x18 || bits(word, 23, 23) != 0 || bits(word, 4, 4) != 0 {
         return undefined(origin, word, "SVE break negate (unallocated)");
     }
     // The architecture reserves bit 9.
@@ -1851,8 +1883,9 @@ fn ptrue_25(origin: Addr, word: u32, sz: usize, t: char, byte: u32, mid: u32) ->
                 if sz != 1 {
                     return undefined(origin, word, "SVE PFIRST (unallocated)");
                 }
-                // The architecture reserves bit 9.
-                if bits(word, 9, 9) != 0 {
+                // The architecture reserves bit 9; the pattern field stops
+                // at bit 5, so bit 4 is reserved as well.
+                if bits(word, 9, 9) != 0 || bits(word, 4, 4) != 0 {
                     return undefined(origin, word, "SVE PFIRST (unallocated)");
                 }
                 return R::new(
@@ -1861,8 +1894,9 @@ fn ptrue_25(origin: Addr, word: u32, sz: usize, t: char, byte: u32, mid: u32) ->
                 );
             }
             if mid == 0x3C && bits(word, 23, 23) == 0 {
-                // The architecture reserves bit 9.
-                if bits(word, 9, 9) != 0 {
+                // The architecture reserves bit 9, and bit 4 below the
+                // pattern field.
+                if bits(word, 9, 9) != 0 || bits(word, 4, 4) != 0 {
                     return undefined(origin, word, "SVE RDFFR (unallocated)");
                 }
                 let mn = if bits(word, 22, 22) == 1 {
@@ -1895,6 +1929,7 @@ fn ptrue_25(origin: Addr, word: u32, sz: usize, t: char, byte: u32, mid: u32) ->
                 // field that would name one is fixed at zero, and only the
                 // non-setting variant has one.
                 if bits(word, 8, 5) != 0
+                    || bits(word, 4, 4) != 0
                     || bits(word, 22, 22) != 0
                     || bits(word, 23, 23) != 0
                 {
@@ -1903,8 +1938,9 @@ fn ptrue_25(origin: Addr, word: u32, sz: usize, t: char, byte: u32, mid: u32) ->
                 return R::new("rdffr", format!("rdffr\tp{pd}.b"));
             }
             if mid == 0x31 {
-                // The architecture reserves bit 9.
-                if bits(word, 9, 9) != 0 {
+                // The architecture reserves bits 9 and 4; the pattern field
+                // stops at bit 5 and the bit below it is not part of it.
+                if bits(word, 9, 9) != 0 || bits(word, 4, 4) != 0 {
                     return undefined(origin, word, "SVE PNEXT (unallocated)");
                 }
                 return R::new(
@@ -1930,6 +1966,10 @@ fn ptrue_25_named(
     pattern: u32,
     setting: bool,
 ) -> R {
+    // The pattern field ends at bit 5; the bit below it is reserved.
+    if bits(word, 4, 4) != 0 {
+        return undefined(origin, word, "SVE PTRUE (unallocated)");
+    }
     let opc = (bits(word, 18, 17) << 1) | bits(word, 16, 16);
     let name = match (opc, setting) {
         (0b000, false) => "ptrue",
@@ -2001,6 +2041,77 @@ fn while_25(word: u32, t: char) -> R {
     )
 }
 
+/// The `WHILE` names, in the order the opcode selects them: the first of
+/// each pair is the signed form and the second the one that excludes the
+/// equal case.
+const WHILE_NAMES: [&str; 8] = [
+    "whilege", "whilegt", "whilelt", "whilele", "whilehs", "whilehi", "whilelo", "whilels",
+];
+
+/// `WHILE` with a counter destination, the pair form of it, and `PEXT`.
+///
+/// The row fixes bit 4 and moves the destination into the low bits: a
+/// counter reads one of the eight predicate-as-counter registers, a pair
+/// reads two consecutive predicates, and `PEXT` extracts one lane of a
+/// counter into a predicate.
+fn while_pn_25(origin: Addr, word: u32) -> R {
+    let sz = bits(word, 23, 22) as usize;
+    let t = SIZES[sz];
+    let base = bits(word, 11, 10) as usize;
+    let rn = zreg(bits(word, 9, 5), true);
+    let rm = zreg(bits(word, 20, 16), true);
+    if bits(word, 12, 12) == 0 {
+        let mn = WHILE_NAMES[base * 2 + bits(word, 3, 3) as usize];
+        let vl = if bits(word, 13, 13) == 1 { "vlx4" } else { "vlx2" };
+        return R::new(
+            mn,
+            format!("{mn}	pn{}.{t}, {rn}, {rm}, {vl}", bits(word, 2, 0) + 8),
+        );
+    }
+    if bits(word, 13, 13) == 0 {
+        let mn = WHILE_NAMES[base * 2 + bits(word, 0, 0) as usize];
+        let lo = bits(word, 3, 1) * 2;
+        return R::new(
+            mn,
+            format!("{mn}	{{ p{lo}.{t}, p{}.{t} }}, {rn}, {rm}", lo + 1),
+        );
+    }
+    // The rest of the row is `PEXT` and the counter form of `PTRUE`.  The
+    // extraction reads a lane out of a counter into a predicate, either
+    // one predicate or two consecutive ones.
+    let pn = bits(word, 7, 5) + 8;
+    // the counter forms read their counter out of the low bits only
+    if base < 3 && bits(word, 20, 16) != 0 {
+        return undefined(origin, word, "SVE PEXT (unallocated)");
+    }
+    match base {
+        0 => R::new(
+            "pext",
+            format!("pext\tp{}.{t}, pn{pn}[{}]", bits(word, 3, 0), bits(word, 9, 8)),
+        ),
+        1 => {
+            // the pair form only names the first two lanes of a counter
+            if bits(word, 9, 8) > 1 {
+                return undefined(origin, word, "SVE PEXT (unallocated)");
+            }
+            let n = bits(word, 3, 0);
+            R::new(
+                "pext",
+                format!("pext\t{{ p{n}.{t}, p{}.{t} }}, pn{pn}[{}]",
+                        (n + 1) & 15, bits(word, 9, 8)),
+            )
+        }
+        2 => {
+            // the initial counter: every parameter of the pattern is zero
+            if bits(word, 9, 5) != 0 || bits(word, 3, 3) != 0 {
+                return undefined(origin, word, "SVE PTRUE (unallocated)");
+            }
+            R::new("ptrue", format!("ptrue\tpn{}.{t}", bits(word, 2, 0) + 8))
+        }
+        _ => undefined(origin, word, "SVE PEXT (unallocated)"),
+    }
+}
+
 /// `WHILEWR` and `WHILERW`.
 fn while_rr2_25(word: u32, t: char) -> R {
     let mn = if bits(word, 4, 4) == 0 {
@@ -2067,7 +2178,7 @@ fn pcount_25(origin: Addr, word: u32, t: char) -> R {
         let pn = bits(word, 9, 5) - 16;
         return R::new(
             "cntp",
-            format!("cntp\t{}, pn{pn}.{t}, {vl}", xreg(bits(word, 4, 0))),
+            format!("cntp\t{}, pn{pn}.{t}, {vl}", zreg(bits(word, 4, 0), true)),
         );
     }
     let mn = match bits(word, 18, 16) {
@@ -2080,7 +2191,7 @@ fn pcount_25(origin: Addr, word: u32, t: char) -> R {
         mn,
         format!(
             "{mn}\t{}, p{}, p{}.{t}",
-            xreg(bits(word, 4, 0)),
+            zreg(bits(word, 4, 0), true),
             bits(word, 13, 10),
             bits(word, 8, 5) & 0xF
         ),
@@ -2131,11 +2242,13 @@ fn count_r_25(origin: Addr, word: u32, t: char) -> R {
     let rd = bits(word, 4, 0);
     let text = if wide {
         format!(
-            "{mn}\t{reg}{rd}, p{}.{t}, w{rd}",
-            bits(word, 8, 5) & 0xF
+            "{mn}\t{}, p{}.{t}, {}",
+            zreg(rd, true),
+            bits(word, 8, 5) & 0xF,
+            zreg(rd, false)
         )
     } else {
-        format!("{mn}\t{reg}{rd}, p{}.{t}", bits(word, 8, 5) & 0xF)
+        format!("{mn}\t{}, p{}.{t}", zreg(rd, reg == 'x'), bits(word, 8, 5) & 0xF)
     };
     R::new(mn, text)
 }
@@ -3332,6 +3445,961 @@ fn lddup_opc(dtypeh: u32, dtypel: u32) -> Option<(&'static str, char, u32)> {
     })
 }
 
+// === top bytes 0xA4/0xA5: SVE contiguous loads ==============================
+//
+// Both top bytes share one encoding space, `Inst{31-25} = 0b1010010`, which
+// holds every contiguous load: the plain LD1 forms and their fault-only and
+// non-temporal relatives, the replicated loads LD1RQ and LD1RO, the 128-bit
+// contiguous loads, and the two-, three- and four-register interleaving
+// loads.  The three bits below the predicate field pick the class:
+//
+//   000  LD1RQ / LD1RO, register offset
+//   001  LD1RQ / LD1RO and the 128-bit loads, immediate
+//   010  LD1x, register offset
+//   011  LDFF1x, register offset
+//   100  the 128-bit loads and LD2Q/LD3Q/LD4Q, register offset
+//   101  LD1x / LDNF1x, immediate
+//   110  LDNT1x and LD2/LD3/LD4, register offset
+//   111  LDNT1x and LD2/LD3/LD4, immediate
+//
+// The two top bytes differ in bit 24, the top bit of the size and of the
+// dtype field: a zero there selects the byte and halfword accesses, a one
+// the word and doubleword ones.
+
+/// Decode one word of the SVE contiguous-load space.
+fn cont_load_a45(origin: Addr, word: u32) -> R {
+    match cont_load_a45_text(word) {
+        Ok((mn, text)) => R::new(mn, text),
+        Err(family) => undefined(origin, word, family),
+    }
+}
+
+/// The printed form of one word of the contiguous-load space.
+fn cont_load_a45_text(word: u32) -> GatherText {
+    if bits(word, 31, 25) != 0b1010010 {
+        return Err("SVE contiguous load (unallocated)");
+    }
+    let pg = bits(word, 12, 10);
+    let rn = bits(word, 9, 5);
+    let rt = bits(word, 4, 0);
+    let base = sp_reg(rn);
+    let m3 = bits(word, 15, 13);
+    let b22_21 = bits(word, 22, 21);
+    let rm = bits(word, 20, 16);
+    // The immediate offset is a signed four-bit field that shares its bits
+    // with the register offset.
+    let imm4 = simm_value(bits(word, 19, 16), 4);
+
+    match m3 {
+        // LD1RQ and LD1RO with a register offset.
+        0b000 => {
+            if rm == 31 {
+                return Err("SVE contiguous load (unallocated)");
+            }
+            let sz = bits(word, 24, 23);
+            let (mn, elem) = match b22_21 {
+                0b00 => ld1rq_opc(sz),
+                0b01 => ld1ro_opc(sz),
+                _ => return Err("SVE contiguous load (unallocated)"),
+            };
+            let mem = format!("[{base}, {}]", reg_off(rm, sz));
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // LD1RQ, LD1RO and the 128-bit contiguous loads with an immediate.
+        0b001 => {
+            let sz = bits(word, 24, 23);
+            let (mn, elem, scale, vl) = match (b22_21, bits(word, 20, 20)) {
+                // LD1RQ replicates one 128-bit group, LD1RO one 256-bit
+                // group, and the offset counts groups of the element.
+                (0b00, 0) => {
+                    let (mn, elem) = ld1rq_opc(sz);
+                    (mn, elem, 16, false)
+                }
+                (0b01, 0) => {
+                    let (mn, elem) = ld1ro_opc(sz);
+                    (mn, elem, 32, false)
+                }
+                // The 128-bit contiguous loads move whole quads, and their
+                // offset scales with the vector length.
+                (0b00, 1) => {
+                    let Some((mn, elem, _shift)) = q128_opc(sz) else {
+                        return Err("SVE contiguous load (unallocated)");
+                    };
+                    (mn, elem, 1, true)
+                }
+                _ => return Err("SVE contiguous load (unallocated)"),
+            };
+            let v = imm4 * scale;
+            let mem = offset_mem(&base, v, vl);
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // LD1x and LDFF1x with a register offset.
+        0b010 | 0b011 => {
+            let Some((mn, elem, acc)) = cld_dtype(bits(word, 24, 21)) else {
+                return Err("SVE contiguous load (unallocated)");
+            };
+            let mn = if m3 == 0b011 {
+                ldff1_mnemonic(mn)
+            } else {
+                mn
+            };
+            let mem = if rm == 31 {
+                // The first-copy form has no encoding without an offset.
+                if m3 == 0b010 {
+                    return Err("SVE contiguous load (unallocated)");
+                }
+                format!("[{base}]")
+            } else {
+                format!("[{base}, {}]", reg_off(rm, acc.trailing_zeros()))
+            };
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // The 128-bit contiguous loads with a register offset.
+        0b100 => match b22_21 {
+            0b00 => {
+                let Some((mn, elem, shift)) = q128_opc(bits(word, 24, 23)) else {
+                    return Err("SVE contiguous load (unallocated)");
+                };
+                if rm == 31 {
+                    return Err("SVE contiguous load (unallocated)");
+                }
+                let mem = format!("[{base}, {}]", reg_off(rm, shift));
+                Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+            }
+            // LD2Q, LD3Q and LD4Q with a register offset.
+            0b01 => {
+                let sz = bits(word, 24, 23);
+                if sz == 0b00 || rm == 31 {
+                    return Err("SVE contiguous load (unallocated)");
+                }
+                let n = 1 + sz as usize;
+                let mem = format!("[{base}, {}]", reg_off(rm, 4));
+                let mn = ldq_mnemonic(n);
+                Ok((
+                    mn,
+                    format!(
+                        "{mn}\t{{ {} }}, p{pg}/z, {mem}",
+                        zlist(rt, n as u32, 'q')
+                    ),
+                ))
+            }
+            _ => Err("SVE contiguous load (unallocated)"),
+        },
+        // LD1x and LDNF1x with an immediate.
+        0b101 => {
+            let Some((mn, elem, _acc)) = cld_dtype(bits(word, 24, 21)) else {
+                return Err("SVE contiguous load (unallocated)");
+            };
+            let mn = if bits(word, 20, 20) == 1 {
+                ldnf1_mnemonic(mn)
+            } else {
+                mn
+            };
+            let mem = offset_mem(&base, imm4, true);
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // LDNT1x with a register offset.
+        0b110 if b22_21 == 0b00 => {
+            let (mn, elem, acc) = ldnt1_opc(bits(word, 24, 23));
+            if rm == 31 {
+                return Err("SVE contiguous load (unallocated)");
+            }
+            let mem = format!("[{base}, {}]", reg_off(rm, acc.trailing_zeros()));
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // LDNT1x with an immediate.
+        0b111 if bits(word, 22, 20) == 0b000 => {
+            let (mn, elem, _acc) = ldnt1_opc(bits(word, 24, 23));
+            let mem = offset_mem(&base, imm4, true);
+            Ok((mn, format!("{mn}\t{{ z{rt}.{elem} }}, p{pg}/z, {mem}")))
+        }
+        // LD2, LD3 and LD4 with a register offset.
+        0b110 => {
+            let n = b22_21 as usize + 1;
+            let (suf, elem, acc) = eld_opc(bits(word, 24, 23));
+            if rm == 31 {
+                return Err("SVE contiguous load (unallocated)");
+            }
+            let mem = format!("[{base}, {}]", reg_off(rm, acc.trailing_zeros()));
+            let mn = ld_mnemonic(n, suf);
+            Ok((
+                mn,
+                format!("{mn}\t{{ {} }}, p{pg}/z, {mem}", zlist(rt, n as u32, elem)),
+            ))
+        }
+        // LD2, LD3 and LD4 with an immediate.
+        0b111 => {
+            let nregs = (bits(word, 20, 20) << 2) | b22_21;
+            let (mn, elem, n) = match nregs {
+                // The quad forms move whole 128-bit groups.
+                0b100 => {
+                    let sz = bits(word, 24, 23);
+                    if sz == 0b00 {
+                        return Err("SVE contiguous load (unallocated)");
+                    }
+                    let n = 1 + sz as usize;
+                    (ldq_mnemonic(n), 'q', n)
+                }
+                0b001 | 0b010 | 0b011 => {
+                    let n = nregs as usize + 1;
+                    let (suf, elem, _acc) = eld_opc(bits(word, 24, 23));
+                    (ld_mnemonic(n, suf), elem, n)
+                }
+                _ => return Err("SVE contiguous load (unallocated)"),
+            };
+            let mem = offset_mem(&base, imm4 * n as i64, true);
+            Ok((mn, format!("{mn}\t{{ {} }}, p{pg}/z, {mem}", zlist(rt, n as u32, elem))))
+        }
+        _ => Err("SVE contiguous load (unallocated)"),
+    }
+}
+
+/// The size field of the replicated loads: the mnemonic and the element the
+/// destination register holds.
+fn ld1rq_opc(sz: u32) -> (&'static str, char) {
+    match sz {
+        0b00 => ("ld1rqb", 'b'),
+        0b01 => ("ld1rqh", 'h'),
+        0b10 => ("ld1rqw", 's'),
+        _ => ("ld1rqd", 'd'),
+    }
+}
+
+/// The size field of the 256-bit replicated load, LD1RO.
+fn ld1ro_opc(sz: u32) -> (&'static str, char) {
+    match sz {
+        0b00 => ("ld1rob", 'b'),
+        0b01 => ("ld1roh", 'h'),
+        0b10 => ("ld1row", 's'),
+        _ => ("ld1rod", 'd'),
+    }
+}
+
+/// The dtype field of the plain contiguous loads: the mnemonic, the element
+/// the destination register holds and the size of one access in bytes.
+fn cld_dtype(dtype: u32) -> Option<(&'static str, char, u32)> {
+    Some(match dtype {
+        0b0000 => ("ld1b", 'b', 1),
+        0b0001 => ("ld1b", 'h', 1),
+        0b0010 => ("ld1b", 's', 1),
+        0b0011 => ("ld1b", 'd', 1),
+        0b0100 => ("ld1sw", 'd', 4),
+        0b0101 => ("ld1h", 'h', 2),
+        0b0110 => ("ld1h", 's', 2),
+        0b0111 => ("ld1h", 'd', 2),
+        0b1000 => ("ld1sh", 'd', 2),
+        0b1001 => ("ld1sh", 's', 2),
+        0b1010 => ("ld1w", 's', 4),
+        0b1011 => ("ld1w", 'd', 4),
+        0b1100 => ("ld1sb", 'd', 1),
+        0b1101 => ("ld1sb", 's', 1),
+        0b1110 => ("ld1sb", 'h', 1),
+        _ => ("ld1d", 'd', 8),
+    })
+}
+
+/// The size field of the non-temporal loads.
+fn ldnt1_opc(sz: u32) -> (&'static str, char, u32) {
+    match sz {
+        0b00 => ("ldnt1b", 'b', 1),
+        0b01 => ("ldnt1h", 'h', 2),
+        0b10 => ("ldnt1w", 's', 4),
+        _ => ("ldnt1d", 'd', 8),
+    }
+}
+
+/// The size field of the interleaving loads: the mnemonic suffix, the
+/// element and the size of one access in bytes.
+fn eld_opc(sz: u32) -> (&'static str, char, u32) {
+    match sz {
+        0b00 => ("b", 'b', 1),
+        0b01 => ("h", 'h', 2),
+        0b10 => ("w", 's', 4),
+        _ => ("d", 'd', 8),
+    }
+}
+
+/// The size field of the 128-bit contiguous loads: the mnemonic, the element
+/// and the shift the register offset is scaled by.
+fn q128_opc(sz: u32) -> Option<(&'static str, char, u32)> {
+    Some(match sz {
+        0b10 => ("ld1w", 'q', 2),
+        0b11 => ("ld1d", 'q', 3),
+        _ => return None,
+    })
+}
+
+/// The fault-only variant of a plain contiguous load.
+fn ldff1_mnemonic(mn: &'static str) -> &'static str {
+    match mn {
+        "ld1b" => "ldff1b",
+        "ld1h" => "ldff1h",
+        "ld1w" => "ldff1w",
+        "ld1d" => "ldff1d",
+        "ld1sb" => "ldff1sb",
+        "ld1sh" => "ldff1sh",
+        "ld1sw" => "ldff1sw",
+        _ => "ldff1d",
+    }
+}
+
+/// The non-fault-only variant of a plain contiguous load.
+fn ldnf1_mnemonic(mn: &'static str) -> &'static str {
+    match mn {
+        "ld1b" => "ldnf1b",
+        "ld1h" => "ldnf1h",
+        "ld1w" => "ldnf1w",
+        "ld1d" => "ldnf1d",
+        "ld1sb" => "ldnf1sb",
+        "ld1sh" => "ldnf1sh",
+        "ld1sw" => "ldnf1sw",
+        _ => "ldnf1d",
+    }
+}
+
+/// The mnemonic of an interleaving load of `n` registers.
+fn ld_mnemonic(n: usize, suffix: &str) -> &'static str {
+    match (n, suffix) {
+        (2, "b") => "ld2b",
+        (3, "b") => "ld3b",
+        (4, "b") => "ld4b",
+        (2, "h") => "ld2h",
+        (3, "h") => "ld3h",
+        (4, "h") => "ld4h",
+        (2, "w") => "ld2w",
+        (3, "w") => "ld3w",
+        (4, "w") => "ld4w",
+        (2, "d") => "ld2d",
+        (3, "d") => "ld3d",
+        _ => "ld4d",
+    }
+}
+
+/// The mnemonic of an interleaving load of whole quads.
+fn ldq_mnemonic(n: usize) -> &'static str {
+    match n {
+        2 => "ld2q",
+        3 => "ld3q",
+        _ => "ld4q",
+    }
+}
+
+/// A register offset operand, shifted when the access size asks for it.
+fn reg_off(rm: u32, shift: u32) -> String {
+    if shift == 0 {
+        format!("x{rm}")
+    } else {
+        format!("x{rm}, lsl #{shift}")
+    }
+}
+
+/// A memory operand with a byte offset, which is scaled by the vector
+/// length in the families that move whole vectors.
+fn offset_mem(base: &str, v: i64, vl: bool) -> String {
+    if v == 0 {
+        format!("[{base}]")
+    } else if vl {
+        format!("[{base}, {}, mul vl]", imm_text(v))
+    } else {
+        format!("[{base}, {}]", imm_text(v))
+    }
+}
+
+// === top bytes 0x64/0x65: SVE floating-point ================================
+//
+// The two top bytes hold the floating-point half of the SVE encoding
+// space: the arithmetic, comparison, conversion and reduction families,
+// in their predicated, unpredicated and indexed forms.  Each family fixes
+// a set of bits and leaves the rest to the operands; the tables below
+// list every family the reference disassembler accepts, with the bits it
+// fixes and the operands it prints.
+//
+// The tables were derived from the reference disassembler by comparing the
+// printed form of every word of the space, so they describe what the
+// architecture really decodes rather than what a manual says it should.
+
+/// What an operand of a floating-point instruction is.
+#[derive(Clone, Copy)]
+enum FpOpKind {
+    /// A vector register: `z<n>.<t>`.
+    Z,
+    /// A vector register with an element index: `z<n>.<t>[i]`.
+    ZIdx,
+    /// A governing or merging predicate: `p<n>`.
+    P,
+    /// The destination predicate of a comparison: `p<n>.<t>`.
+    Pd,
+    /// The vector register of a reduction: `v<n>.<k><t>`.
+    Simd,
+    /// The scalar register of a reduction: `<t><n>`.
+    Scalar,
+    /// The rotation of a complex multiply, two bits: 0, 90, 180 or 270.
+    Rot2,
+    /// The rotation of a complex add, one bit: 90 or 270.
+    Rot1,
+    /// A floating-point immediate of half and one.
+    FpImm,
+    /// A floating-point zero.
+    FZero,
+    /// A hexadecimal immediate.
+    IHex,
+}
+
+/// One operand of a floating-point instruction.
+#[derive(Clone, Copy)]
+struct FpOp {
+    /// What the operand is.
+    kind: FpOpKind,
+    /// The element size letter, or none.
+    elem: char,
+    /// The register field.
+    hi: u8,
+    lo: u8,
+    /// The number of lanes of a reduced result.
+    aux: u32,
+    /// The bits that hold an element index.
+    ibits: u32,
+    /// The text of a floating-point immediate.
+    text: &'static str,
+}
+
+/// One family of the floating-point space.
+struct FpClass {
+    /// The bits the family fixes.
+    mask: u32,
+    /// The value those bits take.
+    val: u32,
+    /// The mnemonic.
+    mn: &'static str,
+    /// The operands, in the order they are printed.
+    ops: &'static [FpOp],
+}
+
+/// The instruction classes of the top byte 0x64.
+static FP64: &[FpClass] = &[
+    FpClass { mask: 0xffa0fc00, val: 0x64200000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffa0fc00, val: 0x64200400, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffa0fc00, val: 0x64200800, mn: "bfmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffa0fc00, val: 0x64200c00, mn: "bfmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffa0fc00, val: 0x64202000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffa0fc00, val: 0x64202800, mn: "bfmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x580000, text: "" }] },
+    FpClass { mask: 0xffe08000, val: 0x64400000, mn: "fcmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot2, elem: '\0', hi: 14, lo: 13, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe08000, val: 0x64800000, mn: "fcmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot2, elem: '\0', hi: 14, lo: 13, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe08000, val: 0x64c00000, mn: "fcmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot2, elem: '\0', hi: 14, lo: 13, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0f000, val: 0x64a01000, mn: "fcmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }, FpOp { kind: FpOpKind::Rot2, elem: '\0', hi: 11, lo: 10, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0f000, val: 0x64e01000, mn: "fcmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 's', hi: 19, lo: 16, aux: 0, ibits: 0x100000, text: "" }, FpOp { kind: FpOpKind::Rot2, elem: '\0', hi: 11, lo: 10, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64a04000, mn: "fmlalb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64a04400, mn: "fmlalt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64a06000, mn: "fmlslb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64a06400, mn: "fmlslt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64e04000, mn: "bfmlalb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64e04400, mn: "bfmlalt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64e06000, mn: "bfmlslb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0f400, val: 0x64e06400, mn: "bfmlslt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180800, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64202400, mn: "bfclamp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64204000, mn: "fdot", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64208000, mn: "fdot", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64602400, mn: "fclamp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64604000, mn: "bfdot", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'h', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64608000, mn: "bfdot", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x6460e400, mn: "bfmmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a00000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 's', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a00400, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 's', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a02000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 's', hi: 18, lo: 16, aux: 0, ibits: 0x180000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a02400, mn: "fclamp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a08000, mn: "fmlalb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a08400, mn: "fmlalt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a0a000, mn: "fmlslb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a0a400, mn: "fmlslt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64a0e400, mn: "fmmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e00000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'd', hi: 19, lo: 16, aux: 0, ibits: 0x100000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e00400, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'd', hi: 19, lo: 16, aux: 0, ibits: 0x100000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e02000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::ZIdx, elem: 'd', hi: 19, lo: 16, aux: 0, ibits: 0x100000, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e02400, mn: "fclamp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e08000, mn: "bfmlalb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e08400, mn: "bfmlalt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e0a000, mn: "bfmlslb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e0a400, mn: "bfmlslt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x64e0e400, mn: "fmmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffee000, val: 0x64408000, mn: "fcadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot1, elem: '\0', hi: 16, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffee000, val: 0x64808000, mn: "fcadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot1, elem: '\0', hi: 16, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffee000, val: 0x64c08000, mn: "fcadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Rot1, elem: '\0', hi: 16, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6402a000, mn: "fcvtxnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x640aa000, mn: "fcvtxnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ac000, mn: "fcvtx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641c8000, mn: "frint32z", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ca000, mn: "frint32x", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641cc000, mn: "frint32z", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ce000, mn: "frint32x", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641d8000, mn: "frint64z", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641da000, mn: "frint64x", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641dc000, mn: "frint64z", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641de000, mn: "frint64x", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ea000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ec000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x641ee000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64508000, mn: "faddp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6450a000, mn: "faddqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'h', hi: 4, lo: 0, aux: 8, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64548000, mn: "fmaxnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6454a000, mn: "fmaxnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'h', hi: 4, lo: 0, aux: 8, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64558000, mn: "fminnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6455a000, mn: "fminnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'h', hi: 4, lo: 0, aux: 8, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64568000, mn: "fmaxp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6456a000, mn: "fmaxqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'h', hi: 4, lo: 0, aux: 8, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64578000, mn: "fminp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6457a000, mn: "fminqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'h', hi: 4, lo: 0, aux: 8, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64588000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6458a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6458c000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6458e000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64598000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6459c000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6459e000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645b8000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645ba000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645cc000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645ce000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645d8000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645da000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645dc000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645de000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645ec000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645ee000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645f8000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645fa000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645fc000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x645fe000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6480a000, mn: "fcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6481a000, mn: "fcvtlt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6482a000, mn: "bfcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6488a000, mn: "fcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6489a000, mn: "fcvtlt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x648aa000, mn: "bfcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64908000, mn: "faddp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6490a000, mn: "faddqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 's', hi: 4, lo: 0, aux: 4, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64948000, mn: "fmaxnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6494a000, mn: "fmaxnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 's', hi: 4, lo: 0, aux: 4, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64958000, mn: "fminnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6495a000, mn: "fminnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 's', hi: 4, lo: 0, aux: 4, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64968000, mn: "fmaxp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6496a000, mn: "fmaxqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 's', hi: 4, lo: 0, aux: 4, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64978000, mn: "fminp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6497a000, mn: "fminqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 's', hi: 4, lo: 0, aux: 4, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64988000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6498a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6498c000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6498e000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64998000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6499c000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6499e000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649a8000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649aa000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649ac000, mn: "bfcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649b8000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649ba000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649d8000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649da000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649f8000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x649fa000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64c2a000, mn: "fcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64c3a000, mn: "fcvtlt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64caa000, mn: "fcvtnt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64cba000, mn: "fcvtlt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d08000, mn: "faddp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d0a000, mn: "faddqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'd', hi: 4, lo: 0, aux: 2, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d48000, mn: "fmaxnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d4a000, mn: "fmaxnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'd', hi: 4, lo: 0, aux: 2, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d58000, mn: "fminnmp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d5a000, mn: "fminnmqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'd', hi: 4, lo: 0, aux: 2, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d68000, mn: "fmaxp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d6a000, mn: "fmaxqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'd', hi: 4, lo: 0, aux: 2, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d78000, mn: "fminp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d7a000, mn: "fminqv", ops: &[FpOp { kind: FpOpKind::Simd, elem: 'd', hi: 4, lo: 0, aux: 2, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d88000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d8a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d8c000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d8e000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d98000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d9c000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64d9e000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64da8000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64daa000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dac000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dae000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64db8000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dba000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dc8000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dca000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dd8000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dda000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64ddc000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dde000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64de8000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dea000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64df8000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dfa000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dfc000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x64dfe000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+];
+
+/// The instruction classes of the top byte 0x65.
+static FP65: &[FpClass] = &[
+    FpClass { mask: 0xffe0e000, val: 0x65200000, mn: "bfmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65202000, mn: "bfmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65600000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65602000, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65604000, mn: "fnmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65606000, mn: "fnmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65608000, mn: "fmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x6560a000, mn: "fmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x6560c000, mn: "fnmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x6560e000, mn: "fnmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a00000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a02000, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a04000, mn: "fnmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a06000, mn: "fnmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a08000, mn: "fmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a0a000, mn: "fmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a0c000, mn: "fnmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65a0e000, mn: "fnmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e00000, mn: "fmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e02000, mn: "fmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e04000, mn: "fnmla", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e06000, mn: "fnmls", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e08000, mn: "fmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e0a000, mn: "fmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e0c000, mn: "fnmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e000, val: 0x65e0e000, mn: "fnmsb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65404000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65404010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65406000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65406010, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6540c000, mn: "fcmuo", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6540c010, mn: "facge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6540e010, mn: "facgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65804000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65804010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65806000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65806010, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6580c000, mn: "fcmuo", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6580c010, mn: "facge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x6580e010, mn: "facgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c04000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c04010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c06000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c06010, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c0c000, mn: "fcmuo", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c0c010, mn: "facge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0e010, val: 0x65c0e010, mn: "facgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65000000, mn: "bfadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65000400, mn: "bfsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65000800, mn: "bfmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65400000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65400400, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65400800, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65400c00, mn: "ftsmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65401800, mn: "frecps", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65401c00, mn: "frsqrts", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65800000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65800400, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65800800, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65800c00, mn: "ftsmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65801800, mn: "frecps", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65801c00, mn: "frsqrts", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c00000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c00400, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c00800, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c00c00, mn: "ftsmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c01800, mn: "frecps", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffe0fc00, val: 0x65c01c00, mn: "frsqrts", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 20, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfff8fc00, val: 0x65508000, mn: "ftmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::IHex, elem: '\0', hi: 18, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfff8fc00, val: 0x65908000, mn: "ftmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::IHex, elem: '\0', hi: 18, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfff8fc00, val: 0x65d08000, mn: "ftmad", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::IHex, elem: '\0', hi: 18, lo: 16, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65008000, mn: "bfadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65018000, mn: "bfsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65028000, mn: "bfmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65048000, mn: "bfmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65058000, mn: "bfminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65068000, mn: "bfmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65078000, mn: "bfmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x650aa000, mn: "fcvtx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6510a000, mn: "frint32z", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6511a000, mn: "frint32x", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6512a000, mn: "frint32z", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6513a000, mn: "frint32x", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6514a000, mn: "frint64z", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6515a000, mn: "frint64x", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6516a000, mn: "frint64z", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6517a000, mn: "frint64x", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x651aa000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x651ca000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x651ea000, mn: "flogb", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65402000, mn: "faddv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65408000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6540a000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65418000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6541a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65428000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6542a000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65438000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6543a000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65442000, mn: "fmaxnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65448000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6544a000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65452000, mn: "fminnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65458000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65462000, mn: "fmaxv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65468000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6546a000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65472000, mn: "fminv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65478000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6547a000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65488000, mn: "fabd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65498000, mn: "fscale", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x654a8000, mn: "fmulx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x654c8000, mn: "fdivr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x654ca000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x654d8000, mn: "fdiv", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x654da000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6552a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6553a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6554a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6555a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6556a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6557a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65582000, mn: "fadda", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Scalar, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655aa000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655ba000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655ca000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655da000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655ea000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x655fa000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65802000, mn: "faddv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65808000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6580a000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65818000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6581a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65828000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6582a000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65838000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6583a000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65842000, mn: "fmaxnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65848000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6584a000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65852000, mn: "fminnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65858000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65862000, mn: "fmaxv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65868000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6586a000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65872000, mn: "fminv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65878000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6587a000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65888000, mn: "fabd", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6588a000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65898000, mn: "fscale", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6589a000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658a8000, mn: "fmulx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658aa000, mn: "bfcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658c8000, mn: "fdivr", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658ca000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658d8000, mn: "fdiv", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x658da000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6594a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x6595a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65982000, mn: "fadda", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Scalar, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x659ca000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x659da000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c02000, mn: "faddv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c08000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c0a000, mn: "frintn", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c18000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c1a000, mn: "frintp", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c28000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c2a000, mn: "frintm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c38000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c3a000, mn: "frintz", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c42000, mn: "fmaxnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c48000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c4a000, mn: "frinta", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c52000, mn: "fminnmv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c58000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c62000, mn: "fmaxv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c68000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c6a000, mn: "frintx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c72000, mn: "fminv", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c78000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c7a000, mn: "frinti", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c88000, mn: "fabd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c8a000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c98000, mn: "fscale", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65c9a000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65ca8000, mn: "fmulx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65caa000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65cba000, mn: "fcvt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65cc8000, mn: "fdivr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65cca000, mn: "frecpx", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65cd8000, mn: "fdiv", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65cda000, mn: "fsqrt", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d0a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d1a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d4a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d5a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d6a000, mn: "scvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d7a000, mn: "ucvtf", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d82000, mn: "fadda", ops: &[FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: '\0', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Scalar, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d8a000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65d9a000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65dca000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65dda000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65dea000, mn: "fcvtzs", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe000, val: 0x65dfa000, mn: "fcvtzu", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65502000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65502010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65512000, mn: "fcmlt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65512010, mn: "fcmle", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65522000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65532000, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'h', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65902000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65902010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65912000, mn: "fcmlt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65912010, mn: "fcmle", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65922000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65932000, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 's', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d02000, mn: "fcmge", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d02010, mn: "fcmgt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d12000, mn: "fcmlt", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d12010, mn: "fcmle", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d22000, mn: "fcmeq", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe010, val: 0x65d32000, mn: "fcmne", ops: &[FpOp { kind: FpOpKind::Pd, elem: 'd', hi: 3, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'z', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FZero, elem: '\0', hi: 0, lo: 0, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65588000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65598000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655a8000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655b8000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655c8000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655d8000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655e8000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x655f8000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65988000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65998000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659a8000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659b8000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659c8000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659d8000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659e8000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x659f8000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65d88000, mn: "fadd", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65d98000, mn: "fsub", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65da8000, mn: "fmul", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65db8000, mn: "fsubr", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.5" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65dc8000, mn: "fmaxnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65dd8000, mn: "fminnm", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65de8000, mn: "fmax", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xffffe3c0, val: 0x65df8000, mn: "fmin", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::P, elem: 'm', hi: 12, lo: 10, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::FpImm, elem: '\0', hi: 5, lo: 5, aux: 0, ibits: 0x0, text: "0.0" }] },
+    FpClass { mask: 0xfffffc00, val: 0x654e3000, mn: "frecpe", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffffc00, val: 0x654f3000, mn: "frsqrte", ops: &[FpOp { kind: FpOpKind::Z, elem: 'h', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'h', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffffc00, val: 0x658e3000, mn: "frecpe", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffffc00, val: 0x658f3000, mn: "frsqrte", ops: &[FpOp { kind: FpOpKind::Z, elem: 's', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 's', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffffc00, val: 0x65ce3000, mn: "frecpe", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+    FpClass { mask: 0xfffffc00, val: 0x65cf3000, mn: "frsqrte", ops: &[FpOp { kind: FpOpKind::Z, elem: 'd', hi: 4, lo: 0, aux: 0, ibits: 0x0, text: "" }, FpOp { kind: FpOpKind::Z, elem: 'd', hi: 9, lo: 5, aux: 0, ibits: 0x0, text: "" }] },
+];
+/// Decode one word of the SVE floating-point space.
+fn float_64_65(origin: Addr, word: u32) -> R {
+    let table = if bits(word, 31, 24) == 0x64 { FP64 } else { FP65 };
+    for cls in table {
+        if word & cls.mask == cls.val {
+            return R::new(cls.mn, fp_text(word, cls));
+        }
+    }
+    undefined(origin, word, "SVE floating-point (unallocated)")
+}
+
+/// The printed form of a floating-point instruction.
+fn fp_text(word: u32, cls: &FpClass) -> String {
+    let mut out = String::from(cls.mn);
+    out.push('\t');
+    for (i, op) in cls.ops.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&fp_operand(word, op, cls.mn));
+    }
+    out
+}
+
+/// The value of a register field.
+fn fp_field(word: u32, hi: u8, lo: u8) -> u32 {
+    (word >> lo) & ((1u32 << (hi - lo + 1)) - 1)
+}
+
+/// The printed form of one operand.
+fn fp_operand(word: u32, op: &FpOp, mn: &str) -> String {
+    match op.kind {
+        FpOpKind::Z => {
+            format!("z{}.{}", fp_field(word, op.hi, op.lo) & 31, op.elem)
+        }
+        FpOpKind::ZIdx => format!(
+            "z{}.{}[{}]",
+            fp_field(word, op.hi, op.lo) & 31,
+            op.elem,
+            fp_index(word, op),
+        ),
+        FpOpKind::P => {
+            let p = fp_field(word, op.hi, op.lo) & 15;
+            if op.elem == '\0' {
+                format!("p{p}")
+            } else {
+                format!("p{p}/{}", op.elem)
+            }
+        }
+        FpOpKind::Pd => {
+            format!("p{}.{}", fp_field(word, op.hi, op.lo) & 15, op.elem)
+        }
+        FpOpKind::Simd => format!(
+            "v{}.{}{}",
+            fp_field(word, op.hi, op.lo) & 31,
+            op.aux,
+            op.elem
+        ),
+        FpOpKind::Scalar => {
+            format!("{}{}", op.elem, fp_field(word, op.hi, op.lo) & 31)
+        }
+        FpOpKind::Rot2 => format!("#{}", fp_field(word, op.hi, op.lo) * 90),
+        FpOpKind::Rot1 => format!("#{}", 90 + fp_field(word, op.hi, op.lo) * 180),
+        FpOpKind::FpImm => {
+            // the immediate is one of two values, and which pair it comes
+            // from is a property of the mnemonic: the multiply scales by
+            // two where the others add one
+            if fp_field(word, op.hi, op.lo) == 0 {
+                format!("#{}", op.text)
+            } else if mn == "fmul" {
+                "#2.0".to_string()
+            } else {
+                "#1.0".to_string()
+            }
+        }
+        FpOpKind::FZero => "#0.0".to_string(),
+        FpOpKind::IHex => format!("#0x{:x}", fp_field(word, op.hi, op.lo)),
+    }
+}
+
+/// The element index of an indexed operand.  The index and the register
+/// share their bits, so the index takes the bits the register leaves over,
+/// from the lowest upwards.
+fn fp_index(word: u32, op: &FpOp) -> u32 {
+    let mut value = 0;
+    let mut pos = 0;
+    let mut bits = op.ibits;
+    while bits != 0 {
+        let b = bits.trailing_zeros();
+        if word >> b & 1 != 0 {
+            value |= 1 << pos;
+        }
+        bits &= bits - 1;
+        pos += 1;
+    }
+    value
+}
+
 // --- Shared helpers ----------------------------------------------------------
 
 /// A signed immediate read as a value, so that a caller can leave a zero
@@ -3395,7 +4463,7 @@ fn pred_pattern(v: u32) -> String {
     match v {
         0 => "pow2".to_string(),
         1..=8 => format!("vl{v}"),
-        9..=13 => format!("vl{}", 1u32 << (v - 8 + 4)),
+        9..=13 => format!("vl{}", 1u32 << (v - 5)),
         29 => "mul4".to_string(),
         30 => "mul3".to_string(),
         31 => String::new(),
