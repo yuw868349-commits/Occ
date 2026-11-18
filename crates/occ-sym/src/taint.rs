@@ -525,116 +525,7 @@ fn transfer(
     sink: &mut dyn FnMut(Flow),
 ) {
     for stmt in &block.stmts {
-        match stmt {
-            Stmt::Assign { dest, value } => {
-                let labels = labels_of(value, state);
-                state.vars.insert(dest.clone(), labels);
-            }
-            Stmt::Store { addr, value, size } => {
-                let value_labels = labels_of(value, state);
-                let addr_labels = labels_of(addr, state);
-                if filter.stores && (!value_labels.is_empty() || !addr_labels.is_empty()) {
-                    let mut all = value_labels.clone();
-                    all.extend(addr_labels.iter().copied());
-                    for bit in all {
-                        sink(Flow {
-                            source: sources[usize::from(bit)].label(),
-                            sink: match addr_const(addr) {
-                                Some(a) => format!("store to 0x{a:x}"),
-                                None => "store through a pointer".into(),
-                            },
-                            at: block.addr,
-                            arg: None,
-                            value: format!("*({size} byte) = {value}"),
-                            path: Vec::new(),
-                        });
-                    }
-                }
-                match addr_const(addr) {
-                    Some(a) => {
-                        state.mem.insert(a, value_labels);
-                    }
-                    None => {
-                        // The write could land anywhere, and the analysis will
-                        // not pretend otherwise.
-                        state.anywhere.extend(addr_labels);
-                        state.anywhere.extend(value_labels);
-                    }
-                }
-            }
-            Stmt::Call {
-                name,
-                args,
-                ret,
-                addr,
-                target,
-            } => {
-                let mut joined = Labels::new();
-                let callee = target.and_then(|t| functions.iter().find(|f| f.entry == t));
-                // The call lists only the registers its block wrote, so a
-                // call that passes an argument the function never touched
-                // reads as a call with no arguments. The callee's own
-                // parameter registers are where those arguments live.
-                let mut bound: Vec<Expr> = args.clone();
-                if bound.is_empty()
-                    && let Some(c) = callee
-                {
-                    bound = calls
-                        .program(c)
-                        .param_regs
-                        .iter()
-                        .map(Expr::var)
-                        .collect();
-                }
-                for (i, a) in bound.iter().enumerate() {
-                    let labels = labels_of(a, state);
-                    if labels.is_empty() {
-                        continue;
-                    }
-                    if filter.wants_call(name) {
-                        for bit in &labels {
-                            sink(Flow {
-                                source: sources[usize::from(*bit)].label(),
-                                sink: filter.sink_label(name),
-                                at: *addr,
-                                arg: Some(i),
-                                value: a.to_string(),
-                                path: Vec::new(),
-                            });
-                        }
-                    }
-                    // A callee whose body is available says what it does with
-                    // this argument. Without one, the conservative rule
-                    // stands: a tainted argument makes the result tainted.
-                    match callee.and_then(|c| calls.summary(functions, c, i)) {
-                        Some(sum) => {
-                            if sum.ret {
-                                joined.extend(labels.iter().copied());
-                            }
-                            for (sink_name, at) in &sum.sinks {
-                                for bit in &labels {
-                                    sink(Flow {
-                                        source: sources[usize::from(*bit)].label(),
-                                        sink: sink_name.clone(),
-                                        at: *at,
-                                        arg: Some(i),
-                                        value: a.to_string(),
-                                        path: Vec::new(),
-                                    });
-                                }
-                            }
-                        }
-                        None => joined.extend(labels.iter().copied()),
-                    }
-                }
-                if let Some(dest) = ret {
-                    state.vars.insert(dest.clone(), joined);
-                }
-            }
-            // A comment is not a statement, and treating it as one would let a
-            // note about a missing instruction carry data flow.
-            Stmt::Comment(_) => {}
-        }
+        transfer_stmt(stmt, block.addr, state, sources, filter, functions, calls, sink);
     }
 
     if filter.branches
@@ -650,6 +541,150 @@ fn transfer(
                 value: cond.to_string(),
                 path: Vec::new(),
             });
+        }
+    }
+}
+
+/// Propagate one statement, descending into the two arms of a conditional.
+///
+/// A conditional store runs on one path and not the other, so the taint it
+/// carries has to reach the sink; joining the states afterwards keeps the
+/// variable that was tainted on only one arm tainted on both.
+#[allow(clippy::too_many_arguments)]
+fn transfer_stmt(
+    stmt: &Stmt,
+    at: occ_core::Addr,
+    state: &mut Taint,
+    sources: &[Source],
+    filter: &SinkFilter,
+    functions: &[Function],
+    calls: &mut Calls<'_>,
+    sink: &mut dyn FnMut(Flow),
+) {
+    match stmt {
+        Stmt::Assign { dest, value } => {
+            let labels = labels_of(value, state);
+            state.vars.insert(dest.clone(), labels);
+        }
+        Stmt::Store { addr, value, size } => {
+            let value_labels = labels_of(value, state);
+            let addr_labels = labels_of(addr, state);
+            if filter.stores && (!value_labels.is_empty() || !addr_labels.is_empty()) {
+                let mut all = value_labels.clone();
+                all.extend(addr_labels.iter().copied());
+                for bit in all {
+                    sink(Flow {
+                        source: sources[usize::from(bit)].label(),
+                        sink: match addr_const(addr) {
+                            Some(a) => format!("store to 0x{a:x}"),
+                            None => "store through a pointer".into(),
+                        },
+                        at,
+                        arg: None,
+                        value: format!("*({size} byte) = {value}"),
+                        path: Vec::new(),
+                    });
+                }
+            }
+            match addr_const(addr) {
+                Some(a) => {
+                    state.mem.insert(a, value_labels);
+                }
+                None => {
+                    // The write could land anywhere, and the analysis will
+                    // not pretend otherwise.
+                    state.anywhere.extend(addr_labels);
+                    state.anywhere.extend(value_labels);
+                }
+            }
+        }
+        Stmt::Call {
+            name,
+            args,
+            ret,
+            addr,
+            target,
+        } => {
+            let mut joined = Labels::new();
+            let callee = target.and_then(|t| functions.iter().find(|f| f.entry == t));
+            // The call lists only the registers its block wrote, so a
+            // call that passes an argument the function never touched
+            // reads as a call with no arguments. The callee's own
+            // parameter registers are where those arguments live.
+            let mut bound: Vec<Expr> = args.clone();
+            if bound.is_empty()
+                && let Some(c) = callee
+            {
+                bound = calls
+                    .program(c)
+                    .param_regs
+                    .iter()
+                    .map(Expr::var)
+                    .collect();
+            }
+            for (i, a) in bound.iter().enumerate() {
+                let labels = labels_of(a, state);
+                if labels.is_empty() {
+                    continue;
+                }
+                if filter.wants_call(name) {
+                    for bit in &labels {
+                        sink(Flow {
+                            source: sources[usize::from(*bit)].label(),
+                            sink: filter.sink_label(name),
+                            at: *addr,
+                            arg: Some(i),
+                            value: a.to_string(),
+                            path: Vec::new(),
+                        });
+                    }
+                }
+                // A callee whose body is available says what it does with
+                // this argument. Without one, the conservative rule
+                // stands: a tainted argument makes the result tainted.
+                match callee.and_then(|c| calls.summary(functions, c, i)) {
+                    Some(sum) => {
+                        if sum.ret {
+                            joined.extend(labels.iter().copied());
+                        }
+                        for (sink_name, at) in &sum.sinks {
+                            for bit in &labels {
+                                sink(Flow {
+                                    source: sources[usize::from(*bit)].label(),
+                                    sink: sink_name.clone(),
+                                    at: *at,
+                                    arg: Some(i),
+                                    value: a.to_string(),
+                                    path: Vec::new(),
+                                });
+                            }
+                        }
+                    }
+                    None => joined.extend(labels.iter().copied()),
+                }
+            }
+            if let Some(dest) = ret {
+                state.vars.insert(dest.clone(), joined);
+            }
+        }
+        // A comment is not a statement, and treating it as one would let a
+        // note about a missing instruction carry data flow.
+        Stmt::Comment(_) => {}
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            let before = state.clone();
+            for s in then_body {
+                transfer_stmt(s, at, state, sources, filter, functions, calls, sink);
+            }
+            let then_state = state.clone();
+            *state = before;
+            for s in else_body {
+                transfer_stmt(s, at, state, sources, filter, functions, calls, sink);
+            }
+            state.join(&then_state);
         }
     }
 }

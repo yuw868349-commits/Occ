@@ -323,28 +323,40 @@ pub fn apply(program: &mut Program, info: &DebugInfo, frame_base_slot: Option<i6
         }
         v.to_string()
     };
+    fn visit(s: &mut Stmt, info: &DebugInfo, alias_of: &dyn Fn(&str) -> String) {
+        match s {
+            Stmt::Assign { value, .. } => {
+                if let Some(m) = rewrite_member_load(info, value, alias_of) {
+                    *value = m;
+                }
+            }
+            Stmt::Store { value, .. } => {
+                if let Some(m) = rewrite_member_load(info, value, alias_of) {
+                    *value = m;
+                }
+            }
+            Stmt::Call { args, .. } => {
+                for a in args.iter_mut() {
+                    if let Some(m) = rewrite_member_load(info, a, alias_of) {
+                        *a = m;
+                    }
+                }
+            }
+            Stmt::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                for s in then_body.iter_mut().chain(else_body.iter_mut()) {
+                    visit(s, info, alias_of);
+                }
+            }
+            Stmt::Comment(_) => {}
+        }
+    }
     for b in &mut program.blocks {
         for s in &mut b.stmts {
-            match s {
-                Stmt::Assign { value, .. } => {
-                    if let Some(m) = rewrite_member_load(info, value, &alias_of) {
-                        *value = m;
-                    }
-                }
-                Stmt::Store { value, .. } => {
-                    if let Some(m) = rewrite_member_load(info, value, &alias_of) {
-                        *value = m;
-                    }
-                }
-                Stmt::Call { args, .. } => {
-                    for a in args.iter_mut() {
-                        if let Some(m) = rewrite_member_load(info, a, &alias_of) {
-                            *a = m;
-                        }
-                    }
-                }
-                Stmt::Comment(_) => {}
-            }
+            visit(s, info, &alias_of);
         }
     }
 }
@@ -369,6 +381,16 @@ fn rename_stmt(s: &mut Stmt, f: &dyn Fn(&str) -> Option<String>) {
                 && let Some(n) = f(r)
             {
                 *r = n;
+            }
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            *cond = cond.rename_vars(f);
+            for s in then_body.iter_mut().chain(else_body.iter_mut()) {
+                rename_stmt(s, f);
             }
         }
         Stmt::Comment(_) => {}

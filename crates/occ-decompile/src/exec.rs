@@ -527,6 +527,21 @@ impl Machine {
                     )));
                 }
             }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                // The condition is a value like any other. Asking the
+                // interpreter for it is what keeps a conditional write from
+                // happening on both paths; when it cannot be answered, saying
+                // so is better than picking one.
+                let c = self.eval(cond)?;
+                let body = if c != 0 { then_body } else { else_body };
+                for s in body {
+                    self.step(s)?;
+                }
+            }
             Stmt::Comment(_) => {}
         }
         Ok(())

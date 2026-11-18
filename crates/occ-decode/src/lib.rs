@@ -22,6 +22,7 @@
 #![deny(missing_docs)]
 
 pub mod aarch64;
+pub mod arm;
 pub mod riscv;
 pub mod wasm;
 pub mod x86;
@@ -46,6 +47,8 @@ pub enum AnyDecoder {
     X86(x86::Decoder),
     /// AArch64 (A64).
     Aarch64(aarch64::Decoder),
+    /// ARM32, in either the A32 or the T32 instruction set.
+    Arm(arm::Decoder),
     /// RISC-V, 32- or 64-bit.
     Riscv(riscv::Decoder),
 }
@@ -59,6 +62,7 @@ impl AnyDecoder {
         match arch {
             Arch::X86 | Arch::X86_64 => x86::Decoder::new(bits).map(AnyDecoder::X86),
             Arch::Aarch64 => aarch64::Decoder::new(bits).map(AnyDecoder::Aarch64),
+            Arch::Arm => arm::Decoder::new(bits).map(AnyDecoder::Arm),
             Arch::RiscV32 | Arch::RiscV64 => riscv::Decoder::new(bits).map(AnyDecoder::Riscv),
             _ => None,
         }
@@ -69,6 +73,7 @@ impl AnyDecoder {
         match self {
             AnyDecoder::X86(d) => d.arch(),
             AnyDecoder::Aarch64(_) => Arch::Aarch64,
+            AnyDecoder::Arm(_) => Arch::Arm,
             AnyDecoder::Riscv(d) => d.arch(),
         }
     }
@@ -78,6 +83,7 @@ impl AnyDecoder {
         match self {
             AnyDecoder::X86(_) => 0,
             AnyDecoder::Aarch64(_) => 4,
+            AnyDecoder::Arm(d) => d.width(),
             AnyDecoder::Riscv(_) => 0,
         }
     }
@@ -91,6 +97,7 @@ impl AnyDecoder {
         match self {
             AnyDecoder::X86(d) => d.decode(origin, bytes),
             AnyDecoder::Aarch64(d) => d.decode(origin, bytes),
+            AnyDecoder::Arm(d) => d.decode(origin, bytes),
             AnyDecoder::Riscv(d) => d.decode(origin, bytes),
         }
     }

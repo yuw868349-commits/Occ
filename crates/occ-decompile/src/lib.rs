@@ -33,7 +33,7 @@ use std::collections::HashMap;
 
 use occ_core::{Addr, FlowKind, Function, Image};
 
-use ir::{Block, BlockId, Decompiled, Expr, Stmt, Term};
+use ir::{BinOp, Block, BlockId, CastKind, Decompiled, Expr, Stmt, Term};
 use lift::Lifted;
 
 /// Options for one decompilation.
@@ -146,7 +146,7 @@ pub fn decompile(
 /// One list, used by both the gate and the message that names what is
 /// missing: two copies of it drift, and a note that lists the wrong
 /// architectures is worse than no note.
-const LIFTABLE: &str = "x86-64, x86-32, AArch64 and RISC-V";
+const LIFTABLE: &str = "x86-64, x86-32, ARM32, AArch64 and RISC-V";
 
 /// The name the machine's general-purpose word has in the output.
 ///
@@ -160,6 +160,12 @@ fn word_type(arch: occ_core::Arch) -> &'static str {
         _ => "u64",
     }
 }
+
+/// The block a conditional return jumps to, before it has a number.
+///
+/// The block is added after the function's own blocks are lifted, so the
+/// number it ends up with is only known then.
+const RETURN_BLOCK: BlockId = usize::MAX;
 
 /// The types of the parameters, with the machine word where nothing else
 /// says.
@@ -188,6 +194,7 @@ pub fn is_liftable(arch: occ_core::Arch) -> bool {
     matches!(
         arch,
         occ_core::Arch::X86 | occ_core::Arch::X86_64
+            | occ_core::Arch::Arm
             | occ_core::Arch::Aarch64
             | occ_core::Arch::RiscV32
             | occ_core::Arch::RiscV64
@@ -221,6 +228,11 @@ fn lifter_for<'a>(
                 _ => &CDECL,
             };
             Some(Box::new(lift::x86::Lifter::new(target, name_of, symbols)))
+        }
+        // ARM32: AAPCS, arguments in r0-r3, return in r0.
+        occ_core::Arch::Arm => {
+            static ARM: lift::arm::ArmTarget = lift::arm::ArmTarget::new();
+            Some(Box::new(lift::arm::Lifter::new(&ARM, name_of, symbols)))
         }
         occ_core::Arch::X86_64 => {
             static SYSV: lift::x86::X86Target = lift::x86::X86Target::sysv();
@@ -399,6 +411,8 @@ pub fn build_program(
     // Jump targets inside the function's own range that its body never
     // decoded. Collected so the lift can say how many paths leave it.
     let mut holes: Vec<Addr> = Vec::new();
+    // Where the block a conditional return jumps to will live.
+    let mut return_block_at: Option<Addr> = None;
     let arg_reg_names = lifter.arg_reg_names();
     for (i, bb) in func.blocks.iter().enumerate() {
         if i >= opts.max_blocks {
@@ -414,7 +428,9 @@ pub fn build_program(
         let term = match last {
             None => Term::Unreachable,
             Some(insn) => match insn.flow {
-                FlowKind::Return => Term::Ret(Some(Expr::var(String::from("rax")))),
+                // The return register is the architecture's, not x86's:
+                // ARM returns in r0 and AArch64 in x0.
+                FlowKind::Return => Term::Ret(Some(Expr::var(lifter.ret_reg()))),
                 FlowKind::UnconditionalBranch => match insn.target {
                     Some(occ_core::CallTarget::Direct { to }) => match by_addr.get(&to) {
                         Some(t) => Term::Jump(*t),
@@ -515,11 +531,22 @@ pub fn build_program(
                         .branch
                         .clone()
                         .unwrap_or_else(|| Expr::Unknown("condition".into()));
-                    let then_bb = match insn.target {
+                    let mut then_bb = match insn.target {
                         Some(occ_core::CallTarget::Direct { to }) => by_addr.get(&to).copied(),
                         _ => None,
                     };
                     let else_bb = by_addr.get(&bb.end).copied();
+                    // A conditional return leaves the function on one path
+                    // and carries on on the other. The path that leaves
+                    // returns what the return register holds, so it gets a
+                    // block of its own: a branch with no target reads as a
+                    // jump into a cold chunk, and the reader is told the
+                    // rest of the function is unreachable — which is how a
+                    // closed form of a loop loses its body.
+                    if then_bb.is_none() && lifted.conditional_return {
+                        then_bb = Some(RETURN_BLOCK);
+                        return_block_at = Some(insn.addr);
+                    }
                     match (then_bb, else_bb) {
                         (Some(t), Some(f)) => Term::Branch {
                             cond,
@@ -594,6 +621,29 @@ pub fn build_program(
         });
     }
 
+    // The block a conditional return jumps to. It is added after the rest,
+    // because it is not a block of the function's own code: it is the end
+    // of the function, reached from one path and carrying the value the
+    // return register holds.
+    if let Some(at) = return_block_at {
+        let id = blocks.len();
+        for b in blocks.iter_mut() {
+            if let Term::Branch {
+                then_bb: Some(t @ RETURN_BLOCK),
+                ..
+            } = &mut b.term
+            {
+                *t = id;
+            }
+        }
+        blocks.push(Block {
+            id,
+            addr: at,
+            stmts: Vec::new(),
+            term: Term::Ret(Some(Expr::var(lifter.ret_reg()))),
+        });
+    }
+
     // A prefix cut leaves terminators that point at blocks the cap dropped.
     // Those targets are indices into a vector that no longer has them, and the
     // first pass that dereferences one aborts the process. The target exists —
@@ -638,7 +688,7 @@ pub fn build_program(
     // function left its last value, and that is settled only once every
     // block has been lifted.
     let ret_reg = lifter.ret_reg();
-    let ret_type = lifter.ret_type().map(str::to_string);
+    let mut ret_type = lifter.ret_type().map(str::to_string);
     // A function that never wrote the register the value comes from has
     // no value to return, and printing one would claim the function chose
     // it.
@@ -650,6 +700,24 @@ pub fn build_program(
             } else {
                 Term::Ret(None)
             };
+        }
+    }
+
+    // A value wider than the machine word comes back in a pair of
+    // registers, and the low half alone is not the value: the product of
+    // two thirty-two bit numbers has a high half that is not zero, and
+    // dropping it makes the function return the wrong number. When the
+    // two halves are the two views of one wide value, that value is what
+    // the function returns.
+    if let Some((lo, hi)) = lifter.ret_pair() {
+        for b in blocks.iter_mut() {
+            if !matches!(b.term, Term::Ret(Some(_))) {
+                continue;
+            }
+            if let Some((value, wide)) = pair_return(&b.stmts, &lo, &hi) {
+                b.term = Term::Ret(Some(value));
+                ret_type = Some(wide.to_string());
+            }
         }
     }
 
@@ -799,6 +867,79 @@ pub fn build_program(
 /// above the callee's entry stack pointer (four in 32-bit mode). AArch64 and
 /// RISC-V keep the return address in a register, so their frame base is the
 /// entry stack pointer itself.
+/// The value a block returns in a pair of registers, when the two halves
+/// are the two views of one wide value.
+///
+/// A multiply that produces twice as many bits as its factors writes the
+/// low half of the product in one register and the high half in the next.
+/// Read as a pair they are one number; read as the low register alone
+/// they are half of one.
+fn pair_return(stmts: &[Stmt], lo: &str, hi: &str) -> Option<(Expr, &'static str)> {
+    let mut low: Option<&Expr> = None;
+    let mut high: Option<&Expr> = None;
+    for s in stmts {
+        let Stmt::Assign { dest, value } = s else {
+            continue;
+        };
+        if dest == lo {
+            low = Some(value);
+        }
+        if dest == hi {
+            high = Some(value);
+        }
+    }
+    let low = low?;
+    let high = high?;
+    // The low half is the wide value narrowed, and the high half is the
+    // same value shifted down.
+    let Expr::Cast {
+        kind: CastKind::Trunc,
+        arg: low_arg,
+        from: 8,
+        to: 4,
+    } = low
+    else {
+        return None;
+    };
+    let Expr::Cast {
+        kind: CastKind::Trunc,
+        arg: high_arg,
+        from: 8,
+        to: 4,
+    } = high
+    else {
+        return None;
+    };
+    let Expr::Var(whole) = low_arg.as_ref() else {
+        return None;
+    };
+    let Expr::Bin {
+        op: BinOp::Shr,
+        lhs: high_lhs,
+        rhs: high_rhs,
+        bits: 8,
+    } = high_arg.as_ref()
+    else {
+        return None;
+    };
+    if high_lhs.as_ref() != &Expr::Var(whole.clone()) || high_rhs.as_ref() != &Expr::Const(32) {
+        return None;
+    }
+    // Whether the number is signed is a fact about how it was made.
+    let wide = match stmts.iter().find_map(|s| match s {
+        Stmt::Assign { dest, value } if dest == whole => Some(value),
+        _ => None,
+    }) {
+        Some(Expr::Bin { lhs, rhs, .. }) => {
+            let signed = matches!(lhs.as_ref(), Expr::Cast { kind: CastKind::Sext, .. })
+                || matches!(rhs.as_ref(), Expr::Cast { kind: CastKind::Sext, .. });
+            if signed { "i64" } else { "u64" }
+        }
+        _ => "u64",
+    };
+    Some((Expr::Var(whole.clone()), wide))
+}
+
 fn cfa_slot(arch: occ_core::Arch) -> i64 {
     match arch {
         occ_core::Arch::X86_64 => 8,
@@ -1069,7 +1210,7 @@ fn parameter_names(
         nodes: &[Stmt],
         used: &mut [bool],
         index_of: &dyn Fn(&str) -> Option<usize>,
-        term: &Term,
+        term: Option<&Term>,
     ) {
         for s in nodes {
             match s {
@@ -1083,9 +1224,19 @@ fn parameter_names(
                         scan(a, used, index_of);
                     }
                 }
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    scan(cond, used, index_of);
+                    walk(then_body, used, index_of, None);
+                    walk(else_body, used, index_of, None);
+                }
                 Stmt::Comment(_) => {}
             }
         }
+        let Some(term) = term else { return };
         if let Term::Branch { cond, .. } = term {
             scan(cond, used, index_of);
         }
@@ -1097,7 +1248,7 @@ fn parameter_names(
         }
     }
     for b in blocks {
-        walk(&b.stmts, &mut used, &index_of, &b.term);
+        walk(&b.stmts, &mut used, &index_of, Some(&b.term));
     }
     // A parameter is a position, not a set: a function that reads the third
     // argument register takes three arguments, whether or not the body says

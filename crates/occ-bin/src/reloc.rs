@@ -306,6 +306,7 @@ fn patch_one(
     match arch {
         Arch::X86_64 => patch_x86_64(data, r.raw_type, place, off, value, addend, endian),
         Arch::X86 => patch_x86(data, r.raw_type, place, off, value, addend, endian),
+        Arch::Arm => patch_arm(data, r.raw_type, place, off, value, addend, endian),
         Arch::Aarch64 => patch_aarch64(data, r.raw_type, place, off, value, addend, endian),
         Arch::RiscV32 | Arch::RiscV64 => patch_riscv(
             data, r, place, off, value, addend, endian, pcrel_hi,
@@ -323,6 +324,26 @@ fn get_u32(d: &[u8], off: usize, e: Endian) -> Option<u32> {
         Endian::Little => u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
         Endian::Big => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
     })
+}
+
+fn get_u16(d: &[u8], off: usize, e: Endian) -> Option<u16> {
+    let b = d.get(off..off + 2)?;
+    Some(match e {
+        Endian::Little => u16::from_le_bytes([b[0], b[1]]),
+        Endian::Big => u16::from_be_bytes([b[0], b[1]]),
+    })
+}
+
+fn put_u16(d: &mut [u8], off: usize, v: u16, e: Endian) -> bool {
+    let Some(b) = d.get_mut(off..off + 2) else {
+        return false;
+    };
+    let bytes = match e {
+        Endian::Little => v.to_le_bytes(),
+        Endian::Big => v.to_be_bytes(),
+    };
+    b.copy_from_slice(&bytes);
+    true
 }
 
 fn put_u32(d: &mut [u8], off: usize, v: u32, e: Endian) -> bool {
@@ -471,6 +492,182 @@ fn patch_x86(
             }
         }
         _ => Outcome::Deferred,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ARM32
+
+/// Patch one ARM32 relocation.
+///
+/// ARM's `SHT_REL` addend for a branch is `-8`, because the architecture
+/// reads the program counter as the instruction's address plus eight. The
+/// assembler writes that `-8` into the displacement field, so reading the
+/// field back as an unsigned number and adding it puts every branch eight
+/// bytes past where it belongs — or, for a call, four gigabytes away.
+fn patch_arm(
+    data: &mut [u8],
+    raw: u32,
+    place: u64,
+    off: usize,
+    value: u64,
+    addend: i64,
+    endian: Endian,
+) -> Outcome {
+    match raw {
+        // R_ARM_ABS32: an absolute pointer, which is what a literal pool and
+        // a jump table are made of.
+        2 => {
+            let v = value.wrapping_add(addend as u64);
+            if put_u32(data, off, v as u32, endian) {
+                Outcome::Patched
+            } else {
+                Outcome::Deferred
+            }
+        }
+        // R_ARM_REL32.
+        3 => {
+            let d = delta(value, addend, place);
+            if d < i128::from(i32::MIN) || d > i128::from(i32::MAX) {
+                return Outcome::OutOfRange;
+            }
+            if put_u32(data, off, d as i32 as u32, endian) {
+                Outcome::Patched
+            } else {
+                Outcome::Deferred
+            }
+        }
+        // R_ARM_PC24, R_ARM_CALL, R_ARM_JUMP24: a signed 26-bit word
+        // displacement carrying a 24-bit field.
+        1 | 28 | 29 => {
+            let Some(word) = get_u32(data, off, endian) else {
+                return Outcome::Deferred;
+            };
+            // The addend is the sign-extended field, and it is already `-8`
+            // for a branch the assembler emitted.
+            let inplace = sext_arm(bits32(word, 23, 0) << 2, 26);
+            let d = i128::from(value) + i128::from(addend) + i128::from(inplace) - i128::from(place);
+            if !(-(1i128 << 25)..(1i128 << 25)).contains(&d) {
+                return Outcome::OutOfRange;
+            }
+            if d & 3 != 0 {
+                return Outcome::Deferred;
+            }
+            let field = ((d >> 2) as u32) & 0x00ff_ffff;
+            let patched = (word & 0xff00_0000) | field;
+            if put_u32(data, off, patched, endian) {
+                Outcome::Patched
+            } else {
+                Outcome::Deferred
+            }
+        }
+        // R_ARM_THM_CALL, R_ARM_THM_JUMP24: the 26-bit displacement split
+        // across two halfwords, with two of its bits inverted.
+        10 | 30 => patch_thumb_branch(data, place, off, value, addend, endian),
+        // R_ARM_PREL31: `.ARM.exidx` entries, a 31-bit displacement that
+        // keeps its top bit as a flag.
+        42 => {
+            let d = delta(value, addend, place) as i32;
+            let word = get_u32(data, off, endian).unwrap_or(0);
+            let patched = (word & 0x8000_0000) | (d as u32 & 0x7fff_ffff);
+            if put_u32(data, off, patched, endian) {
+                Outcome::Patched
+            } else {
+                Outcome::Deferred
+            }
+        }
+        // R_ARM_MOVW_ABS_NC / R_ARM_MOVT_ABS and their PC-relative forms.
+        43..=46 => {
+            let v = match raw {
+                45 | 46 => delta(value, addend, place) as u64,
+                _ => value.wrapping_add(addend as u64),
+            };
+            let imm16 = if raw == 43 || raw == 45 {
+                v as u16
+            } else {
+                (v >> 16) as u16
+            };
+            let Some(word) = get_u32(data, off, endian) else {
+                return Outcome::Deferred;
+            };
+            // `movw Rd, #imm16`: the four high bits sit at 19:16 and the low
+            // twelve at 11:0, with the opcode and register in between.
+            let patched = (word & 0xfff0_f000)
+                | ((u32::from(imm16) & 0xf000) << 4)
+                | u32::from(imm16 & 0x0fff);
+            if put_u32(data, off, patched, endian) {
+                Outcome::Patched
+            } else {
+                Outcome::Deferred
+            }
+        }
+        // R_ARM_V4BX: asks a linker to rewrite `bx` for pre-ARMv4T cores.
+        // The instruction is already what a modern core wants.
+        40 => Outcome::Patched,
+        _ => Outcome::Deferred,
+    }
+}
+
+fn bits32(w: u32, hi: u32, lo: u32) -> u32 {
+    (w >> lo) & ((1u32 << (hi - lo + 1)) - 1)
+}
+
+fn sext_arm(v: u32, n: u32) -> i64 {
+    let shift = 64 - n;
+    ((v as i64) << shift) >> shift
+}
+
+/// Patch a Thumb `bl`/`b.w`.
+///
+/// The displacement is spread over both halfwords and two of its bits are
+/// stored inverted, so the reader has to un-invert them before the value is
+/// an offset and invert them again before it is an encoding. Getting the
+/// inversion wrong produces a branch that is right about half the time.
+fn patch_thumb_branch(
+    data: &mut [u8],
+    place: u64,
+    off: usize,
+    value: u64,
+    addend: i64,
+    endian: Endian,
+) -> Outcome {
+    let Some(mut hw1) = get_u16(data, off, endian) else {
+        return Outcome::Deferred;
+    };
+    let Some(mut hw2) = get_u16(data, off + 2, endian) else {
+        return Outcome::Deferred;
+    };
+    let s = (hw1 >> 10) & 1;
+    let j1 = (hw2 >> 13) & 1;
+    let j2 = (hw2 >> 11) & 1;
+    let i1 = (!(j1 ^ s)) & 1;
+    let i2 = (!(j2 ^ s)) & 1;
+    let mut a = u32::from(s);
+    a = (a << 10) | u32::from(hw1 & 0x3ff);
+    a = (a << 1) | u32::from(i1);
+    a = (a << 1) | u32::from(i2);
+    a = (a << 11) | u32::from(hw2 & 0x7ff);
+    a <<= 1;
+    let inplace = sext_arm(a, 25);
+    let d = i128::from(value) + i128::from(addend) + i128::from(inplace) - i128::from(place);
+    if !(-(1i128 << 24)..(1i128 << 24)).contains(&d) {
+        return Outcome::OutOfRange;
+    }
+    let x = d as i64;
+    let s = ((x >> 24) & 1) as u16;
+    let i1 = ((x >> 23) & 1) as u16;
+    let i2 = ((x >> 22) & 1) as u16;
+    let imm10 = ((x >> 12) & 0x3ff) as u16;
+    let imm11 = ((x >> 1) & 0x7ff) as u16;
+    // J1 = NOT(I1 XOR S), the inverse of how the addend was read.
+    let j1 = (!(i1 ^ s)) & 1;
+    let j2 = (!(i2 ^ s)) & 1;
+    hw1 = (hw1 & 0xf800) | (s << 10) | imm10;
+    hw2 = (hw2 & 0xd000) | (j1 << 13) | (j2 << 11) | imm11;
+    if put_u16(data, off, hw1, endian) && put_u16(data, off + 2, hw2, endian) {
+        Outcome::Patched
+    } else {
+        Outcome::Deferred
     }
 }
 

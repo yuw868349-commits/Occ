@@ -532,6 +532,33 @@ impl Runner<'_> {
                 }
                 state.env.insert(dest.clone(), v);
             }
+            // A conditional statement runs on one path or the other. When
+            // the condition is a constant the interpreter knows, it takes
+            // that path; otherwise it runs both and keeps the state the
+            // second one leaves, which is one of the two the machine could
+            // have.
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let c = self.eval(cond, state);
+                if !state.missing.is_empty() {
+                    return;
+                }
+                let both: Vec<Stmt>;
+                let body: &[Stmt] = match c.as_const() {
+                    Some(v) if v != 0 => then_body,
+                    Some(_) => else_body,
+                    None => {
+                        both = then_body.iter().chain(else_body.iter()).cloned().collect();
+                        &both
+                    }
+                };
+                for s in body {
+                    self.stmt(state, s);
+                }
+            }
             Stmt::Store { addr, value, size } => {
                 let a = self.eval(addr, state);
                 let v = self.eval(value, state);

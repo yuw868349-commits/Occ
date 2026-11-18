@@ -844,7 +844,11 @@ impl FlagState {
         let flag = |mask: u8| -> Option<Expr> {
             self.get(mask).cloned()
         };
-        match cond {
+        // The flags answer the question in the form the branch asked it,
+        // and the answer is simplified: a loop that ends on "not equal"
+        // is a negation of a comparison, and the reader wants to see the
+        // comparison rather than the negation.
+        let answer = match cond {
             FlagCond::Z => flag(FLAG_ZF),
             FlagCond::Nz => flag(FLAG_ZF).map(not),
             FlagCond::C => flag(FLAG_CF),
@@ -885,7 +889,8 @@ impl FlagState {
                 }),
                 _ => None,
             },
-        }
+        };
+        answer.map(|e| e.simplify())
     }
 
     /// Whether two flags differ, when both are known.
@@ -1599,6 +1604,50 @@ impl Expr {
                         UnOp::Not => truncate(!*v, width),
                         UnOp::LNot => u64::from(*v == 0),
                     });
+                }
+                // The negation of a comparison is the opposite comparison.
+                // A loop that ends on "not equal" is written as the
+                // negation of "equal" by the machine, and the reader wants
+                // to see the question the branch actually asks.
+                if *op == UnOp::LNot {
+                    match &arg {
+                        Expr::Cond {
+                            op,
+                            lhs,
+                            rhs,
+                            bits,
+                        } => {
+                            return Expr::Cond {
+                                op: op.negated(),
+                                lhs: lhs.clone(),
+                                rhs: rhs.clone(),
+                                bits: *bits,
+                            };
+                        }
+                        Expr::Bool {
+                            op: BoolOp::Not,
+                            args,
+                        } => return args[0].clone(),
+                        Expr::Bool {
+                            op: BoolOp::Eq,
+                            args,
+                        } => {
+                            return Expr::Bool {
+                                op: BoolOp::Ne,
+                                args: args.clone(),
+                            };
+                        }
+                        Expr::Bool {
+                            op: BoolOp::Ne,
+                            args,
+                        } => {
+                            return Expr::Bool {
+                                op: BoolOp::Eq,
+                                args: args.clone(),
+                            };
+                        }
+                        _ => {}
+                    }
                 }
                 Expr::Un {
                     op: *op,
@@ -2441,6 +2490,22 @@ pub enum Stmt {
         /// executor that wants to run the callee needs the target, and
         /// recovering it from the printed name would be a guess.
         target: Option<Addr>,
+    },
+    /// A statement that runs only when a condition holds.
+    ///
+    /// ARM32 executes most instructions conditionally, and `streq r0, [r1]`
+    /// is one instruction that writes memory on one path and does nothing on
+    /// the other. A select cannot express it — the store either happens or
+    /// it does not — and a comment would drop the write. The bodies hold
+    /// stores and calls, which is what a conditional instruction can do;
+    /// conditional values go through [`Expr::Select`].
+    If {
+        /// Predicate.
+        cond: Expr,
+        /// Statements when it holds.
+        then_body: Vec<Stmt>,
+        /// Statements when it does not.
+        else_body: Vec<Stmt>,
     },
     /// Side-effecting operation the lifter keeps as a comment.
     Comment(String),

@@ -35,6 +35,7 @@
 //! through [`Target`].
 
 pub mod aarch64;
+pub mod arm;
 pub mod riscv;
 pub mod x86;
 
@@ -326,6 +327,14 @@ pub struct Lifted {
     pub branch: Option<Expr>,
     /// Target expression of a trailing indirect jump.
     pub indirect: Option<Expr>,
+    /// Whether the block ends in a conditional return.
+    ///
+    /// `bxne lr` returns on one path and falls through on the other. The
+    /// target is the link register rather than an address, so the branch
+    /// has no target to name, and a branch with no target reads as a jump
+    /// out of the function: the rest of the function then looks
+    /// unreachable, which is how a closed form of a loop loses its body.
+    pub conditional_return: bool,
 }
 
 /// The facts that differ between architectures.
@@ -1279,6 +1288,31 @@ impl<'a> Core<'a> {
             .map(|r| Expr::var(self.name(*r)))
             .collect()
     }
+
+    /// The arguments of a call whose target is in a register.
+    ///
+    /// The register the target is in is not an argument, and the arguments
+    /// stop below it: a register above the target holds something else —
+    /// `mov r3, r0; mov r0, r1; mov r1, r2; blx r3` passes two arguments
+    /// and keeps the pointer in r3, and counting r3 as a third argument
+    /// invents one.
+    pub fn call_args_excluding(&self, skip: u8) -> Vec<Expr> {
+        let regs = self.target.arg_regs();
+        let mut argc = 0usize;
+        for (i, reg) in regs.iter().enumerate() {
+            if *reg == skip {
+                break;
+            }
+            if self.written.contains(reg) {
+                argc = i + 1;
+            }
+        }
+        regs[..argc]
+            .iter()
+            .filter(|r| **r != skip)
+            .map(|r| Expr::var(self.name(*r)))
+            .collect()
+    }
 }
 
 /// The condition a comparison answers, when the condition is a relation
@@ -1431,6 +1465,16 @@ pub trait Lifter {
 
     /// The register a function returns its value in.
     fn ret_reg(&self) -> String;
+
+    /// The two registers a value wider than the machine word comes back
+    /// in, low half first.
+    ///
+    /// A32 returns a sixty-four bit value in r0 and r1, and the low half
+    /// alone is not the value: the product of two thirty-two bit numbers
+    /// has a high half that is not zero.
+    fn ret_pair(&self) -> Option<(String, String)> {
+        None
+    }
 
     /// The type of the value the function returns, when the body says so.
     ///

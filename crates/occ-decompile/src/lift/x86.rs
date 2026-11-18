@@ -4532,6 +4532,9 @@ mod tests {
                         args.iter().map(crate::render::expr).collect();
                     format!("{name}({})", args.join(", "))
                 }
+                Stmt::If { cond, .. } => {
+                    format!("if ({}) {{ ... }}", crate::render::expr(cond))
+                }
                 Stmt::Comment(c) => format!("// {c}"),
             })
             .collect();
@@ -4578,6 +4581,9 @@ mod tests {
                     let args: Vec<String> =
                         args.iter().map(crate::render::expr).collect();
                     format!("{name}({})", args.join(", "))
+                }
+                Stmt::If { cond, .. } => {
+                    format!("if ({}) {{ ... }}", crate::render::expr(cond))
                 }
                 Stmt::Comment(c) => format!("// {c}"),
             })

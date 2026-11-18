@@ -795,6 +795,15 @@ impl<'a> Structurer<'a> {
                     args: args.clone(),
                     ret: ret.clone(),
                 },
+                Stmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => Node::If {
+                    cond: cond.clone(),
+                    then_body: self.stmts_to_nodes(then_body),
+                    else_body: self.stmts_to_nodes(else_body),
+                },
                 Stmt::Comment(c) => Node::Comment(c.clone()),
             })
             .collect()

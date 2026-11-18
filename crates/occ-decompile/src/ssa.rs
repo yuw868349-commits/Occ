@@ -179,54 +179,77 @@ impl Builder<'_> {
         }
     }
 
-    fn rename_block(&mut self, b: BlockId) {
-        self.used.clear();
-        let stmts = std::mem::take(&mut self.blocks[b].stmts);
-        let mut out = Vec::with_capacity(stmts.len());
-        for stmt in stmts {
-            match stmt {
-                Stmt::Assign { dest, value } => {
-                    let value = self.rewrite(&value, b);
-                    let version = self.write(b, &dest);
-                    out.push(Stmt::Assign {
-                        dest: version,
-                        value,
-                    });
+    /// Rename one statement, descending into a conditional body.
+    ///
+    /// A conditional instruction on ARM writes memory on one path and does
+    /// nothing on the other; its body holds no definitions, but the walk is
+    /// recursive anyway so that a later lifter cannot put one there and have
+    /// it silently escape renaming.
+    fn rename_stmt(&mut self, stmt: Stmt, b: BlockId) -> Stmt {
+        match stmt {
+            Stmt::Assign { dest, value } => {
+                let value = self.rewrite(&value, b);
+                let version = self.write(b, &dest);
+                Stmt::Assign {
+                    dest: version,
+                    value,
                 }
-                Stmt::Store { addr, value, size } => out.push(Stmt::Store {
-                    addr: self.rewrite(&addr, b),
-                    value: self.rewrite(&value, b),
-                    size,
-                }),
+            }
+            Stmt::Store { addr, value, size } => Stmt::Store {
+                addr: self.rewrite(&addr, b),
+                value: self.rewrite(&value, b),
+                size,
+            },
+            Stmt::Call {
+                name,
+                args,
+                ret,
+                addr,
+                target,
+            } => {
+                let name = self.rename_in_name(b, &name);
+                let args = args.iter().map(|a| self.rewrite(a, b)).collect();
+                let ret = ret.map(|r| {
+                    let version = self.write(b, &r);
+                    // The call result itself is filled in by the renderer;
+                    // the name records which call produced it.
+                    self.defs
+                        .insert((b, r.clone()), Expr::Var(version.clone()));
+                    version
+                });
                 Stmt::Call {
                     name,
                     args,
                     ret,
                     addr,
                     target,
-                } => {
-                    let name = self.rename_in_name(b, &name);
-                    let args = args.iter().map(|a| self.rewrite(a, b)).collect();
-                    let ret = ret.map(|r| {
-                        let version = self.write(b, &r);
-                        // The call result itself is filled in by the renderer;
-                        // the name records which call produced it.
-                        self.defs.insert(
-                            (b, r.clone()),
-                            Expr::Var(version.clone()),
-                        );
-                        version
-                    });
-                    out.push(Stmt::Call {
-                        name,
-                        args,
-                        ret,
-                        addr,
-                        target,
-                    });
                 }
-                Stmt::Comment(c) => out.push(Stmt::Comment(c)),
             }
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => Stmt::If {
+                cond: self.rewrite(&cond, b),
+                then_body: then_body
+                    .into_iter()
+                    .map(|s| self.rename_stmt(s, b))
+                    .collect(),
+                else_body: else_body
+                    .into_iter()
+                    .map(|s| self.rename_stmt(s, b))
+                    .collect(),
+            },
+            Stmt::Comment(c) => Stmt::Comment(c),
+        }
+    }
+
+    fn rename_block(&mut self, b: BlockId) {
+        self.used.clear();
+        let stmts = std::mem::take(&mut self.blocks[b].stmts);
+        let mut out = Vec::with_capacity(stmts.len());
+        for stmt in stmts {
+            out.push(self.rename_stmt(stmt, b));
         }
         self.blocks[b].stmts = out;
         let term = self.blocks[b].term.clone();
@@ -623,21 +646,20 @@ fn apply_subst(blocks: &mut [Block], subst: &HashMap<String, Expr>) {
         return;
     }
     for b in blocks.iter_mut() {
-        for s in b.stmts.iter_mut() {
-            match s {
-                Stmt::Assign { value, .. } => *value = value.substitute(subst),
-                Stmt::Store { addr, value, .. } => {
-                    *addr = addr.substitute(subst);
-                    *value = value.substitute(subst);
-                }
-                Stmt::Call { args, .. } => {
-                    for a in args.iter_mut() {
-                        *a = a.substitute(subst);
-                    }
-                }
-                Stmt::Comment(_) => {}
+        for_each_stmt_mut(&mut b.stmts, &mut |s| match s {
+            Stmt::Assign { value, .. } => *value = value.substitute(subst),
+            Stmt::Store { addr, value, .. } => {
+                *addr = addr.substitute(subst);
+                *value = value.substitute(subst);
             }
-        }
+            Stmt::Call { args, .. } => {
+                for a in args.iter_mut() {
+                    *a = a.substitute(subst);
+                }
+            }
+            Stmt::If { cond, .. } => *cond = cond.substitute(subst),
+            Stmt::Comment(_) => {}
+        });
         match &mut b.term {
             Term::Branch { cond, .. } => *cond = cond.substitute(subst),
             Term::Switch { index, .. } => *index = index.substitute(subst),
@@ -748,21 +770,20 @@ fn use_counts(blocks: &[Block]) -> HashMap<String, u32> {
         }
     };
     for b in blocks {
-        for s in &b.stmts {
-            match s {
-                Stmt::Assign { value, .. } => bump(value, &mut counts),
-                Stmt::Store { addr, value, .. } => {
-                    bump(addr, &mut counts);
-                    bump(value, &mut counts);
-                }
-                Stmt::Call { args, .. } => {
-                    for a in args {
-                        bump(a, &mut counts);
-                    }
-                }
-                Stmt::Comment(_) => {}
+        for_each_stmt(&b.stmts, &mut |s| match s {
+            Stmt::Assign { value, .. } => bump(value, &mut counts),
+            Stmt::Store { addr, value, .. } => {
+                bump(addr, &mut counts);
+                bump(value, &mut counts);
             }
-        }
+            Stmt::Call { args, .. } => {
+                for a in args {
+                    bump(a, &mut counts);
+                }
+            }
+            Stmt::If { cond, .. } => bump(cond, &mut counts),
+            Stmt::Comment(_) => {}
+        });
         if let crate::ir::Term::Branch { cond, .. } = &b.term {
             bump(cond, &mut counts);
         }
@@ -847,8 +868,7 @@ fn propagate_constants(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
     }
     let mut changed = false;
     for b in blocks.iter_mut() {
-        for s in b.stmts.iter_mut() {
-            match s {
+        for_each_stmt_mut(&mut b.stmts, &mut |s| match s {
                 Stmt::Assign { value, .. } => {
                     let n = value.substitute(&consts).simplify();
                     if n != *value {
@@ -874,9 +894,15 @@ fn propagate_constants(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                         }
                     }
                 }
+                Stmt::If { cond, .. } => {
+                    let n = cond.substitute(&consts).simplify();
+                    if n != *cond {
+                        *cond = n;
+                        changed = true;
+                    }
+                }
                 Stmt::Comment(_) => {}
-            }
-        }
+        });
         match &mut b.term {
             Term::Branch { cond, .. } => {
                 let n = cond.substitute(&consts).simplify();
@@ -939,18 +965,16 @@ fn propagate_copies(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
         if subst.is_empty() {
             continue;
         }
-        for s in block.stmts.iter_mut() {
-            match s {
+        for_each_stmt_mut(&mut block.stmts, &mut |s| match s {
                 Stmt::Assign { dest, value } => {
-                    if subst.contains_key(dest) {
-                        // The definition stays; readers are rewritten and the
-                        // dead pass removes it once nothing refers to it.
-                        continue;
-                    }
-                    let new = value.substitute(&subst);
-                    if new != *value {
-                        *value = new;
-                        changed = true;
+                    // The definition stays; readers are rewritten and the
+                    // dead pass removes it once nothing refers to it.
+                    if !subst.contains_key(dest) {
+                        let new = value.substitute(&subst);
+                        if new != *value {
+                            *value = new;
+                            changed = true;
+                        }
                     }
                 }
                 Stmt::Store { addr, value, .. } => {
@@ -971,9 +995,15 @@ fn propagate_copies(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
                         }
                     }
                 }
+                Stmt::If { cond, .. } => {
+                    let n = cond.substitute(&subst);
+                    if n != *cond {
+                        *cond = n;
+                        changed = true;
+                    }
+                }
                 Stmt::Comment(_) => {}
-            }
-        }
+        });
         match &mut block.term {
             Term::Branch { cond, .. } => {
                 let n = cond.substitute(&subst);
@@ -1208,6 +1238,39 @@ pub fn coalesce(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
     changed
 }
 
+/// Visit every statement, descending into the bodies of conditional ones.
+fn for_each_stmt(stmts: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+    for s in stmts {
+        f(s);
+        if let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = s
+        {
+            for_each_stmt(then_body, f);
+            for_each_stmt(else_body, f);
+        }
+    }
+}
+
+/// The mutable form. The visitor sees the conditional statement itself and is
+/// responsible for its condition; the bodies are visited for it.
+fn for_each_stmt_mut(stmts: &mut [Stmt], f: &mut dyn FnMut(&mut Stmt)) {
+    for s in stmts {
+        f(s);
+        if let Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } = s
+        {
+            for_each_stmt_mut(then_body, f);
+            for_each_stmt_mut(else_body, f);
+        }
+    }
+}
+
 /// Every name read by a statement.
 fn stmt_uses(s: &Stmt, out: &mut Vec<String>) {
     match s {
@@ -1220,6 +1283,15 @@ fn stmt_uses(s: &Stmt, out: &mut Vec<String>) {
             for a in args {
                 a.vars(out);
             }
+        }
+        Stmt::If {
+            cond,
+            then_body,
+            else_body,
+        } => {
+            cond.vars(out);
+            for_each_stmt(then_body, &mut |s| stmt_uses(s, out));
+            for_each_stmt(else_body, &mut |s| stmt_uses(s, out));
         }
         Stmt::Comment(_) => {}
     }
@@ -1240,6 +1312,41 @@ fn rename_in_stmt(s: &mut Stmt, from: &str, to: &str) {
                 *a = a.substitute(&map);
             }
         }
+        Stmt::If { cond, .. } => *cond = cond.substitute(&map),
+        Stmt::Comment(_) => {}
+    }
+    if let Stmt::If {
+        then_body,
+        else_body,
+        ..
+    } = s
+    {
+        for_each_stmt_mut(then_body, &mut |s| {
+            rename_in_stmt_body(s, from, to)
+        });
+        for_each_stmt_mut(else_body, &mut |s| {
+            rename_in_stmt_body(s, from, to)
+        });
+    }
+}
+
+/// `rename_in_stmt` without the descent, for the visitor above: the walk
+/// already reaches every nested statement.
+fn rename_in_stmt_body(s: &mut Stmt, from: &str, to: &str) {
+    let mut map = HashMap::new();
+    map.insert(from.to_string(), Expr::Var(to.to_string()));
+    match s {
+        Stmt::Assign { value, .. } => *value = value.substitute(&map),
+        Stmt::Store { addr, value, .. } => {
+            *addr = addr.substitute(&map);
+            *value = value.substitute(&map);
+        }
+        Stmt::Call { args, .. } => {
+            for a in args.iter_mut() {
+                *a = a.substitute(&map);
+            }
+        }
+        Stmt::If { cond, .. } => *cond = cond.substitute(&map),
         Stmt::Comment(_) => {}
     }
 }

@@ -392,6 +392,25 @@ impl<'a> Walker<'a> {
             // A store is dropped: a table the program writes at run time is
             // not something this pass can read back.
             Stmt::Store { .. } | Stmt::Comment(_) => {}
+            // A conditional write happens on one path and not the other.
+            // Stepping both bodies and then forgetting what either wrote is
+            // the honest answer: the value afterwards is one of two, and
+            // this pass cannot tell which.
+            Stmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                let _ = self.eval(cond, state, out, 0);
+                let mut written = Vec::new();
+                for s in then_body.iter().chain(else_body.iter()) {
+                    self.step(s, state, out);
+                    written_dests(s, &mut written);
+                }
+                for d in written {
+                    state.insert(d, Value::Top);
+                }
+            }
         }
     }
 
@@ -1405,6 +1424,25 @@ fn stub(program: &Program, id: BlockId) -> Option<(i64, BlockId)> {
         return None;
     };
     Some((constant?, next))
+}
+
+
+/// Names a statement may write.
+fn written_dests(s: &Stmt, out: &mut Vec<String>) {
+    match s {
+        Stmt::Assign { dest, .. } => out.push(dest.clone()),
+        Stmt::Call { ret: Some(ret), .. } => out.push(ret.clone()),
+        Stmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for s in then_body.iter().chain(else_body.iter()) {
+                written_dests(s, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// True for the calls whose result is a fresh object.
