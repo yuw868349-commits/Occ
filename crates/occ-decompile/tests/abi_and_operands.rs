@@ -429,3 +429,27 @@ int wrapper(int a) { return target(a); }
         "the wrapper returns the callee's value:\n{code}"
     );
 }
+
+#[test]
+fn a_riscv_computed_jump_names_the_value_it_goes_through() {
+    // `auipc t1, 0x2; jr t1` lifted to `goto *(<indirect target>)`: the block
+    // had computed the address and the lifter threw away the register that
+    // held it, so the one thing a reader needs — where the target came from —
+    // was missing. The answer here is a constant because the address is a
+    // link-time one; what matters is that it is the value the code computed
+    // and not the word "unknown".
+    let loaded = load("fixture.riscv64.o");
+    let code = loaded.code("dispatch");
+    assert!(
+        !code.contains("indirect target"),
+        "the computed jump has no target expression:\n{code}"
+    );
+    let goto = code
+        .lines()
+        .find(|l| l.contains("goto *("))
+        .unwrap_or_else(|| panic!("the computed jump is not rendered:\n{code}"));
+    assert!(
+        !goto.contains("unknown"),
+        "the target expression is not a value the body defined: {goto}"
+    );
+}

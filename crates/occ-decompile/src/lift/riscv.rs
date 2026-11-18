@@ -608,6 +608,23 @@ impl<'a> Lifter<'a> {
             bits: 8,
         }
     }
+
+    /// The register a `jr`/`jalr` leaves through.
+    ///
+    /// `jr a0` and `jalr zero, 0(a1)` both compute the target at run time, and
+    /// the register is the only thing the block says about it. Reporting the
+    /// expression is what lets a reader — and a value-set pass — ask where it
+    /// came from; `unknown` ends the question.
+    fn indirect_target(&mut self, insn: &Instruction) -> Expr {
+        let Some(p) = self.core.target.parse(&insn.text) else {
+            return Expr::Unknown("indirect target".into());
+        };
+        let mut scratch: Vec<Stmt> = Vec::new();
+        match p.ops.first() {
+            Some(o) => self.core.read(o, &mut scratch),
+            None => Expr::Unknown("indirect target".into()),
+        }
+    }
 }
 
 impl super::Lifter for Lifter<'_> {
@@ -634,10 +651,12 @@ impl super::Lifter for Lifter<'_> {
                     }
                     None => Expr::Unknown("condition".into()),
                 });
-            } else if matches!(insn.flow, FlowKind::UnconditionalBranch)
-                && insn.target.is_none()
+            } else if matches!(
+                insn.flow,
+                FlowKind::UnconditionalBranch | FlowKind::IndirectBranch
+            ) && insn.target.is_none()
             {
-                out.indirect = Some(Expr::Unknown("indirect target".into()));
+                out.indirect = Some(self.indirect_target(insn));
             }
         }
         out

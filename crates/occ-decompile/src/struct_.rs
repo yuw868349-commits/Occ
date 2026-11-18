@@ -291,34 +291,49 @@ impl<'a> Structurer<'a> {
         let _ = self.region(entry, &Region::root());
         self.boundary = self.goto_targets.iter().copied().collect();
 
-        // Second pass: the shared blocks are boundaries now. Every path that
-        // reaches one jumps to it, and it is emitted once, under a label.
+        // Second pass: a shared block is labelled where it already sits on
+        // the first path that reaches it, and every later path jumps to that
+        // label. The first version emitted the block twice — once in place,
+        // once at the end under a label — and the copy of a loop header read
+        // `L1: goto L1`, a spin loop the original code did not contain.
         self.placed.clear();
         self.goto_targets.clear();
         self.unstructured = 0;
         let mut body = self.region(entry, &Region::root());
 
-        // Emit the shared blocks under their labels, after the structured
-        // body. A jump lands on the copy, so the statements run exactly once
-        // whichever path reached them.
-        let mut queue = std::mem::take(&mut self.goto_targets);
-        let mut i = 0;
-        while i < queue.len() {
-            let b = queue[i];
-            i += 1;
+        // A shared block that no path reached still needs a definition: a
+        // jump to a label that is never defined cannot be compiled, and the
+        // reader cannot follow it either.
+        let missing: Vec<BlockId> = self
+            .boundary
+            .iter()
+            .copied()
+            .filter(|b| !self.placed.contains(b))
+            .collect();
+        for b in missing {
             self.expanding.insert(b);
-            let mut nodes = vec![Node::Label(label(b))];
-            nodes.extend(self.region(b, &Region::root()));
+            body.push(Node::Label(label(b)));
+            body.extend(self.region(b, &Region::root()));
             self.expanding.remove(&b);
-            body.extend(nodes);
-            // Emitting the copy can need a label of its own.
-            for t in std::mem::take(&mut self.goto_targets) {
-                if !queue.contains(&t) {
-                    queue.push(t);
-                }
-            }
         }
         body
+    }
+
+    /// Label a shared block the first time control reaches it.
+    ///
+    /// Returns `false` when the block was already emitted, in which case a
+    /// `goto` has been written and the caller must stop walking this path.
+    fn label_once(&mut self, b: BlockId, nodes: &mut Vec<Node>) -> bool {
+        if !self.boundary.contains(&b) || self.expanding.contains(&b) {
+            return true;
+        }
+        if self.placed.contains(&b) {
+            nodes.push(Node::Goto(label(b)));
+            self.unstructured += 1;
+            return false;
+        }
+        nodes.push(Node::Label(label(b)));
+        true
     }
 
     fn region(&mut self, start: BlockId, ctx: &Region) -> Vec<Node> {
@@ -350,14 +365,7 @@ impl<'a> Structurer<'a> {
                 cur = self.structure_loop(b, &mut nodes);
                 continue;
             }
-            if self.boundary.contains(&b) && !self.expanding.contains(&b) {
-                // A shared block: reach it by jumping to the copy that is
-                // emitted under its label at the end of the function.
-                if !self.goto_targets.contains(&b) {
-                    self.goto_targets.push(b);
-                }
-                nodes.push(Node::Goto(label(b)));
-                self.unstructured += 1;
+            if !self.label_once(b, &mut nodes) {
                 break;
             }
             if !self.placed.insert(b) {
@@ -469,6 +477,9 @@ impl<'a> Structurer<'a> {
     /// recomputes the loop condition on every iteration, so hoisting them out
     /// would be wrong, not merely ugly.
     fn structure_loop(&mut self, header: BlockId, nodes: &mut Vec<Node>) -> Option<BlockId> {
+        if !self.label_once(header, nodes) {
+            return None;
+        }
         if !self.placed.insert(header) {
             // The loop header was already emitted. The jump needs a target
             // like any other, so the header goes on the list of blocks that
@@ -969,6 +980,87 @@ mod tests {
         assert_eq!(g.ipdom[2], Some(3));
         assert_eq!(g.ipdom[3], None, "3 returns; nothing post-dominates it");
         assert_eq!(g.idom[3], 0);
+    }
+
+    /// The classic irreducible shape: `1` and `3` form a cycle with two
+    /// entries, from `0` directly and through `2`.
+    ///
+    /// ```text
+    ///   0 -> 1, 2
+    ///   1 -> 3
+    ///   2 -> 3
+    ///   3 -> 1, 4
+    /// ```
+    ///
+    /// `1` has two predecessors and one of them is inside the cycle, so no
+    /// single header dominates the loop and the structure has to name blocks.
+    fn irreducible() -> Vec<Block> {
+        vec![
+            marked(
+                0,
+                Term::Branch {
+                    cond: Expr::Var("c".into()),
+                    then_bb: Some(1),
+                    else_bb: Some(2),
+                },
+            ),
+            marked(1, Term::Jump(3)),
+            marked(2, Term::Jump(3)),
+            marked(
+                3,
+                Term::Branch {
+                    cond: Expr::Var("d".into()),
+                    then_bb: Some(1),
+                    else_bb: Some(4),
+                },
+            ),
+            marked(4, Term::Ret(None)),
+        ]
+    }
+
+    #[test]
+    fn a_shared_block_is_labelled_where_it_is_not_copied_at_the_end() {
+        // The copy used to be emitted after the body, and the copy of a block
+        // that jumps to itself read `L1: goto L1` — a spin loop the original
+        // code did not have. Labelling the block where it already sits costs
+        // one label and no duplicate.
+        let blocks = irreducible();
+        let (g, _) = graph(&blocks, 0);
+        let mut s = Structurer::new(&blocks, &g);
+        let body = s.run(0);
+        let mut seen = Vec::new();
+        flatten(&body, &mut seen);
+
+        let labels: Vec<&String> = seen
+            .iter()
+            .filter(|n| n.starts_with("label:"))
+            .collect();
+        for l in &labels {
+            assert_eq!(
+                labels.iter().filter(|x| *x == l).count(),
+                1,
+                "{l} is defined once: {seen:?}"
+            );
+        }
+        for (i, n) in seen.iter().enumerate() {
+            if let Some(l) = n.strip_prefix("label:") {
+                let next = seen.get(i + 1).map(String::as_str);
+                assert_ne!(
+                    next,
+                    Some(format!("goto:{l}").as_str()),
+                    "{l} jumps to itself, which is a loop the code did not have: {seen:?}"
+                );
+            }
+        }
+        // Every jump has somewhere to land.
+        for n in &seen {
+            if let Some(l) = n.strip_prefix("goto:") {
+                assert!(
+                    seen.iter().any(|x| x == &format!("label:{l}")),
+                    "goto {l} has no label: {seen:?}"
+                );
+            }
+        }
     }
 
     #[test]
