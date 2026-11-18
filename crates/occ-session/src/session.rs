@@ -397,6 +397,37 @@ impl Session {
         inner.images.get(&id).cloned()
     }
 
+    /// Give functions in one image new names.
+    ///
+    /// The analysis is shared behind an `Arc`; a handle that is still alive
+    /// blocks the write. That is reported rather than silently skipped,
+    /// because a caller who asked for names and got a success would read the
+    /// image again and find the old ones.
+    pub fn rename_functions(
+        &self,
+        id: u32,
+        renames: &[(Addr, String)],
+    ) -> Result<usize, String> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| "session lock is poisoned".to_string())?;
+        let Some(slot) = inner.images.get_mut(&id) else {
+            return Err(format!("no image {id} is open"));
+        };
+        let Some(file) = Arc::get_mut(slot) else {
+            return Err("the image is still borrowed; retry the rename".into());
+        };
+        let mut n = 0;
+        for (addr, name) in renames {
+            if let Some(f) = file.analysis.functions.iter_mut().find(|f| f.entry == *addr) {
+                f.name = Some(name.clone());
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// Ids of all loaded images.
     pub fn image_ids(&self) -> Vec<u32> {
         self.inner

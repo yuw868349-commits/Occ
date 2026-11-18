@@ -12,6 +12,7 @@ name = "occ"
 path = "src/main.rs"
 
 [dependencies]
+occ-bin.workspace = true
 occ-core.workspace = true
 occ-analyze.workspace = true
 occ-session.workspace = true

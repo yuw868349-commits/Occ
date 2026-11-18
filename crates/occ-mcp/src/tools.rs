@@ -81,7 +81,7 @@ macro_rules! tool {
     };
 }
 
-static TOOLS: [ToolDef; 38] = [
+static TOOLS: [ToolDef; 39] = [
     tool!(
         "session.info",
         "List open images and their ids, plus hypotheses and notes. Call this first when continuing a conversation to see what state exists.",
@@ -165,6 +165,12 @@ static TOOLS: [ToolDef; 38] = [
         "Compiler, source language, linkage model, runtime and packer suspicion, each with the evidence behind it.",
         r#"{"type":"object","properties":{"image":{"type":"integer"}},"additionalProperties":false}"#,
         binary_fingerprint
+    ),
+    tool!(
+        "binary.signatures",
+        "Learn function signatures from an image that still has symbols, then name the same code in a stripped one. A signature is the function's first bytes plus a mask; names are never given to a function that already has one, and a tie between two signatures names nothing.",
+        r#"{"type":"object","properties":{"action":{"type":"string","description":"learn from a binary, or apply a .sig file"},"source":{"type":"string","description":"binary to learn from, or .sig file to apply"},"save":{"type":"string","description":"write the learned database here"},"image":{"type":"integer","description":"image to name, defaults to the only open one"},"apply_now":{"type":"boolean","description":"apply what was just learned, default true when one image is open"}},"required":["action","source"],"additionalProperties":false}"#,
+        binary_signatures
     ),
     tool!(
         "code.functions",
@@ -796,6 +802,87 @@ fn binary_hexdump(session: &Session, args: &Args) -> Result<Value, String> {
         .field("bytes_len", Value::from(len))
         .field("hex", hexdump(bytes, at, width))
         .build())
+}
+
+fn binary_signatures(session: &Session, args: &Args) -> Result<Value, String> {
+    let action = args.req_str("action")?;
+    let source = args.req_str("source")?;
+    let (db, learned) = match action {
+        "learn" => {
+            let data = std::fs::read(source).map_err(|e| format!("{source}: {e}"))?;
+            let image = occ_bin::load(&data, source, occ_core::ImageId(0))
+                .map_err(|e| format!("{source}: {e}"))?;
+            let view = occ_analyze::View::new(&image, &data);
+            let db =
+                occ_analyze::sig::SignatureDb::learn(&image, &view, occ_analyze::sig::DEFAULT_LEN);
+            if let Some(path) = args.opt_str("save") {
+                std::fs::write(path, db.to_text()).map_err(|e| format!("{path}: {e}"))?;
+            }
+            (db, true)
+        }
+        "apply" => {
+            let text = std::fs::read_to_string(source).map_err(|e| format!("{source}: {e}"))?;
+            (occ_analyze::sig::SignatureDb::parse(&text)?, false)
+        }
+        other => return Err(format!("unknown action `{other}`; accepted: learn, apply")),
+    };
+
+    if !args.bool_or("apply_now", true)? {
+        return Ok(Envelope::ok(format!(
+            "{} signature(s) {}",
+            db.len(),
+            if learned { "learned" } else { "loaded" }
+        ))
+        .field("signatures", Value::from(db.len()))
+        .field("source", Value::from(source))
+        .build());
+    }
+
+    let id = args.image(session)?;
+    let file = args.file(session)?;
+    let view = occ_analyze::View::new(&file.image, &file.data);
+    let applied = db.match_all(&file.analysis, &view);
+    drop(file);
+    let renamed = session.rename_functions(id, &applied.renames)?;
+
+    let collisions: Vec<Value> = applied
+        .collisions
+        .iter()
+        .take(32)
+        .map(|c| {
+            obj!(
+                "entry" => addr(c.entry),
+                "names" => Value::Array(c.names.iter().cloned().map(Value::String).collect()),
+            )
+        })
+        .collect();
+    let mut e = Envelope::ok(format!(
+        "{} signature(s) {} · named {renamed} of {} function(s), {} left unnamed",
+        db.len(),
+        if learned { "learned" } else { "loaded" },
+        applied.named + applied.collisions.len(),
+        applied.collisions.len()
+    ))
+    .handle(Handle::image(id).to_string())
+    .field("signatures", Value::from(db.len()))
+    .field("source", Value::from(source))
+    .field("named", Value::from(renamed))
+    .field("unnamed_collisions", Value::from(applied.collisions.len()))
+    .field("collisions", Value::Array(collisions))
+    .next(vec![
+        format!("code.functions with image={id} to read the recovered names"),
+        "binary.signatures action=learn source=<unstripped build> save=lib.sig".into(),
+    ]);
+    if let Some(path) = args.opt_str("save") {
+        e = e.field("saved", Value::from(path));
+    }
+    if !applied.collisions.is_empty() {
+        e = e.caveats(vec![format!(
+            "{} function(s) matched two signatures of the same length and were left as they were",
+            applied.collisions.len()
+        )]);
+    }
+    Ok(e.build())
 }
 
 fn binary_entropy(session: &Session, args: &Args) -> Result<Value, String> {

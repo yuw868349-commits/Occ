@@ -26,6 +26,7 @@ pub mod disasm;
 pub mod entropy;
 pub mod fingerprint;
 pub mod jumptable;
+pub mod sig;
 pub mod strings;
 pub mod view;
 pub mod xref;

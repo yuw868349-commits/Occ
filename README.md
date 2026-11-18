@@ -138,6 +138,7 @@ Thirty-eight, in seven groups. The names carry the intent.
 | `binary.strings` | ASCII and UTF-16 strings with addresses, addressable as `str:<addr>`. |
 | `binary.hexdump` | Hex and ASCII, up to 4096 bytes. |
 | `binary.entropy` | Per-section entropy or a sliding window, with the threshold used. |
+| `binary.signatures` | Learn function signatures from a build that still has symbols, then name the same code stripped. |
 | `binary.fingerprint` | Compiler, language, linkage, runtime, packer suspicion, each with its evidence. |
 
 **Code — what it does**
@@ -483,6 +484,43 @@ jump      0x134e in     0x1330 via rax   7 cases  (the table was recovered: 7 ca
 
 The same numbers are behind `code.indirect`, so the pass is available over MCP
 without leaving the session.
+
+## Naming library code in a stripped image
+
+A stripped static executable is mostly a library, and every name in it is
+gone. `binary.signatures` learns signatures from a build that still has
+symbols and applies them to the same code stripped.
+
+A signature is a function's first 32 bytes plus a mask, one flag per byte.
+Learning records those bytes as they are; a mask entry says whether a byte has
+to match, so a call displacement or a RIP-relative address that the linker
+chose differently on a second build does not have to. The file format is text,
+because a signature is a claim about code and a reader should be able to see
+what it claims:
+
+```
+# occ signatures v1
+# name	bytes-hex	mask-bits
+memcpy	488b0511b709004885c0	11111111111111111111
+```
+
+Three rules make the answer safe to act on:
+
+- **A function that already has a name is never renamed.** The symbol table
+  wins over a byte pattern, every time.
+- **Two signatures of equal length that both match name nothing.** The
+  collision is reported with both names, because a wrong name is worse than
+  `sub_4f3a20`: the reader stops looking.
+- **A signature never matches a prefix it did not compare in full.** There is
+  no partial credit and no fuzzy score.
+
+Sixteen bytes was not enough. A static link holds hundreds of bodies that open
+with the same `endbr64; push r15; push r14` and diverge later; a sixteen-byte
+prefix produced 468 collisions against 580 names, which is a database that
+names almost nothing it could not also have named wrongly. Thirty-two bytes
+fixed it. On a static `-O1` build of a fifty-line program, learning from the
+unstripped binary and applying to the stripped one named 953 of 1044 functions,
+and every name it placed agreed with the symbol table it was checked against.
 
 ## Fuzzing the boundary
 
