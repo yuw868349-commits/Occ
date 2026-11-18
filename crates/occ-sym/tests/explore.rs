@@ -81,6 +81,7 @@ fn a_straight_line_function_returns_its_expression() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &ExecConfig::default(),
     );
     assert_eq!(report.paths.len(), 1, "no branches, so one path");
@@ -110,6 +111,7 @@ fn a_two_way_branch_yields_two_paths_with_solved_inputs() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &ExecConfig::default(),
     );
     assert_eq!(report.paths.len(), 2, "one path per arm");
@@ -155,6 +157,7 @@ fn an_unsatisfiable_edge_is_not_reported_as_a_path() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &ExecConfig::default(),
     );
     assert_eq!(report.paths.len(), 2);
@@ -180,6 +183,7 @@ fn concrete_mode_names_the_input_it_still_needs() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &cfg,
     );
     assert_eq!(report.paths.len(), 1);
@@ -198,6 +202,7 @@ fn concrete_mode_names_the_input_it_still_needs() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &cfg,
     );
     match &report.paths[0].outcome {
@@ -229,6 +234,7 @@ fn a_loop_is_unrolled_until_the_bound_and_says_so() {
         &Options::default(),
         &|a| format!("sub_{:x}", a.get()),
         &no_static,
+        &[],
         &cfg,
     );
     assert!(report.paths.len() > 1, "the loop has an exit and iterations");
@@ -323,4 +329,87 @@ fn nothing_is_tainted_when_nothing_is_a_source() {
     );
     assert!(report.flows.is_empty());
     assert!(!report.notes.is_empty(), "an empty result is explained");
+}
+
+#[test]
+fn a_call_with_a_known_body_is_interpreted() {
+    // 1000: call 1010          ; e8 0b 00 00 00
+    // 1005: cmp  eax, 0xa      ; 83 f8 0a
+    // 1008: jne  100f          ; 75 05
+    // 100a: mov  eax, 1        ; b8 01 00 00 00
+    // 100f: ret                ; c3
+    // 1010: lea  rax, [rdi+rdi]; 48 8d 04 3f
+    // 1014: ret                ; c3
+    const CODE: &[u8] = &[
+        0xe8, 0x0b, 0x00, 0x00, 0x00, 0x83, 0xf8, 0x0a, 0x75, 0x05, 0xb8, 0x01, 0x00, 0x00, 0x00,
+        0xc3, 0x48, 0x8d, 0x04, 0x3f, 0xc3,
+    ];
+    let image = image_with_code(CODE);
+    let view = View::new(&image, CODE);
+    let rec = recover(
+        &view,
+        &RecoverOptions {
+            max_functions: 16,
+            max_insns: 4096,
+            follow_calls: true,
+            ..RecoverOptions::default()
+        },
+    );
+    let caller = rec
+        .functions
+        .iter()
+        .find(|f| f.entry == Addr(0x1000))
+        .expect("caller");
+    // The callee doubled the argument, so `rdi = 5` makes `eax` ten and the
+    // branch falls through. Without interpreting the call, `eax` is unknown
+    // and both arms are explored.
+    let cfg = ExecConfig {
+        mode: Mode::Concrete,
+        inputs: vec![("rdi".into(), 5)],
+        ..ExecConfig::default()
+    };
+    let report = explore(
+        &image,
+        caller,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &rec.functions,
+        &cfg,
+    );
+    assert_eq!(
+        report.paths.len(),
+        1,
+        "the callee decides the branch: {:#?}",
+        report.paths
+    );
+    assert_eq!(report.paths[0].ret.as_deref(), Some("0x1"));
+    assert!(
+        report.notes.iter().any(|n| n.contains("interpreted")),
+        "the run says it interpreted a call: {:?}",
+        report.notes
+    );
+}
+
+#[test]
+fn a_recursive_call_is_not_interpreted() {
+    // 1000: call 1000 ; e8 fb ff ff ff
+    // 1005: ret       ; c3
+    const CODE: &[u8] = &[0xe8, 0xfb, 0xff, 0xff, 0xff, 0xc3];
+    let image = image_with_code(CODE);
+    let func = function_at_entry(&image, CODE);
+    let report = explore(
+        &image,
+        &func,
+        &Options::default(),
+        &|a| format!("sub_{:x}", a.get()),
+        &no_static,
+        &[func.clone()],
+        &ExecConfig::default(),
+    );
+    assert!(
+        report.notes.iter().any(|n| n.contains("recursive")),
+        "recursion is named rather than followed: {:?}",
+        report.notes
+    );
 }

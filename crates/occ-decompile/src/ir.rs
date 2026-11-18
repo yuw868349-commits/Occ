@@ -2435,6 +2435,12 @@ pub enum Stmt {
         ret: Option<String>,
         /// Address of the call instruction.
         addr: Addr,
+        /// Callee, when the instruction names one directly.
+        ///
+        /// `addr` is where the call is, not where it goes: a symbolic
+        /// executor that wants to run the callee needs the target, and
+        /// recovering it from the printed name would be a guess.
+        target: Option<Addr>,
     },
     /// Side-effecting operation the lifter keeps as a comment.
     Comment(String),

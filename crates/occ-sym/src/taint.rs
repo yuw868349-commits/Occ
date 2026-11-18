@@ -419,6 +419,7 @@ fn transfer(
                 args,
                 ret,
                 addr,
+                ..
             } => {
                 let mut joined = Labels::new();
                 for (i, a) in args.iter().enumerate() {

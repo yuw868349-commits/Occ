@@ -549,6 +549,10 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_call(&mut self, insn: &Instruction, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let direct = match insn.target {
+            Some(occ_core::CallTarget::Direct { to }) => Some(to),
+            _ => None,
+        };
         let name = match insn.target {
             Some(occ_core::CallTarget::Direct { to }) => (self.core.name_of)(to),
             _ => match ops.last() {
@@ -565,6 +569,7 @@ impl<'a> Lifter<'a> {
             args,
             ret: Some(self.core.name(self.core.target.ret_reg())),
             addr: insn.addr,
+            target: direct,
         });
         self.core.written.clear();
         self.core.written.insert(self.core.target.ret_reg());

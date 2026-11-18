@@ -1190,6 +1190,7 @@ fn code_explore(session: &Session, args: &Args) -> Result<Value, String> {
         },
         &name_of,
         &read_static,
+        &file.analysis.functions,
         &cfg,
     );
 

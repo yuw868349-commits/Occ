@@ -55,6 +55,18 @@ pub struct Config {
     pub memory: Vec<(Addr, Vec<u8>)>,
     /// Unknown-input policy.
     pub mode: Mode,
+    /// How deep calls may be interpreted.
+    ///
+    /// Zero keeps every call opaque: its result is an unconstrained value
+    /// named after the callee. A positive depth lets the explorer run the
+    /// callee when its body is available, which is what turns `if (len(buf))`
+    /// into a concrete answer for a known `buf`.
+    pub max_call_depth: usize,
+    /// Largest callee, in instructions, that is interpreted.
+    ///
+    /// Interpreting a large function costs far more than it explains, and the
+    /// step budget is better spent on the function the caller asked about.
+    pub max_callee_insns: usize,
 }
 
 impl Default for Config {
@@ -68,6 +80,8 @@ impl Default for Config {
             inputs: Vec::new(),
             memory: Vec::new(),
             mode: Mode::Symbolic,
+            max_call_depth: 2,
+            max_callee_insns: 400,
         }
     }
 }
@@ -75,6 +89,14 @@ impl Default for Config {
 /// Reads initialised bytes from the image's loadable data, for addresses the
 /// executor did not write itself. `None` means the address is not file-backed.
 pub type StaticRead<'a> = &'a dyn Fn(Addr, u8) -> Option<u64>;
+
+/// What interpreting a call produced.
+enum CallResult {
+    /// The callee returned this value.
+    Value(Value),
+    /// The callee returned nothing; the caller sees no value.
+    Void,
+}
 
 /// Call a path made, in order.
 #[derive(Clone, Debug)]
@@ -207,6 +229,22 @@ struct Runner<'a> {
     program: Program,
     cfg: Config,
     read_static: StaticRead<'a>,
+    /// The image being explored, for lifting a callee on demand.
+    image: &'a Image,
+    /// Options the caller's program was built with; a callee needs the same.
+    opts: &'a Options,
+    /// How a call target prints.
+    name_of: &'a dyn Fn(Addr) -> String,
+    /// Functions whose bodies may be interpreted.
+    functions: &'a [Function],
+    /// Lifted callees, by entry address. A callee called twice is lifted once.
+    callees: HashMap<Addr, Option<std::rc::Rc<Program>>>,
+    /// Calls currently being interpreted, outermost first.
+    active: Vec<Addr>,
+    /// Numbers of interpreted calls, for the run report.
+    interpreted: usize,
+    /// Callees that could not be interpreted, and why, once each.
+    call_notes: Vec<String>,
     notes: Vec<String>,
     paths: Vec<Path>,
     steps: usize,
@@ -219,8 +257,9 @@ pub fn explore<'a>(
     image: &Image,
     func: &Function,
     opts: &Options,
-    name_of: &dyn Fn(Addr) -> String,
+    name_of: &'a dyn Fn(Addr) -> String,
     read_static: StaticRead<'a>,
+    functions: &'a [Function],
     cfg: &Config,
 ) -> Report {
     let program = build_program(image, func, opts, name_of);
@@ -232,6 +271,14 @@ pub fn explore<'a>(
         notes: Vec::new(),
         paths: Vec::new(),
         read_static,
+        image,
+        opts,
+        name_of,
+        functions,
+        callees: HashMap::new(),
+        active: Vec::new(),
+        interpreted: 0,
+        call_notes: Vec::new(),
         cfg: cfg.clone(),
         program,
     };
@@ -276,6 +323,13 @@ impl Runner<'_> {
             }
             self.run_path(state, &mut work);
         }
+        if self.interpreted > 0 {
+            self.notes.push(format!(
+                "{} call(s) were interpreted rather than left unknown",
+                self.interpreted
+            ));
+        }
+        self.notes.append(&mut self.call_notes.clone());
         self.notes.push(format!(
             "{} block execution(s), {} path(s), {} state(s) dropped",
             self.steps,
@@ -503,6 +557,7 @@ impl Runner<'_> {
                 args,
                 ret,
                 addr,
+                target,
             } => {
                 let mut values = Vec::with_capacity(args.len());
                 for a in args {
@@ -514,16 +569,28 @@ impl Runner<'_> {
                 state.calls.push(CallInfo {
                     name: name.clone(),
                     addr: *addr,
-                    args: values,
+                    args: values.clone(),
                 });
+                // A call whose body is available and small enough is run
+                // rather than approximated: the caller's next branch usually
+                // asks what the callee returned, and answering it is the
+                // difference between two paths and a fork on an unknown.
                 if let Some(dest) = ret {
-                    // The callee is not interpreted, so its result is an
-                    // unconstrained value. Naming it after the call keeps the
-                    // printed form readable and the origin obvious.
-                    state.env.insert(
-                        dest.clone(),
-                        Value::Sym(Expr::Unknown(format!("{name}()"))),
-                    );
+                    let interpreted = match target {
+                        Some(callee) => self.call_into(*callee, &values, state),
+                        None => None,
+                    };
+                    let value = match interpreted {
+                        Some(CallResult::Value(v)) => v,
+                        _ => {
+                            // The callee is not interpreted, so its result is
+                            // an unconstrained value. Naming it after the call
+                            // keeps the printed form readable and the origin
+                            // obvious.
+                            Value::Sym(Expr::Unknown(format!("{name}()")))
+                        }
+                    };
+                    state.env.insert(dest.clone(), value);
                 }
             }
             Stmt::Comment(_) => {}
@@ -718,6 +785,139 @@ impl Runner<'_> {
                 .collect(),
             calls: state.calls.clone(),
             ret: None,
+        }
+    }
+
+    /// Interpret a call, when the callee's body is available.
+    ///
+    /// The callee runs on a copy of the caller's memory — a callee that
+    /// writes through a pointer its caller passed must not silently rewrite
+    /// the caller's model of that memory — and the result is the value on its
+    /// only feasible path. A callee with a branch that cannot be decided, a
+    /// loop, or a call it cannot interpret is given up on: the caller keeps
+    /// an unconstrained result rather than a guess.
+    fn call_into(&mut self, target: Addr, args: &[Expr], caller: &mut State) -> Option<CallResult> {
+        if self.cfg.max_call_depth == 0 || self.active.len() >= self.cfg.max_call_depth {
+            return None;
+        }
+        if self.active.contains(&target) {
+            self.note_call(target, "recursive, so its result stays unconstrained");
+            return None;
+        }
+        let callee = self.functions.iter().find(|f| f.entry == target)?;
+        if callee.insns.len() > self.cfg.max_callee_insns {
+            self.note_call(
+                target,
+                &format!(
+                    "{} instructions, past the {} this explorer interprets",
+                    callee.insns.len(),
+                    self.cfg.max_callee_insns
+                ),
+            );
+            return None;
+        }
+        let program = match self.callees.get(&target) {
+            Some(Some(p)) => p.clone(),
+            Some(None) => return None,
+            None => {
+                let lifted = std::rc::Rc::new(build_program(
+                    self.image, callee, self.opts, self.name_of,
+                ));
+                self.callees.insert(target, Some(lifted.clone()));
+                lifted
+            }
+        };
+        if program.blocks.is_empty() {
+            self.callees.insert(target, None);
+            return None;
+        }
+        let mut state = State::new(program.entry);
+        state.mem = caller.mem.clone();
+        // Arguments bind to the ABI registers the callee reads. The lifter
+        // names them `a0`.. in the signature, but the body refers to the
+        // registers, which is what the environment is keyed by.
+        //
+        // The call statement lists only the registers this block wrote, so a
+        // function that passes an argument it never touched — `call strlen`
+        // right after entry, with the pointer still in `rdi` — has an empty
+        // argument list. In that case the caller's live value for the
+        // register is the argument.
+        for (i, reg) in program.param_regs.iter().enumerate() {
+            let value = args
+                .get(i)
+                .map(|e| Value::expr(e.clone()))
+                .or_else(|| caller.env.get(reg).cloned());
+            if let Some(v) = value {
+                state.env.insert(reg.clone(), v);
+            }
+        }
+        self.active.push(target);
+        let result = self.run_callee(&program, &mut state);
+        self.active.pop();
+        match result {
+            Some(r) => {
+                self.interpreted += 1;
+                Some(r)
+            }
+            None => {
+                self.note_call(target, "its body did not reduce to one path");
+                None
+            }
+        }
+    }
+
+    /// Run a callee's lifted body to its return, or give up.
+    fn run_callee(&mut self, program: &Program, state: &mut State) -> Option<CallResult> {
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > self.cfg.max_steps {
+                return None;
+            }
+            if state.block >= program.blocks.len() {
+                return None;
+            }
+            let block = program.blocks[state.block].clone();
+            for stmt in &block.stmts {
+                self.stmt(state, stmt);
+                if !state.missing.is_empty() {
+                    return None;
+                }
+            }
+            match &block.term {
+                Term::Ret(value) => {
+                    return Some(match value {
+                        Some(e) => {
+                            let v = self.eval(e, state);
+                            CallResult::Value(v)
+                        }
+                        None => CallResult::Void,
+                    });
+                }
+                Term::Jump(t) => state.block = *t,
+                Term::Branch {
+                    cond,
+                    then_bb,
+                    else_bb,
+                } => {
+                    let value = self.eval(cond, state);
+                    match value.truth() {
+                        Some(true) => state.block = (*then_bb)?,
+                        Some(false) => state.block = (*else_bb)?,
+                        None => return None,
+                    }
+                }
+                // A switch, a computed jump or a hole is not one path.
+                _ => return None,
+            }
+        }
+    }
+
+    /// Record why one callee was not interpreted, once.
+    fn note_call(&mut self, target: Addr, why: &str) {
+        let text = format!("{}: {}", (self.name_of)(target), why);
+        if !self.call_notes.contains(&text) {
+            self.call_notes.push(text);
         }
     }
 

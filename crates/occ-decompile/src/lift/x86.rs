@@ -2260,6 +2260,7 @@ impl<'a> Lifter<'a> {
             args,
             ret: None,
             addr,
+            target: None,
         });
         self.core
             .write(&Operand::Reg(Reg::full(RAX, 8)), Expr::Unknown("syscall".into()), stmts);
@@ -2337,6 +2338,10 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_call(&mut self, insn: &Instruction, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let direct = match insn.target {
+            Some(occ_core::CallTarget::Direct { to }) => Some(to),
+            _ => None,
+        };
         let name = match insn.target {
             Some(occ_core::CallTarget::Direct { to }) => (self.core.name_of)(to),
             _ => match ops.first() {
@@ -2358,6 +2363,7 @@ impl<'a> Lifter<'a> {
                 args,
                 ret: Some("rax".into()),
                 addr: insn.addr,
+                target: direct,
             });
             // Caller-saved registers are dead after the call; carrying them
             // forward made every later call inherit the previous call's
@@ -2377,6 +2383,7 @@ impl<'a> Lifter<'a> {
                 args,
                 ret: None,
                 addr: insn.addr,
+                target: direct,
             });
         }
     }
@@ -3679,6 +3686,7 @@ impl<'a> Lifter<'a> {
                         args: vec![destination, source, count.clone()],
                         ret: None,
                         addr,
+                        target: None,
                     });
                     self.core.assign("rsi", add_to("rsi", count.clone()), stmts);
                     self.core.assign("rdi", add_to("rdi", count), stmts);
@@ -3728,6 +3736,7 @@ impl<'a> Lifter<'a> {
                             count.clone(),
                         ],
                         ret: None,
+                        target: None,
                         addr,
                     });
                     self.core.assign("rdi", add_to("rdi", count), stmts);

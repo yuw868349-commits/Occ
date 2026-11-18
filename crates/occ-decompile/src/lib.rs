@@ -388,6 +388,7 @@ pub fn build_program(
                                     args: lifter.call_args(),
                                     ret: None,
                                     addr: insn.addr,
+                                    target: Some(to),
                                 });
                                 Term::Unreachable
                             } else {
@@ -397,6 +398,7 @@ pub fn build_program(
                                     args: lifter.call_args(),
                                     ret: Some(ret.clone()),
                                     addr: insn.addr,
+                                    target: Some(to),
                                 });
                                 forwards_call_result = true;
                                 Term::Ret(Some(Expr::var(ret)))

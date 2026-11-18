@@ -224,6 +224,7 @@ fn every_architecture_answers_the_same_way() {
                 &occ_decompile::Options::default(),
                 &name_of,
                 &read_static,
+                &loaded.analysis.functions,
                 &cfg,
             );
             let returned: Vec<String> = report
@@ -263,6 +264,7 @@ fn every_architecture_explores_every_path() {
             &occ_decompile::Options::default(),
             &name_of,
             &read_static,
+            &loaded.analysis.functions,
             &ExecConfig::default(),
         );
         let feasible = report.paths.iter().filter(|p| p.is_feasible()).count();

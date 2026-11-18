@@ -539,6 +539,7 @@ mod tests {
                         args: vec![Expr::var("rdi")],
                         ret: None,
                         addr: Addr(0x1004),
+                        target: None,
                     },
                 ],
                 term: crate::ir::Term::Ret(None),

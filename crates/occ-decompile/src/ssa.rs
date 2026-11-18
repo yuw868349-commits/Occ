@@ -203,6 +203,7 @@ impl Builder<'_> {
                     args,
                     ret,
                     addr,
+                    target,
                 } => {
                     let name = self.rename_in_name(b, &name);
                     let args = args.iter().map(|a| self.rewrite(a, b)).collect();
@@ -221,6 +222,7 @@ impl Builder<'_> {
                         args,
                         ret,
                         addr,
+                        target,
                     });
                 }
                 Stmt::Comment(c) => out.push(Stmt::Comment(c)),
