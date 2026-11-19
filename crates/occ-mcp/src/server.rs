@@ -67,7 +67,9 @@ fn dispatch(session: &Session, method: &str, params: &Value) -> Result<Value, (i
         }
         other => Err((
             code::METHOD_NOT_FOUND,
-            format!("unknown method {other:?}; supported: initialize, ping, tools/list, tools/call"),
+            format!(
+                "unknown method {other:?}; supported: initialize, ping, tools/list, tools/call"
+            ),
         )),
     }
 }
@@ -96,8 +98,8 @@ fn initialize(params: &Value) -> Value {
             "title" => "occ — binary reverse engineering for AI clients",
         ),
         "instructions" => "Handle-first binary analysis. Call binary.open once, then address everything by handle \
-(fn:0x401000, str:0x402000, insn:0x401004). Responses carry a `handle` you can reuse and a `next` \
-list of follow-ups. Conclusions include evidence and a confidence value; heuristics are labelled.",
+    (fn:0x401000, str:0x402000, insn:0x401004). Responses carry a `handle` you can reuse and a `next` \
+    list of follow-ups. Conclusions include evidence and a confidence value; heuristics are labelled.",
     )
 }
 
@@ -112,10 +114,7 @@ fn call_tool(session: &Session, params: &Value) -> Result<Value, (i32, String)> 
     ))?;
     let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
     if !matches!(arguments, Value::Object(_) | Value::Null) {
-        return Err((
-            code::INVALID_PARAMS,
-            "`arguments` must be an object".into(),
-        ));
+        return Err((code::INVALID_PARAMS, "`arguments` must be an object".into()));
     }
     let args = Args::new(&arguments);
     match (def.handler)(session, &args) {
@@ -269,7 +268,10 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#,
         );
         let v = r.get("result").unwrap();
-        assert_eq!(v.get("protocolVersion").unwrap().as_str(), Some("2024-11-05"));
+        assert_eq!(
+            v.get("protocolVersion").unwrap().as_str(),
+            Some("2024-11-05")
+        );
         assert!(v.get("capabilities").is_some());
     }
 
@@ -295,7 +297,11 @@ mod tests {
             .as_array()
             .unwrap();
         assert!(tools.len() > 10);
-        assert!(tools.iter().any(|t| t.get("name").and_then(|n| n.as_str()) == Some("binary.open")));
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.get("name").and_then(|n| n.as_str()) == Some("binary.open"))
+        );
     }
 
     #[test]
@@ -313,6 +319,12 @@ mod tests {
     #[test]
     fn notifications_produce_no_response() {
         let s = Session::new();
-        assert!(handle(&s, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
+        assert!(
+            handle(
+                &s,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+            )
+            .is_none()
+        );
     }
 }

@@ -6,7 +6,9 @@
 //! test.
 
 use occ_analyze::{RecoverOptions, View, recover};
-use occ_core::{Addr, Arch, Endian, Fingerprint, Format, Image, ImageId, Perm, Section, SectionKind};
+use occ_core::{
+    Addr, Arch, Endian, Fingerprint, Format, Image, ImageId, Perm, Section, SectionKind,
+};
 use occ_decompile::Options;
 use occ_sym::{ExecConfig, Mode, Outcome, Source, TaintConfig, Verdict, explore, trace};
 
@@ -23,6 +25,7 @@ fn image_with_code(code: &[u8]) -> Image {
         file_size: code.len() as u64,
         sha256: String::new(),
         segments: Vec::new(),
+        resources: Vec::new(),
         sections: vec![Section {
             index: 1,
             name: ".text".into(),
@@ -118,11 +121,7 @@ fn a_two_way_branch_yields_two_paths_with_solved_inputs() {
         &ExecConfig::default(),
     );
     assert_eq!(report.paths.len(), 2, "one path per arm");
-    let mut returns: Vec<String> = report
-        .paths
-        .iter()
-        .filter_map(|p| p.ret.clone())
-        .collect();
+    let mut returns: Vec<String> = report.paths.iter().filter_map(|p| p.ret.clone()).collect();
     returns.sort();
     assert_eq!(returns, vec!["rdi".to_string(), "rsi".to_string()]);
 
@@ -240,7 +239,10 @@ fn a_loop_is_unrolled_until_the_bound_and_says_so() {
         &[],
         &cfg,
     );
-    assert!(report.paths.len() > 1, "the loop has an exit and iterations");
+    assert!(
+        report.paths.len() > 1,
+        "the loop has an exit and iterations"
+    );
     let truncated = report
         .paths
         .iter()

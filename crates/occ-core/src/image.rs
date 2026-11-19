@@ -702,7 +702,9 @@ pub struct ArmModes {
 impl ArmModes {
     /// An empty set of regions.
     pub const fn new() -> Self {
-        ArmModes { regions: Vec::new() }
+        ArmModes {
+            regions: Vec::new(),
+        }
     }
 
     /// Record that `mode` begins at `addr`.
@@ -710,9 +712,7 @@ impl ArmModes {
     /// The regions are kept in address order, so a region inserted out of
     /// order still ends up where it belongs.
     pub fn push(&mut self, addr: Addr, mode: ArmMode) {
-        let at = self
-            .regions
-            .partition_point(|&(a, _)| a < addr);
+        let at = self.regions.partition_point(|&(a, _)| a < addr);
         self.regions.insert(at, (addr, mode));
     }
 
@@ -739,6 +739,161 @@ impl ArmModes {
     /// The regions, in address order.
     pub fn regions(&self) -> &[(Addr, ArmMode)] {
         &self.regions
+    }
+}
+
+/// What a PE resource directory entry names, by type.
+///
+/// The numeric ids are the values the loader uses; the variants for the
+/// standard types exist so callers do not have to know them. A resource may
+/// also be named by a string instead of an id, which is why the name is kept
+/// as [`ResourceName`] rather than a bare integer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// RT_CURSOR.
+    Cursor,
+    /// RT_BITMAP.
+    Bitmap,
+    /// RT_ICON.
+    Icon,
+    /// RT_MENU.
+    Menu,
+    /// RT_DIALOG, including Borland's extended templates.
+    Dialog,
+    /// RT_STRING: one bundle of sixteen strings per resource.
+    StringTable,
+    /// RT_FONTDIR.
+    FontDir,
+    /// RT_FONT.
+    Font,
+    /// RT_ACCELERATOR.
+    Accelerator,
+    /// RT_RCDATA, the container Borland uses for forms.
+    RcData,
+    /// RT_MESSAGE_TABLE.
+    MessageTable,
+    /// RT_GROUP_CURSOR.
+    GroupCursor,
+    /// RT_GROUP_ICON.
+    GroupIcon,
+    /// RT_VERSION.
+    VersionInfo,
+    /// RT_HTML.
+    Html,
+    /// RT_MANIFEST.
+    Manifest,
+    /// A type this table does not know.
+    Other(u32),
+}
+
+impl ResourceKind {
+    /// Classification of a numeric resource type.
+    pub const fn from_id(id: u32) -> Self {
+        match id {
+            1 => ResourceKind::Cursor,
+            2 => ResourceKind::Bitmap,
+            3 => ResourceKind::Icon,
+            4 => ResourceKind::Menu,
+            5 => ResourceKind::Dialog,
+            6 => ResourceKind::StringTable,
+            7 => ResourceKind::FontDir,
+            8 => ResourceKind::Font,
+            9 => ResourceKind::Accelerator,
+            10 => ResourceKind::RcData,
+            11 => ResourceKind::MessageTable,
+            12 => ResourceKind::GroupCursor,
+            14 => ResourceKind::GroupIcon,
+            16 => ResourceKind::VersionInfo,
+            23 => ResourceKind::Html,
+            24 => ResourceKind::Manifest,
+            other => ResourceKind::Other(other),
+        }
+    }
+
+    /// Lower-case label used in output.
+    pub fn label(&self) -> String {
+        match self {
+            ResourceKind::Cursor => "cursor".into(),
+            ResourceKind::Bitmap => "bitmap".into(),
+            ResourceKind::Icon => "icon".into(),
+            ResourceKind::Menu => "menu".into(),
+            ResourceKind::Dialog => "dialog".into(),
+            ResourceKind::StringTable => "string-table".into(),
+            ResourceKind::FontDir => "font-dir".into(),
+            ResourceKind::Font => "font".into(),
+            ResourceKind::Accelerator => "accelerator".into(),
+            ResourceKind::RcData => "rcdata".into(),
+            ResourceKind::MessageTable => "message-table".into(),
+            ResourceKind::GroupCursor => "group-cursor".into(),
+            ResourceKind::GroupIcon => "group-icon".into(),
+            ResourceKind::VersionInfo => "version".into(),
+            ResourceKind::Html => "html".into(),
+            ResourceKind::Manifest => "manifest".into(),
+            ResourceKind::Other(id) => format!("type-{id}"),
+        }
+    }
+
+    /// True when the payload is a string table bundle.
+    pub fn is_string_table(&self) -> bool {
+        matches!(self, ResourceKind::StringTable)
+    }
+
+    /// True when the payload is a dialog template.
+    pub fn is_dialog(&self) -> bool {
+        matches!(self, ResourceKind::Dialog)
+    }
+}
+
+/// The name of a resource: an integer id, or a string the container stores.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceName {
+    /// Numeric id, as `MAKEINTRESOURCE` uses it.
+    Id(u32),
+    /// A named resource, UTF-16 in the file and UTF-8 here.
+    String(String),
+}
+
+impl fmt::Display for ResourceName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResourceName::Id(id) => write!(f, "{id}"),
+            ResourceName::String(s) => write!(f, "{s:?}"),
+        }
+    }
+}
+
+/// One leaf of a PE resource tree.
+///
+/// The resource directory is a three-level tree — type, name, language —
+/// and only the leaves carry bytes. Flattening it loses nothing that a
+/// caller needs: every leaf records all three coordinates.
+#[derive(Debug, Clone)]
+pub struct Resource {
+    /// Resource type (`RT_*`, or an arbitrary id).
+    pub kind: ResourceKind,
+    /// Raw type id, kept because `Other` still has a number.
+    pub type_id: u32,
+    /// Name or id within the type.
+    pub name: ResourceName,
+    /// Language id (`0` is neutral).
+    pub language: u32,
+    /// Where the bytes are once the image is mapped.
+    pub addr: Addr,
+    /// Payload size in bytes.
+    pub size: u64,
+    /// Code page stated by the directory entry, when one is.
+    pub code_page: u32,
+}
+
+impl Resource {
+    /// True when this leaf is a dialog template.
+    pub fn is_dialog(&self) -> bool {
+        self.kind.is_dialog()
+    }
+
+    /// True when this leaf is a string-table bundle.
+    pub fn is_string_table(&self) -> bool {
+        self.kind.is_string_table()
     }
 }
 
@@ -769,6 +924,8 @@ pub struct Image {
     pub segments: Vec<Segment>,
     /// Sections.
     pub sections: Vec<Section>,
+    /// PE resource leaves, flattened from the type/name/language tree.
+    pub resources: Vec<Resource>,
     /// Symbols, in container order.
     pub symbols: Vec<Symbol>,
     /// Imports.
@@ -1057,6 +1214,7 @@ mod tests {
                     perm: Perm::of(true, false, true),
                 },
             ],
+            resources: Vec::new(),
             sections: vec![Section {
                 index: 1,
                 name: ".text".into(),

@@ -4,7 +4,6 @@
 //! the handles stable across requests, and turns analysis results into the
 //! envelope every tool returns.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 

@@ -17,8 +17,8 @@
 use crate::reader::Reader;
 use occ_core::{
     Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
-    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind,
-    Segment, Symbol, SymbolBinding, SymbolKind,
+    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Resource, ResourceKind, ResourceName,
+    Result, Section, SectionKind, Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 /// `IMAGE_FILE_DLL`: the image is a library, not a program.
@@ -29,6 +29,7 @@ const PE32_PLUS_MAGIC: u16 = 0x20b;
 // Data directory indices.
 const DIR_EXPORT: usize = 0;
 const DIR_IMPORT: usize = 1;
+const DIR_RESOURCE: usize = 2;
 const DIR_EXCEPTION: usize = 3;
 const DIR_BASERELOC: usize = 5;
 
@@ -112,6 +113,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     let mut imports = read_imports(&r, &l, data, &mut warnings);
     let exports = read_exports(&r, &l, data, &mut warnings);
     let relocations = read_relocations(&r, &l, data);
+    let resources = read_resources(&r, &l, data, &mut warnings);
     let rich = check_rich_header(data, &mut warnings);
 
     // Bind import slots to the IAT entries their descriptors name.
@@ -175,6 +177,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         sha256: crate::sha256::hex_digest(data),
         segments,
         sections,
+        resources,
         symbols,
         imports,
         exports,
@@ -730,6 +733,174 @@ fn map_machine(machine: u16) -> Arch {
 ///
 /// An object has no optional header, no base address and no imports: it is a
 /// bag of sections plus a symbol table that a linker will resolve later.
+/// Read the PE resource directory into a flat list.
+///
+/// The tree is fixed-depth — type, name, language — but nothing in the
+/// format enforces that, so the walk tracks its own depth, refuses cycles,
+/// and stops at a leaf. Offsets inside the directory are relative to the
+/// directory's own base, not to the image, which is the detail that makes a
+/// hand-written parser read the section header as an entry.
+fn read_resources(
+    r: &Reader<'_>,
+    l: &Layout,
+    data: &[u8],
+    warnings: &mut Vec<String>,
+) -> Vec<Resource> {
+    let Some(&(rva, size)) = l.dirs.get(DIR_RESOURCE) else {
+        return Vec::new();
+    };
+    if rva == 0 || size == 0 {
+        return Vec::new();
+    }
+    let Some(base) = rva_to_offset(l, rva) else {
+        warnings.push(format!(
+            "resource directory RVA {rva:#x} maps to no file bytes"
+        ));
+        return Vec::new();
+    };
+    let limit = size as usize;
+    if base + limit > data.len() {
+        // A declared size past EOF is common in packed files; the entries that
+        // are inside the file are still readable, so clamp and continue.
+        warnings.push(format!(
+            "resource directory claims {size} bytes but only {} are in the file",
+            data.len().saturating_sub(base)
+        ));
+    }
+    let end = (base + limit).min(data.len());
+    let mut out = Vec::new();
+    let mut stack = vec![(0usize, 0u8, 0u32, None::<ResourceName>, 0u32)];
+    let mut visited = std::collections::BTreeSet::new();
+    while let Some((rel, depth, type_id, name, language)) = stack.pop() {
+        let off = base.saturating_add(rel);
+        if off + 16 > end || !visited.insert((rel, depth)) {
+            continue;
+        }
+        let named = r.u16(off + 12).unwrap_or(0) as usize;
+        let ids = r.u16(off + 14).unwrap_or(0) as usize;
+        let count = match named.checked_add(ids) {
+            Some(n) if n <= 4096 => n,
+            _ => {
+                warnings.push(format!(
+                    "resource directory at {rel:#x} claims {named}+{ids} entries"
+                ));
+                continue;
+            }
+        };
+        for i in 0..count {
+            let entry = off + 16 + i * 8;
+            if entry + 8 > end {
+                break;
+            }
+            let name_field = r.u32(entry).unwrap_or(0);
+            let offset_field = r.u32(entry + 4).unwrap_or(0);
+            let child_name = if name_field & 0x8000_0000 != 0 {
+                read_resource_name(r, base, end, (name_field & 0x7fff_ffff) as usize)
+            } else {
+                ResourceName::Id(name_field)
+            };
+            let is_dir = offset_field & 0x8000_0000 != 0;
+            let child = (offset_field & 0x7fff_ffff) as usize;
+            if depth < 2 {
+                if !is_dir {
+                    // A leaf before the language level means the language was
+                    // omitted; record it as neutral rather than dropping the
+                    // payload.
+                    if depth == 1 {
+                        let kind = ResourceKind::from_id(type_id);
+                        if let Some((addr, size, code_page)) =
+                            read_resource_data(r, l, base, end, child)
+                        {
+                            out.push(Resource {
+                                kind,
+                                type_id,
+                                name: name.clone().unwrap_or(child_name),
+                                language: 0,
+                                addr,
+                                size,
+                                code_page,
+                            });
+                        }
+                    }
+                    continue;
+                }
+                let (next_type, next_name, next_lang) = match depth {
+                    0 => {
+                        let id = match &child_name {
+                            ResourceName::Id(id) => *id,
+                            ResourceName::String(_) => 0,
+                        };
+                        (id, None, 0)
+                    }
+                    1 => (type_id, Some(child_name), 0),
+                    _ => (type_id, name.clone(), 0),
+                };
+                stack.push((child, depth + 1, next_type, next_name, next_lang));
+            } else if is_dir {
+                // A directory at the language level is malformed; skip rather
+                // than recurse forever on a cycle.
+                continue;
+            } else {
+                let lang = match &child_name {
+                    ResourceName::Id(id) => *id,
+                    ResourceName::String(_) => 0,
+                };
+                let kind = ResourceKind::from_id(type_id);
+                if let Some((addr, size, code_page)) = read_resource_data(r, l, base, end, child) {
+                    out.push(Resource {
+                        kind,
+                        type_id,
+                        name: name.clone().unwrap_or(ResourceName::Id(0)),
+                        language: if language != 0 { language } else { lang },
+                        addr,
+                        size,
+                        code_page,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read a UTF-16 resource name at `rel` (relative to the directory base).
+fn read_resource_name(r: &Reader<'_>, base: usize, end: usize, rel: usize) -> ResourceName {
+    let off = base.saturating_add(rel);
+    if off + 2 > end {
+        return ResourceName::String(String::new());
+    }
+    let len = r.u16(off).unwrap_or(0) as usize;
+    let chars = off + 2;
+    if chars + len * 2 > end {
+        return ResourceName::String(String::new());
+    }
+    let mut s = String::with_capacity(len);
+    for i in 0..len {
+        let c = r.u16(chars + i * 2).unwrap_or(0);
+        s.push(char::from_u32(u32::from(c)).unwrap_or('\u{fffd}'));
+    }
+    ResourceName::String(s)
+}
+
+/// Read one IMAGE_RESOURCE_DATA_ENTRY and turn its RVA into a mapped address.
+fn read_resource_data(
+    r: &Reader<'_>,
+    l: &Layout,
+    base: usize,
+    end: usize,
+    rel: usize,
+) -> Option<(Addr, u64, u32)> {
+    let off = base.checked_add(rel)?;
+    if off + 16 > end {
+        return None;
+    }
+    let data_rva = r.u32(off).ok()?;
+    let size = u64::from(r.u32(off + 4).ok()?);
+    let code_page = r.u32(off + 8).unwrap_or(0);
+    Some((Addr(l.image_base + u64::from(data_rva)), size, code_page))
+}
+
+/// Parse a raw COFF object file (not an image).
 pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     if data.len() < 20 {
         return Err(CoreError::Malformed {
@@ -818,9 +989,7 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
             // `Value` is an offset into the section named by `SectionNumber`,
             // never an address: an object is linked at an unknown base.
             let addr = if secnum > 0 {
-                let base = sections
-                    .get((secnum - 1) as usize)
-                    .map_or(0, |s| s.addr.0);
+                let base = sections.get((secnum - 1) as usize).map_or(0, |s| s.addr.0);
                 Addr(base.wrapping_add(u64::from(value)))
             } else {
                 Addr::NULL
@@ -872,6 +1041,7 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         sha256: crate::sha256::hex_digest(data),
         segments: Vec::new(),
         sections,
+        resources: Vec::new(),
         symbols,
         imports: Vec::new(),
         exports: Vec::new(),

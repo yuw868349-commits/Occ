@@ -121,11 +121,7 @@ impl Num {
     /// The symbol this value hangs off, when it hangs off one.
     pub fn symbol(&self) -> Option<(&str, i64, i64)> {
         match self {
-            Num::Sym {
-                name,
-                scale,
-                bias,
-            } => Some((name.as_str(), *scale, *bias)),
+            Num::Sym { name, scale, bias } => Some((name.as_str(), *scale, *bias)),
             _ => None,
         }
     }
@@ -343,14 +339,7 @@ impl Num {
     /// is not a symbol at all.
     fn symbol_add(&self, other: &Num, sign: i64) -> Option<Num> {
         match (self, other) {
-            (
-                Num::Sym {
-                    name,
-                    scale,
-                    bias,
-                },
-                Num::Exact(set),
-            ) if set.len() == 1 => {
+            (Num::Sym { name, scale, bias }, Num::Exact(set)) if set.len() == 1 => {
                 let k = *set.iter().next()?;
                 Some(Num::Sym {
                     name: name.clone(),
@@ -358,14 +347,7 @@ impl Num {
                     bias: bias.wrapping_add(sign.wrapping_mul(k)),
                 })
             }
-            (
-                Num::Exact(set),
-                Num::Sym {
-                    name,
-                    scale,
-                    bias,
-                },
-            ) if set.len() == 1 && sign > 0 => {
+            (Num::Exact(set), Num::Sym { name, scale, bias }) if set.len() == 1 && sign > 0 => {
                 let k = *set.iter().next()?;
                 Some(Num::Sym {
                     name: name.clone(),
@@ -579,8 +561,12 @@ impl Value {
                 at: *aa,
                 off: ao.join(bo),
             },
-            (Value::Stack { off: a }, Value::Stack { off: b }) if a == b => Value::Stack { off: *a },
-            (Value::Heap { site: a }, Value::Heap { site: b }) if a == b => Value::Heap { site: *a },
+            (Value::Stack { off: a }, Value::Stack { off: b }) if a == b => {
+                Value::Stack { off: *a }
+            }
+            (Value::Heap { site: a }, Value::Heap { site: b }) if a == b => {
+                Value::Heap { site: *a }
+            }
             (
                 Value::Table {
                     base: ab,
@@ -714,7 +700,10 @@ mod tests {
         // analysis name every member of it.
         let run = set(&[0, 4, 8]);
         assert_eq!(run.listed(), Some(vec![0, 4, 8]));
-        assert_eq!(run.add(&Num::one(0x1000)).listed(), Some(vec![0x1000, 0x1004, 0x1008]));
+        assert_eq!(
+            run.add(&Num::one(0x1000)).listed(),
+            Some(vec![0x1000, 0x1004, 0x1008])
+        );
     }
 
     #[test]
@@ -817,7 +806,10 @@ mod tests {
 
     #[test]
     fn truncation_keeps_the_low_bits_and_the_sign() {
-        assert_eq!(Num::one(0x1234_5678).truncate(16, false).single(), Some(0x5678));
+        assert_eq!(
+            Num::one(0x1234_5678).truncate(16, false).single(),
+            Some(0x5678)
+        );
         assert_eq!(Num::one(0xffff).truncate(8, true).single(), Some(-1));
     }
 
@@ -852,6 +844,9 @@ mod tests {
             panic!("still a table");
         };
         assert_eq!(base, 0x5000);
-        assert_eq!(entries.iter().copied().collect::<Vec<_>>(), vec![0x1010, 0x1020]);
+        assert_eq!(
+            entries.iter().copied().collect::<Vec<_>>(),
+            vec![0x1010, 0x1020]
+        );
     }
 }

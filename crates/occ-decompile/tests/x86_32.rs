@@ -24,8 +24,7 @@ struct Loaded {
 fn load() -> Loaded {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/fixture.x86-32.o");
-    let mut data =
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let image = occ_bin::load(&data, &path.display().to_string(), occ_core::ImageId(0))
         .expect("the fixture parses");
     assert_eq!(image.arch, occ_core::Arch::X86, "the fixture is 32-bit x86");
@@ -92,7 +91,10 @@ fn a_32_bit_function_is_lifted_rather_than_outlined() {
     // And the width is read from the image, not assumed: a 32-bit function
     // that returns `u64` tells its caller about an upper half that never
     // existed.
-    assert!(!code.contains("u64"), "the word is four bytes wide:\n{code}");
+    assert!(
+        !code.contains("u64"),
+        "the word is four bytes wide:\n{code}"
+    );
     assert!(code.contains("u32 add("), "{code}");
 }
 
@@ -108,7 +110,10 @@ fn both_stack_arguments_become_parameters() {
         vec!["a0".to_string(), "a1".to_string()],
         "{code}"
     );
-    assert!(code.contains("a0 + a1") || code.contains("a1 + a0"), "{code}");
+    assert!(
+        code.contains("a0 + a1") || code.contains("a1 + a0"),
+        "{code}"
+    );
     // A slot name in the body would mean the alias table never saw it.
     assert!(!code.contains("arg_4_u32"), "{code}");
     assert!(!code.contains("local_"), "{code}");

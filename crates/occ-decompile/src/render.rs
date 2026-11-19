@@ -19,13 +19,15 @@ pub fn render(d: &Decompiled) -> String {
         d.params
             .iter()
             .enumerate()
-            .map(|(i, p)| match d.param_types.get(i).and_then(|t| t.as_deref()) {
-                // `struct point *p`, not `struct point * p`: the star belongs
-                // to the declarator in C, and the debug info already spaced it.
-                Some(t) if t.ends_with('*') => format!("{t}{p}"),
-                Some(t) => format!("{t} {p}"),
-                None => format!("u64 {p}"),
-            })
+            .map(
+                |(i, p)| match d.param_types.get(i).and_then(|t| t.as_deref()) {
+                    // `struct point *p`, not `struct point * p`: the star belongs
+                    // to the declarator in C, and the debug info already spaced it.
+                    Some(t) if t.ends_with('*') => format!("{t}{p}"),
+                    Some(t) => format!("{t} {p}"),
+                    None => format!("u64 {p}"),
+                },
+            )
             .collect::<Vec<_>>()
             .join(", ")
     };
@@ -116,7 +118,11 @@ impl Renderer {
                 );
                 self.line(&line);
             }
-            Node::Call { name: callee, args, ret } => {
+            Node::Call {
+                name: callee,
+                args,
+                ret,
+            } => {
                 // The arguments go through this renderer's renaming table,
                 // not the free function: an argument that is still an
                 // incoming parameter reads `a0` in the signature and has to
@@ -213,183 +219,178 @@ impl Renderer {
     }
 
     fn fmt_expr(&self, e: &Expr, out: &mut String, min: u8) {
-    let (p, needs) = prec(e);
-    let paren = needs && p < min;
-    if paren {
-        out.push('(');
-    }
-    match e {
-        Expr::Const(v) => {
-            if *v < 10 {
-                let _ = write!(out, "{v}");
-            } else {
-                let _ = write!(out, "{v:#x}");
-            }
+        let (p, needs) = prec(e);
+        let paren = needs && p < min;
+        if paren {
+            out.push('(');
         }
-        Expr::Var(v) => out.push_str(&self.aliases.var_name(v)),
-        Expr::Member { base, name, .. } => {
-            // The debug info named the aggregate and the member, so the load
-            // reads as the access the source wrote. A base that is not a bare
-            // variable keeps its parentheses: `(a + b)->x` is still clear,
-            // `a + b->x` would not be.
-            let compound = !matches!(base.as_ref(), Expr::Var(_));
-            if compound {
-                out.push('(');
-            }
-            self.fmt_expr(base, out, 0);
-            if compound {
-                out.push(')');
-            }
-            let _ = write!(out, "->{name}");
-        }
-        Expr::Load { addr, size, signed } => {
-            let _ = write!(out, "*({}*)", type_name(*size, *signed));
-            self.fmt_expr(addr, out, 7);
-        }
-        Expr::Bin { op, lhs, rhs, bits } => {
-            if let Some(name) = op.float_name(*bits) {
-                // The same spelling as the expression's own: a floating-point
-                // operation is a call, because its operands are bit patterns.
-                let _ = write!(out, "{name}(");
-                self.fmt_expr(lhs, out, 0);
-                if op.float_arity() == 2 {
-                    out.push_str(", ");
-                    self.fmt_expr(rhs, out, 0);
-                }
-                out.push(')');
-            } else {
-                self.fmt_expr(lhs, out, op.precedence());
-                let _ = write!(out, " {} ", op.symbol());
-                self.fmt_expr(rhs, out, op.precedence() + 1);
-            }
-        }
-        Expr::Un { op, arg, .. } => {
-            out.push_str(match op {
-                crate::ir::UnOp::Neg => "-",
-                crate::ir::UnOp::Not => "~",
-                crate::ir::UnOp::LNot => "!",
-            });
-            self.fmt_expr(arg, out, 6);
-        }
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            bits,
-        } => {
-            // The width decides how the operands are read, and the output
-            // has to say so: the same 32 bits are a negative number and a
-            // large positive one, and a branch that asks "below" asks one
-            // of them.
-            let lhs = crate::ir::comparison_operand(lhs, *bits);
-            let rhs = crate::ir::comparison_operand(rhs, *bits);
-            if *bits < 8 {
-                let ty = type_name(*bits, op.signed());
-                // A constant is the value it is, whatever the width.
-                if matches!(lhs, Expr::Const(_)) {
-                    self.fmt_expr(lhs, out, 7);
+        match e {
+            Expr::Const(v) => {
+                if *v < 10 {
+                    let _ = write!(out, "{v}");
                 } else {
-                    let _ = write!(out, "({ty})");
-                    self.fmt_expr(lhs, out, 7);
-                }
-                let _ = write!(out, " {} ", op.symbol());
-                if matches!(rhs, Expr::Const(_)) {
-                    self.fmt_expr(rhs, out, 7);
-                } else {
-                    let _ = write!(out, "({ty})");
-                    self.fmt_expr(rhs, out, 7);
-                }
-            } else {
-                self.fmt_expr(lhs, out, 1);
-                let _ = write!(out, " {} ", op.symbol());
-                self.fmt_expr(rhs, out, 1);
-            }
-        }
-        Expr::Bool { op, args } => {
-            if *op == crate::ir::BoolOp::Not {
-                out.push('!');
-                self.fmt_expr(&args[0], out, 6);
-            } else {
-                self.fmt_expr(&args[0], out, op.precedence());
-                let _ = write!(out, " {} ", op.symbol());
-                self.fmt_expr(&args[1], out, op.precedence() + 1);
-            }
-        }
-        Expr::FlagCond { cond, state, .. } => {
-            // The condition on the flags is a question about the flags, and
-            // the flags answer it with the values they hold.
-            match state.condition(*cond) {
-                Some(e) => self.fmt_expr(&e, out, min),
-                None => {
-                    let _ = write!(out, "<flags>");
+                    let _ = write!(out, "{v:#x}");
                 }
             }
-        }
-        Expr::Cast {
-            kind,
-            arg,
-            from,
-            to,
-        } => {
-            // Zero-extension to the machine width is the default reading of any
-            // 32-bit value here, so it adds nothing.
-            if *kind == crate::ir::CastKind::Zext && *to == 8 {
-                self.fmt_expr(arg, out, min);
-                if paren {
+            Expr::Var(v) => out.push_str(&self.aliases.var_name(v)),
+            Expr::Member { base, name, .. } => {
+                // The debug info named the aggregate and the member, so the load
+                // reads as the access the source wrote. A base that is not a bare
+                // variable keeps its parentheses: `(a + b)->x` is still clear,
+                // `a + b->x` would not be.
+                let compound = !matches!(base.as_ref(), Expr::Var(_));
+                if compound {
+                    out.push('(');
+                }
+                self.fmt_expr(base, out, 0);
+                if compound {
                     out.push(')');
                 }
-                return;
+                let _ = write!(out, "->{name}");
             }
-            // A cast that does not change the width says nothing.
-            if from == to {
-                self.fmt_expr(arg, out, min);
-                if paren {
+            Expr::Load { addr, size, signed } => {
+                let _ = write!(out, "*({}*)", type_name(*size, *signed));
+                self.fmt_expr(addr, out, 7);
+            }
+            Expr::Bin { op, lhs, rhs, bits } => {
+                if let Some(name) = op.float_name(*bits) {
+                    // The same spelling as the expression's own: a floating-point
+                    // operation is a call, because its operands are bit patterns.
+                    let _ = write!(out, "{name}(");
+                    self.fmt_expr(lhs, out, 0);
+                    if op.float_arity() == 2 {
+                        out.push_str(", ");
+                        self.fmt_expr(rhs, out, 0);
+                    }
                     out.push(')');
+                } else {
+                    self.fmt_expr(lhs, out, op.precedence());
+                    let _ = write!(out, " {} ", op.symbol());
+                    self.fmt_expr(rhs, out, op.precedence() + 1);
                 }
-                return;
             }
-            let _ = write!(
-                out,
-                "({})",
-                type_name(*to, *kind == crate::ir::CastKind::Sext)
-            );
-            self.fmt_expr(arg, out, 7);
-        }
-        Expr::Select { cond, yes, no } => {
-            self.fmt_expr(cond, out, 1);
-            out.push_str(" ? ");
-            self.fmt_expr(yes, out, 0);
-            out.push_str(" : ");
-            self.fmt_expr(no, out, 0);
-        }
-        Expr::Phi(args) => {
-            out.push_str("phi(");
-            for (i, (bb, v)) in args.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
+            Expr::Un { op, arg, .. } => {
+                out.push_str(match op {
+                    crate::ir::UnOp::Neg => "-",
+                    crate::ir::UnOp::Not => "~",
+                    crate::ir::UnOp::LNot => "!",
+                });
+                self.fmt_expr(arg, out, 6);
+            }
+            Expr::Cond { op, lhs, rhs, bits } => {
+                // The width decides how the operands are read, and the output
+                // has to say so: the same 32 bits are a negative number and a
+                // large positive one, and a branch that asks "below" asks one
+                // of them.
+                let lhs = crate::ir::comparison_operand(lhs, *bits);
+                let rhs = crate::ir::comparison_operand(rhs, *bits);
+                if *bits < 8 {
+                    let ty = type_name(*bits, op.signed());
+                    // A constant is the value it is, whatever the width.
+                    if matches!(lhs, Expr::Const(_)) {
+                        self.fmt_expr(lhs, out, 7);
+                    } else {
+                        let _ = write!(out, "({ty})");
+                        self.fmt_expr(lhs, out, 7);
+                    }
+                    let _ = write!(out, " {} ", op.symbol());
+                    if matches!(rhs, Expr::Const(_)) {
+                        self.fmt_expr(rhs, out, 7);
+                    } else {
+                        let _ = write!(out, "({ty})");
+                        self.fmt_expr(rhs, out, 7);
+                    }
+                } else {
+                    self.fmt_expr(lhs, out, 1);
+                    let _ = write!(out, " {} ", op.symbol());
+                    self.fmt_expr(rhs, out, 1);
                 }
-                let _ = write!(out, "L{bb}: ");
-                self.fmt_expr(v, out, 0);
             }
+            Expr::Bool { op, args } => {
+                if *op == crate::ir::BoolOp::Not {
+                    out.push('!');
+                    self.fmt_expr(&args[0], out, 6);
+                } else {
+                    self.fmt_expr(&args[0], out, op.precedence());
+                    let _ = write!(out, " {} ", op.symbol());
+                    self.fmt_expr(&args[1], out, op.precedence() + 1);
+                }
+            }
+            Expr::FlagCond { cond, state, .. } => {
+                // The condition on the flags is a question about the flags, and
+                // the flags answer it with the values they hold.
+                match state.condition(*cond) {
+                    Some(e) => self.fmt_expr(&e, out, min),
+                    None => {
+                        let _ = write!(out, "<flags>");
+                    }
+                }
+            }
+            Expr::Cast {
+                kind,
+                arg,
+                from,
+                to,
+            } => {
+                // Zero-extension to the machine width is the default reading of any
+                // 32-bit value here, so it adds nothing.
+                if *kind == crate::ir::CastKind::Zext && *to == 8 {
+                    self.fmt_expr(arg, out, min);
+                    if paren {
+                        out.push(')');
+                    }
+                    return;
+                }
+                // A cast that does not change the width says nothing.
+                if from == to {
+                    self.fmt_expr(arg, out, min);
+                    if paren {
+                        out.push(')');
+                    }
+                    return;
+                }
+                let _ = write!(
+                    out,
+                    "({})",
+                    type_name(*to, *kind == crate::ir::CastKind::Sext)
+                );
+                self.fmt_expr(arg, out, 7);
+            }
+            Expr::Select { cond, yes, no } => {
+                self.fmt_expr(cond, out, 1);
+                out.push_str(" ? ");
+                self.fmt_expr(yes, out, 0);
+                out.push_str(" : ");
+                self.fmt_expr(no, out, 0);
+            }
+            Expr::Phi(args) => {
+                out.push_str("phi(");
+                for (i, (bb, v)) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = write!(out, "L{bb}: ");
+                    self.fmt_expr(v, out, 0);
+                }
+                out.push(')');
+            }
+            Expr::Intrinsic { op, args, bits } => {
+                let _ = write!(out, "{}(", op.name_for(*bits));
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    self.fmt_expr(a, out, 0);
+                }
+                out.push(')');
+            }
+            Expr::Unknown(t) => {
+                let _ = write!(out, "<{t}>");
+            }
+        }
+        if paren {
             out.push(')');
         }
-        Expr::Intrinsic { op, args, bits } => {
-            let _ = write!(out, "{}(", op.name_for(*bits));
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
-                }
-                self.fmt_expr(a, out, 0);
-            }
-            out.push(')');
-        }
-        Expr::Unknown(t) => {
-            let _ = write!(out, "<{t}>");
-        }
-    }
-    if paren {
-        out.push(')');
-    }
     }
 }
 
@@ -421,7 +422,9 @@ pub fn expr(e: &Expr) -> String {
     let r = Renderer {
         out: String::new(),
         indent: 0,
-        aliases: Aliases { map: HashMap::new() },
+        aliases: Aliases {
+            map: HashMap::new(),
+        },
         last_call: None,
     };
     r.fmt_expr(e, &mut out, 0);
@@ -498,7 +501,6 @@ fn prec(e: &Expr) -> (u8, bool) {
         _ => (9, false),
     }
 }
-
 
 /// Render a whole program: one function per entry, in the order given.
 pub fn render_all(items: &[Decompiled]) -> String {

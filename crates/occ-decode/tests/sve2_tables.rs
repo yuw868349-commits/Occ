@@ -549,5 +549,10 @@ fn every_case_matches_the_reference() {
     for (word, want, got) in &bad {
         eprintln!("{word:08x}\n  want {want:?}\n  got  {got:?}");
     }
-    assert!(bad.is_empty(), "{} of {} cases differ", bad.len(), CASES.len());
+    assert!(
+        bad.is_empty(),
+        "{} of {} cases differ",
+        bad.len(),
+        CASES.len()
+    );
 }

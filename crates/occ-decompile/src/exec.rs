@@ -170,10 +170,7 @@ impl Machine {
                 self.load(a, *size, *signed)
             }
             Expr::Member {
-                base,
-                offset,
-                size,
-                ..
+                base, offset, size, ..
             } => {
                 let a = self.eval(base)?.wrapping_add(*offset);
                 self.load(a, *size, false)
@@ -345,9 +342,7 @@ impl Machine {
                     u64::from(v.trailing_zeros().min(width))
                 }
             }
-            Intrinsic::Popcnt => {
-                u64::from((vals.first().copied().unwrap_or(0) & m).count_ones())
-            }
+            Intrinsic::Popcnt => u64::from((vals.first().copied().unwrap_or(0) & m).count_ones()),
             Intrinsic::CopySign => {
                 // The magnitude of the first operand with the sign of the
                 // second: every bit but the top one comes from the first,
@@ -653,13 +648,11 @@ impl Machine {
                         }
                     }
                 }
-                Term::Switch {
-                    index, targets, ..
-                } => {
+                Term::Switch { index, targets, .. } => {
                     let i = self.eval(index)? as usize;
-                    at = *targets
-                        .get(i)
-                        .ok_or_else(|| Fault::Unsupported(format!("switch index {i} out of range")))?;
+                    at = *targets.get(i).ok_or_else(|| {
+                        Fault::Unsupported(format!("switch index {i} out of range"))
+                    })?;
                 }
                 Term::Ret(v) => {
                     let value = match v {
@@ -742,11 +735,19 @@ fn bin(op: BinOp, a: u64, b: u64, bits: u8) -> Result<u64, Fault> {
             // is responsible for the processor's own masking of the count,
             // because that rule differs between architectures.
             let n = b as u32;
-            if n >= u32::from(bits) * 8 { 0 } else { (a << n) & m }
+            if n >= u32::from(bits) * 8 {
+                0
+            } else {
+                (a << n) & m
+            }
         }
         BinOp::Shr => {
             let n = b as u32;
-            if n >= u32::from(bits) * 8 { 0 } else { (a & m) >> n }
+            if n >= u32::from(bits) * 8 {
+                0
+            } else {
+                (a & m) >> n
+            }
         }
         BinOp::Sar => {
             let width = u32::from(bits) * 8;
@@ -758,11 +759,34 @@ fn bin(op: BinOp, a: u64, b: u64, bits: u8) -> Result<u64, Fault> {
             }
         }
         BinOp::Div | BinOp::UDiv | BinOp::Mod | BinOp::UMod => unreachable!("handled by caller"),
-        BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FMin | BinOp::FMax
-        | BinOp::FEq | BinOp::FNe | BinOp::FLt | BinOp::FLe | BinOp::FGt | BinOp::FGe
-        | BinOp::FUnordered | BinOp::I2F32 | BinOp::I2F64 | BinOp::F2I32 | BinOp::F2I64
-        | BinOp::F2F32 | BinOp::F2F64 | BinOp::FSqrt | BinOp::I2F80 | BinOp::FNeg | BinOp::FAbs
-        | BinOp::F2U32 | BinOp::F2U64 | BinOp::FCeil | BinOp::FFloor | BinOp::FRound => {
+        BinOp::FAdd
+        | BinOp::FSub
+        | BinOp::FMul
+        | BinOp::FDiv
+        | BinOp::FMin
+        | BinOp::FMax
+        | BinOp::FEq
+        | BinOp::FNe
+        | BinOp::FLt
+        | BinOp::FLe
+        | BinOp::FGt
+        | BinOp::FGe
+        | BinOp::FUnordered
+        | BinOp::I2F32
+        | BinOp::I2F64
+        | BinOp::F2I32
+        | BinOp::F2I64
+        | BinOp::F2F32
+        | BinOp::F2F64
+        | BinOp::FSqrt
+        | BinOp::I2F80
+        | BinOp::FNeg
+        | BinOp::FAbs
+        | BinOp::F2U32
+        | BinOp::F2U64
+        | BinOp::FCeil
+        | BinOp::FFloor
+        | BinOp::FRound => {
             return float(op, a, b, bits);
         }
     };

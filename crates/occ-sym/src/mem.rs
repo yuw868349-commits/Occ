@@ -13,8 +13,8 @@
 
 use std::collections::BTreeMap;
 
-use occ_decompile::ir::{BinOp, CastKind, sign_extend, truncate};
 use occ_core::Addr;
+use occ_decompile::ir::{BinOp, CastKind, sign_extend, truncate};
 
 use crate::value::Value;
 
@@ -126,14 +126,16 @@ impl Memory {
                     bytes: stored,
                     value,
                 } if *stored == bytes => return Some(narrow(value, bytes, signed)),
-                Cell::Sym { bytes: stored, value } if *stored > bytes => {
+                Cell::Sym {
+                    bytes: stored,
+                    value,
+                } if *stored > bytes => {
                     let cut = Value::cast(CastKind::Trunc, value, *stored, 8);
                     return Some(narrow(&cut, bytes, signed));
                 }
                 Cell::Bytes(data) if data.len() >= usize::from(bytes) => {
                     let mut raw = [0u8; 8];
-                    raw[..usize::from(bytes)]
-                        .copy_from_slice(&data[..usize::from(bytes)]);
+                    raw[..usize::from(bytes)].copy_from_slice(&data[..usize::from(bytes)]);
                     return Some(Value::Const(assemble(raw, bytes, signed)));
                 }
                 _ => {}

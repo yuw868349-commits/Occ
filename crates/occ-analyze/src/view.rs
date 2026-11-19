@@ -111,7 +111,9 @@ impl<'a> View<'a> {
     pub fn bytes_to_end(&self, addr: Addr) -> Option<&'a [u8]> {
         let span = self.span_at(addr)?;
         let delta = (addr.0 - span.start.0) as usize;
-        Some(&self.data[span.file_off + delta..span.file_off + (span.end.0 - span.start.0) as usize])
+        Some(
+            &self.data[span.file_off + delta..span.file_off + (span.end.0 - span.start.0) as usize],
+        )
     }
 
     /// Contents of a section, addressed by file offset rather than by virtual
@@ -191,7 +193,11 @@ impl<'a> View<'a> {
             .position(|b| *b == 0)
             .unwrap_or(bytes.len().min(limit));
         let slice = &bytes[..end];
-        if slice.is_empty() || !slice.iter().all(|b| (0x20..0x7f).contains(b) || *b == b'\t') {
+        if slice.is_empty()
+            || !slice
+                .iter()
+                .all(|b| (0x20..0x7f).contains(b) || *b == b'\t')
+        {
             return None;
         }
         String::from_utf8(slice.to_vec()).ok()
@@ -259,6 +265,7 @@ mod tests {
             sha256: String::new(),
             segments,
             sections,
+            resources: Vec::new(),
             symbols: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
@@ -269,8 +276,8 @@ mod tests {
             warnings: Vec::new(),
             function_bounds: Vec::new(),
             arm_modes: Default::default(),
-        wasm_types: Default::default(),
-        wasm_funcs: Default::default(),
+            wasm_types: Default::default(),
+            wasm_funcs: Default::default(),
         }
     }
 
@@ -282,7 +289,11 @@ mod tests {
             file_offset: off,
             size,
             file_size: size,
-            kind: if exec { SectionKind::Code } else { SectionKind::Data },
+            kind: if exec {
+                SectionKind::Code
+            } else {
+                SectionKind::Data
+            },
             perm: Perm::of(true, !exec, exec),
         }
     }

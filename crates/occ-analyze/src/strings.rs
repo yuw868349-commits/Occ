@@ -201,9 +201,7 @@ fn scan_utf16(bytes: &[u8], base: Addr, section: &str, opts: &Options, out: &mut
                 if chars >= opts.min_len {
                     let text: String = (s..i)
                         .step_by(2)
-                        .map(|k| {
-                            (if le { bytes[k] } else { bytes[k + 1] }) as char
-                        })
+                        .map(|k| (if le { bytes[k] } else { bytes[k + 1] }) as char)
                         .collect();
                     out.push(Found {
                         addr: base.add(s as u64),
@@ -287,7 +285,10 @@ mod tests {
             data[i * 2] = c as u8;
         }
         let found = scan_bytes(&data);
-        let wide: Vec<_> = found.iter().filter(|f| f.encoding == Encoding::Utf16Le).collect();
+        let wide: Vec<_> = found
+            .iter()
+            .filter(|f| f.encoding == Encoding::Utf16Le)
+            .collect();
         assert_eq!(wide.len(), 1, "got {found:?}");
         assert_eq!(wide[0].text, "wide string");
     }

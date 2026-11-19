@@ -315,10 +315,18 @@ fn a32(w: u32, addr: Addr) -> R {
             // address into a condition test.
             if matches!(bits(w, 27, 20), 0x30 | 0x34) {
                 let imm16 = (bits(w, 19, 16) << 12) | bits(w, 11, 0);
-                let name = if bits(w, 27, 20) == 0x30 { "movw" } else { "movt" };
+                let name = if bits(w, 27, 20) == 0x30 {
+                    "movw"
+                } else {
+                    "movt"
+                };
                 return R::new(
                     name,
-                    format!("{name}{suffix} {}, {}", reg(bits(w, 15, 12)), imm(i64::from(imm16))),
+                    format!(
+                        "{name}{suffix} {}, {}",
+                        reg(bits(w, 15, 12)),
+                        imm(i64::from(imm16))
+                    ),
                 );
             }
             // The extra load/store group is `1SH1`, and the two halves of
@@ -341,8 +349,7 @@ fn a32(w: u32, addr: Addr) -> R {
         // Supervisor call.
         _ => {
             let imm = bits(w, 23, 0);
-            R::new("svc", format!("svc{suffix} #{}", hex(u64::from(imm))))
-                .flow(FlowKind::Interrupt)
+            R::new("svc", format!("svc{suffix} #{}", hex(u64::from(imm)))).flow(FlowKind::Interrupt)
         }
     }
 }
@@ -350,8 +357,7 @@ fn a32(w: u32, addr: Addr) -> R {
 /// An undecodable word: still four bytes, still aligned, and the listing says
 /// what class the encoding belongs to rather than inventing a mnemonic.
 fn reserved(w: u32, class: &str) -> R {
-    R::new(".word", format!(".word {} ; {class}", hex(u64::from(w))))
-        .flow(FlowKind::Exception)
+    R::new(".word", format!(".word {} ; {class}", hex(u64::from(w)))).flow(FlowKind::Exception)
 }
 
 fn hex(v: u64) -> String {
@@ -380,24 +386,31 @@ fn dp_name(base: &str, s: bool, suffix: &str, has_s: bool) -> String {
 
 /// True when the second operand is exactly `lr` with no shift.
 fn op2_is_lr(w: u32) -> bool {
-    bits(w, 25, 25) == 0
-        && bits(w, 4, 4) == 0
-        && bits(w, 3, 0) == 14
-        && bits(w, 11, 5) == 0
+    bits(w, 25, 25) == 0 && bits(w, 4, 4) == 0 && bits(w, 3, 0) == 14 && bits(w, 11, 5) == 0
 }
 
 /// The second operand of a data-processing instruction: an immediate, or a
 /// register with an optional shift.
 enum Op2 {
     Imm(u32),
-    Reg { rm: u32, shift: u32, amount: Option<u32>, rs: Option<u32> },
+    Reg {
+        rm: u32,
+        shift: u32,
+        amount: Option<u32>,
+        rs: Option<u32>,
+    },
 }
 
 impl Op2 {
     fn render(&self) -> String {
         match self {
             Op2::Imm(v) => imm(i64::from(*v)),
-            Op2::Reg { rm, shift, amount, rs } => {
+            Op2::Reg {
+                rm,
+                shift,
+                amount,
+                rs,
+            } => {
                 let kind = SHIFTS[*shift as usize];
                 match (amount, rs) {
                     (_, Some(r)) => format!("{}, {kind} {}", reg(*rm), reg(*r)),
@@ -415,7 +428,11 @@ impl Op2 {
 
 /// A shift of zero written as zero means thirty-two for LSR and ASR.
 fn a_or_32(kind: u32, amount: u32) -> u32 {
-    if amount == 0 && (kind == 1 || kind == 2) { 32 } else { amount }
+    if amount == 0 && (kind == 1 || kind == 2) {
+        32
+    } else {
+        amount
+    }
 }
 
 fn operand2(w: u32) -> Op2 {
@@ -515,13 +532,7 @@ fn multiply(w: u32, suffix: &str) -> R {
             let name = dp_name("umaal", s, suffix, true);
             R::new(
                 "umaal",
-                format!(
-                    "{name} {}, {}, {}, {}",
-                    reg(rn),
-                    reg(rd),
-                    reg(rm),
-                    reg(rs)
-                ),
+                format!("{name} {}, {}, {}, {}", reg(rn), reg(rd), reg(rm), reg(rs)),
             )
         }
         0b100 | 0b101 => {
@@ -529,13 +540,7 @@ fn multiply(w: u32, suffix: &str) -> R {
             let name = dp_name(if long { "umlal" } else { "umull" }, s, suffix, true);
             R::new(
                 if long { "umlal" } else { "umull" },
-                format!(
-                    "{name} {}, {}, {}, {}",
-                    reg(rn),
-                    reg(rd),
-                    reg(rm),
-                    reg(rs)
-                ),
+                format!("{name} {}, {}, {}, {}", reg(rn), reg(rd), reg(rm), reg(rs)),
             )
         }
         0b110 | 0b111 => {
@@ -543,13 +548,7 @@ fn multiply(w: u32, suffix: &str) -> R {
             let name = dp_name(if long { "smlal" } else { "smull" }, s, suffix, true);
             R::new(
                 if long { "smlal" } else { "smull" },
-                format!(
-                    "{name} {}, {}, {}, {}",
-                    reg(rn),
-                    reg(rd),
-                    reg(rm),
-                    reg(rs)
-                ),
+                format!("{name} {}, {}, {}, {}", reg(rn), reg(rd), reg(rm), reg(rs)),
             )
         }
         _ => reserved(w, "multiply"),
@@ -703,7 +702,12 @@ fn single_offset(w: u32, rn: u32, addr: Addr) -> Transfer {
         let mut text = if amount == 0 && shift == 0 {
             format!("{sign}{}", reg(rm))
         } else {
-            format!("{sign}{}, {} #{}", reg(rm), SHIFTS[shift as usize], a_or_32(shift, amount))
+            format!(
+                "{sign}{}, {} #{}",
+                reg(rm),
+                SHIFTS[shift as usize],
+                a_or_32(shift, amount)
+            )
         };
         if post {
             // A post-indexed operand is written after the brackets, so the
@@ -712,9 +716,19 @@ fn single_offset(w: u32, rn: u32, addr: Addr) -> Transfer {
             if !u {
                 text.insert(0, '-');
             }
-            return Transfer { text, abs: None, write_back, post };
+            return Transfer {
+                text,
+                abs: None,
+                write_back,
+                post,
+            };
         }
-        return Transfer { text, abs: None, write_back, post };
+        return Transfer {
+            text,
+            abs: None,
+            write_back,
+            post,
+        };
     }
     let off = bits(w, 11, 0);
     let value = if u { i64::from(off) } else { -i64::from(off) };
@@ -727,7 +741,12 @@ fn single_offset(w: u32, rn: u32, addr: Addr) -> Transfer {
     };
     // A zero offset prints nothing: `[r0]` and `[r0, #0]` are one address.
     let text = if off == 0 { String::new() } else { imm(value) };
-    Transfer { text, abs, write_back, post }
+    Transfer {
+        text,
+        abs,
+        write_back,
+        post,
+    }
 }
 
 fn single_transfer(w: u32, suffix: &str, addr: Addr) -> R {
@@ -851,7 +870,12 @@ fn extra_load_store(w: u32, suffix: &str, addr: Addr) -> R {
         // A post-indexed halfword transfer has its offset after the bracket
         // and the bracket holds only the base; the encoding still keeps the
         // pieces in the same fields.
-        text = format!("{name} {}, [{}], {}", reg(rd), reg(rn), imm(if u { i64::from(off) } else { -i64::from(off) }));
+        text = format!(
+            "{name} {}, [{}], {}",
+            reg(rd),
+            reg(rn),
+            imm(if u { i64::from(off) } else { -i64::from(off) })
+        );
     } else if wb {
         text.push('!');
     }
@@ -1097,7 +1121,12 @@ fn t16_shift_add(x: u32) -> R {
             }
             R::new(
                 name,
-                format!("{name} {}, {}, {}", reg(rd), reg(rm), imm(i64::from(amount))),
+                format!(
+                    "{name} {}, {}, {}",
+                    reg(rd),
+                    reg(rm),
+                    imm(i64::from(amount))
+                ),
             )
         }
         _ => {
@@ -1124,7 +1153,12 @@ fn t16_shift_add(x: u32) -> R {
                 let rn = bits(x, 5, 3);
                 R::new(
                     if sub { "sub" } else { "add" },
-                    format!("{name} {}, {}, {}", reg(rd), reg(rn), imm(i64::from(amount))),
+                    format!(
+                        "{name} {}, {}, {}",
+                        reg(rd),
+                        reg(rn),
+                        imm(i64::from(amount))
+                    ),
                 )
             }
         }
@@ -1258,9 +1292,7 @@ fn t16_dp_special(x: u32) -> R {
                 // plain exchange, a set bit at 2 is the security
                 // extension, and the rest are not defined at all.
                 match bits(x, 2, 0) {
-                    0b000 => {
-                        R::new("blx", format!("blx {}", reg(rm))).flow(FlowKind::IndirectCall)
-                    }
+                    0b000 => R::new("blx", format!("blx {}", reg(rm))).flow(FlowKind::IndirectCall),
                     0b100..=0b111 => {
                         R::new("blxns", format!("blxns {}", reg(rm))).flow(FlowKind::IndirectCall)
                     }
@@ -1463,7 +1495,9 @@ fn t16_misc(x: u32, addr: Addr) -> R {
                 let target = t_target(t_pc(addr), amount);
                 let name = if nz { "cbnz" } else { "cbz" };
                 let text = format!("{name} {}, {}", reg(rn), hex(target.get()));
-                return R::new(name, text).flow(FlowKind::ConditionalBranch).to(target);
+                return R::new(name, text)
+                    .flow(FlowKind::ConditionalBranch)
+                    .to(target);
             }
             // The extends.  The operation is the two bits at 6 —
             // signed or unsigned, halfword or byte — the source is the
@@ -1507,7 +1541,9 @@ fn t16_misc(x: u32, addr: Addr) -> R {
                 let amount = i64::from((bits(x, 9, 9) << 5) | bits(x, 7, 3)) * 2;
                 let target = t_target(t_pc(addr), amount);
                 let text = format!("cbnz {}, {}", reg(rn), hex(target.get()));
-                return R::new("cbnz", text).flow(FlowKind::ConditionalBranch).to(target);
+                return R::new("cbnz", text)
+                    .flow(FlowKind::ConditionalBranch)
+                    .to(target);
             }
             // The reverses.  The operation is in the two bits at 6, the
             // source is the three bits at 3, and the destination is the
@@ -1575,10 +1611,7 @@ fn t16_misc(x: u32, addr: Addr) -> R {
 fn t16_system(x: u32) -> R {
     // `10111110`: `bkpt`.  The immediate is the whole of the low byte.
     if bits(x, 15, 8) == 0b1011_1110 {
-        return R::new(
-            "bkpt",
-            format!("bkpt #{}", hex(u64::from(bits(x, 7, 0)))),
-        );
+        return R::new("bkpt", format!("bkpt #{}", hex(u64::from(bits(x, 7, 0)))));
     }
     // `10110110`: the endianness switch and the interrupt masks.
     if bits(x, 15, 8) == 0b1011_0110 {
@@ -1751,8 +1784,7 @@ fn t16_branch(x: u32, addr: Addr) -> R {
         if cond == 0b1111 {
             // `svc`: a supervisor call.
             let amount = i64::from(bits(x, 7, 0));
-            return R::new("svc", format!("svc #{}", hex(amount as u64)))
-                .flow(FlowKind::Call);
+            return R::new("svc", format!("svc #{}", hex(amount as u64))).flow(FlowKind::Call);
         }
         if cond == 0b1110 {
             // The permanently-undefined space.  Two of its 256
@@ -1762,8 +1794,7 @@ fn t16_branch(x: u32, addr: Addr) -> R {
             match bits(x, 7, 0) {
                 0xFE => return R::new("trap", "trap".to_string()).flow(FlowKind::Exception),
                 0xF9 => {
-                    return R::new("__brkdiv0", "__brkdiv0".to_string())
-                        .flow(FlowKind::Exception)
+                    return R::new("__brkdiv0", "__brkdiv0".to_string()).flow(FlowKind::Exception);
                 }
                 _ => {}
             }
@@ -1776,7 +1807,9 @@ fn t16_branch(x: u32, addr: Addr) -> R {
         let target = t_target(t_pc(addr), amount);
         let suffix = CONDS[cond as usize];
         let text = format!("b{suffix} {}", hex(target.get()));
-        return R::new("b", text).flow(FlowKind::ConditionalBranch).to(target);
+        return R::new("b", text)
+            .flow(FlowKind::ConditionalBranch)
+            .to(target);
     }
     t16_undefined(x)
 }
@@ -2029,12 +2062,7 @@ fn t32_dp_reg(hw1: u32, hw2: u32) -> R {
             name.push('s');
         }
         name.push_str(".w");
-        let text = format!(
-            "{name} {}, {}, #{}",
-            reg(rd),
-            reg(rm),
-            shift.amount_out()
-        );
+        let text = format!("{name} {}, {}, #{}", reg(rd), reg(rm), shift.amount_out());
         return R::new(name.trim_end_matches(".w").to_string(), text);
     }
 
@@ -2091,10 +2119,7 @@ fn t32_dp_imm(hw1: u32, hw2: u32) -> R {
     // The move and the negate are the two operations whose first operand
     // is the program counter, and the program counter is not printed.
     let (name, show_rn): (String, bool) = if rn == 15 && op == 2 {
-        (
-            if s { "movs.w" } else { "mov.w" }.to_string(),
-            false,
-        )
+        (if s { "movs.w" } else { "mov.w" }.to_string(), false)
     } else if rn == 15 && op == 3 {
         (if s { "mvns" } else { "mvn" }.to_string(), false)
     } else {
@@ -2152,19 +2177,18 @@ fn t32_wide_imm(hw1: u32, hw2: u32) -> R {
         0b00000 | 0b01010 => {
             let name = if bits(hw1, 8, 4) == 0 { "addw" } else { "subw" };
             let value = (i << 11) | (imm3 << 8) | imm8;
-            let text = format!(
-                "{name} {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                imm(i64::from(value))
-            );
+            let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), imm(i64::from(value)));
             R::new(name, text)
         }
         // The move of a sixteen-bit immediate, in two halves. The top
         // four bits of the value are the register field of the first
         // halfword, which is otherwise unused in this class.
         0b00100 | 0b01100 => {
-            let name = if bits(hw1, 8, 4) == 0b00100 { "movw" } else { "movt" };
+            let name = if bits(hw1, 8, 4) == 0b00100 {
+                "movw"
+            } else {
+                "movt"
+            };
             let value = (rn << 12) | (i << 11) | (imm3 << 8) | imm8;
             let text = format!("{name} {}, {}", reg(rd), imm(i64::from(value)));
             R::new(name, text)
@@ -2176,7 +2200,11 @@ fn t32_wide_imm(hw1: u32, hw2: u32) -> R {
         // three bits above the destination and the two bits below it,
         // and the width is the five bits below those, plus one.
         0b10100 | 0b11100 => {
-            let name = if bits(hw1, 8, 4) == 0b10100 { "sbfx" } else { "ubfx" };
+            let name = if bits(hw1, 8, 4) == 0b10100 {
+                "sbfx"
+            } else {
+                "ubfx"
+            };
             let lsb = (imm3 << 2) | bits(hw2, 7, 6);
             let width = bits(hw2, 4, 0) + 1;
             let text = format!("{name} {}, {}, #{}, #{}", reg(rd), reg(rn), lsb, width);
@@ -2269,7 +2297,13 @@ fn t32_wide_imm(hw1: u32, hw2: u32) -> R {
                 } else {
                     name
                 };
-                format!("{name} {}, #{}, {}, {shift} #{}", reg(rd), sat, reg(rn), amount)
+                format!(
+                    "{name} {}, #{}, {}, {shift} #{}",
+                    reg(rd),
+                    sat,
+                    reg(rn),
+                    amount
+                )
             };
             R::new(name, text)
         }
@@ -2290,11 +2324,7 @@ fn t32_branch_cond(hw1: u32, hw2: u32) -> i64 {
     let s = bits(hw1, 10, 10);
     let j1 = bits(hw2, 13, 13);
     let j2 = bits(hw2, 11, 11);
-    let v = (s << 20)
-        | (j2 << 19)
-        | (j1 << 18)
-        | (bits(hw1, 5, 0) << 12)
-        | (bits(hw2, 10, 0) << 1);
+    let v = (s << 20) | (j2 << 19) | (j1 << 18) | (bits(hw1, 5, 0) << 12) | (bits(hw2, 10, 0) << 1);
     sext(v, 21)
 }
 
@@ -2313,11 +2343,7 @@ fn t32_branch_wide(hw1: u32, hw2: u32) -> i64 {
     let s = bits(hw1, 10, 10);
     let i1 = 1 ^ (bits(hw2, 13, 13) ^ s);
     let i2 = 1 ^ (bits(hw2, 11, 11) ^ s);
-    let v = (s << 24)
-        | (i1 << 23)
-        | (i2 << 22)
-        | (bits(hw1, 9, 0) << 12)
-        | (bits(hw2, 10, 0) << 1);
+    let v = (s << 24) | (i1 << 23) | (i2 << 22) | (bits(hw1, 9, 0) << 12) | (bits(hw2, 10, 0) << 1);
     sext(v, 25)
 }
 
@@ -2333,11 +2359,7 @@ fn t32_branch_call(hw1: u32, hw2: u32) -> i64 {
     let s = bits(hw1, 10, 10);
     let i1 = 1 ^ (bits(hw2, 13, 13) ^ s);
     let i2 = 1 ^ (bits(hw2, 11, 11) ^ s);
-    let v = (s << 24)
-        | (i1 << 23)
-        | (i2 << 22)
-        | (bits(hw1, 9, 0) << 12)
-        | (bits(hw2, 10, 1) << 2);
+    let v = (s << 24) | (i1 << 23) | (i2 << 22) | (bits(hw1, 9, 0) << 12) | (bits(hw2, 10, 1) << 2);
     sext(v, 25)
 }
 
@@ -2358,7 +2380,9 @@ fn t32_branch(hw1: u32, hw2: u32, addr: Addr) -> R {
             let amount = t32_branch_cond(hw1, hw2);
             let target = t_target(t_pc(addr), amount);
             let text = format!("b{}.w {}", CONDS[cond as usize], hex(target.get()));
-            R::new("b", text).flow(FlowKind::ConditionalBranch).to(target)
+            R::new("b", text)
+                .flow(FlowKind::ConditionalBranch)
+                .to(target)
         }
         (0, 1) => {
             // The unconditional branch.
@@ -2489,7 +2513,12 @@ fn t32_load_store(hw1: u32, hw2: u32) -> R {
             reg(rn),
             imm(-i64::from(offset))
         ),
-        (0, 1, 1) => format!("{name} {}, [{}], {}", reg(rt), reg(rn), imm(i64::from(offset))),
+        (0, 1, 1) => format!(
+            "{name} {}, [{}], {}",
+            reg(rt),
+            reg(rn),
+            imm(i64::from(offset))
+        ),
         (1, 0, 0) => format!(
             "{name} {}, [{}, {}]",
             reg(rt),
@@ -2502,7 +2531,12 @@ fn t32_load_store(hw1: u32, hw2: u32) -> R {
             reg(rn),
             imm(-i64::from(offset))
         ),
-        (1, 1, 1) => format!("{name} {}, [{}, {}]!", reg(rt), reg(rn), imm(i64::from(offset))),
+        (1, 1, 1) => format!(
+            "{name} {}, [{}, {}]!",
+            reg(rt),
+            reg(rn),
+            imm(i64::from(offset))
+        ),
         (1, 1, 0) => format!("{name}t {}, [{}]", reg(rt), reg(rn)),
         _ => return t32_undefined(hw1, hw2),
     };
@@ -2800,10 +2834,22 @@ fn t32_dp_reg2(hw1: u32, hw2: u32) -> R {
     // operand for it, so the assembler writes the source register in both
     // places and the field carries nothing the decoder can use.
     let shared = match (op, variant) {
-        (8, 8) => Some(("qadd", format!("qadd {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
-        (8, 9) => Some(("qdadd", format!("qdadd {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
-        (8, 10) => Some(("qsub", format!("qsub {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
-        (8, 11) => Some(("qdsub", format!("qdsub {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
+        (8, 8) => Some((
+            "qadd",
+            format!("qadd {}, {}, {}", reg(rd), reg(rm), reg(rn)),
+        )),
+        (8, 9) => Some((
+            "qdadd",
+            format!("qdadd {}, {}, {}", reg(rd), reg(rm), reg(rn)),
+        )),
+        (8, 10) => Some((
+            "qsub",
+            format!("qsub {}, {}, {}", reg(rd), reg(rm), reg(rn)),
+        )),
+        (8, 11) => Some((
+            "qdsub",
+            format!("qdsub {}, {}, {}", reg(rd), reg(rm), reg(rn)),
+        )),
         (9, 8) => Some(("rev", format!("rev.w {}, {}", reg(rd), reg(rm)))),
         (9, 9) => Some(("rev16", format!("rev16.w {}, {}", reg(rd), reg(rm)))),
         (9, 10) => Some(("rbit", format!("rbit {}, {}", reg(rd), reg(rm)))),
@@ -2922,13 +2968,7 @@ fn t32_multiply(hw1: u32, hw2: u32) -> R {
             _ => None,
         };
         if let Some(name) = long {
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(ra),
-                reg(rd),
-                reg(rn),
-                reg(rm)
-            );
+            let text = format!("{name} {}, {}, {}, {}", reg(ra), reg(rd), reg(rn), reg(rm));
             return R::new(name, text);
         }
         let name = match (op, sub) {
@@ -3075,13 +3115,14 @@ fn t32(w: u32, addr: Addr) -> R {
         0b1110101 => t32_dp_reg(hw1, hw2),
         // `1110110` and `1110111`: the coprocessor and the vector space,
         // which this decoder does not cover.
-        0b1110110 | 0b1110111 => {
-            R::new(
-                ".word",
-                format!(".word {} ; coprocessor (VFP/NEON)", hex(u64::from((hw2 << 16) | hw1))),
-            )
-            .flow(FlowKind::Exception)
-        }
+        0b1110110 | 0b1110111 => R::new(
+            ".word",
+            format!(
+                ".word {} ; coprocessor (VFP/NEON)",
+                hex(u64::from((hw2 << 16) | hw1))
+            ),
+        )
+        .flow(FlowKind::Exception),
         // `11110xx`: the data processing with an immediate, and the
         // branches that share its space.
         //
@@ -3254,8 +3295,8 @@ pub fn inverse_condition(cond: &'static str) -> Option<&'static str> {
 /// because a name that ends in `s` may also be a name that ends in a
 /// condition.
 const FLAG_SETTING: &[&str] = &[
-    "movs", "adds", "subs", "adcs", "sbcs", "rsbs", "ands", "orrs", "eors", "bics", "muls",
-    "mvns", "lsls", "lsrs", "asrs", "rors",
+    "movs", "adds", "subs", "adcs", "sbcs", "rsbs", "ands", "orrs", "eors", "bics", "muls", "mvns",
+    "lsls", "lsrs", "asrs", "rors",
 ];
 
 /// Write a condition into an instruction's own name.

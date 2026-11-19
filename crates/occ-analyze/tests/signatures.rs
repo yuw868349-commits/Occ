@@ -255,5 +255,9 @@ fn a_signature_never_lands_on_a_different_function() {
         .iter()
         .find(|f| f.name.is_some() && f.size > 0)
         .filter(|f| f.name.as_deref() == Some("totally_different"));
-    assert!(f.is_some() || applied.named < 20, "{} names moved", applied.named);
+    assert!(
+        f.is_some() || applied.named < 20,
+        "{} names moved",
+        applied.named
+    );
 }

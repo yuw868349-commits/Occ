@@ -110,7 +110,14 @@ fn build(name: &str, source: &str) -> Option<PathBuf> {
     // A fixture whose block count depends on which compiler is installed
     // tests the distribution, not the tracer.
     let output = Command::new("cc")
-        .args(["-O0", "-fno-inline", "-g", "-pthread", "-fstack-protector-strong", "-o"])
+        .args([
+            "-O0",
+            "-fno-inline",
+            "-g",
+            "-pthread",
+            "-fstack-protector-strong",
+            "-o",
+        ])
         .arg(&bin)
         .arg(&src)
         .output()
@@ -275,7 +282,8 @@ fn a_branch_that_did_not_run_is_reported_as_not_run() {
         "the canary check and the argc branch: {a:?}"
     );
     assert!(
-        b.iter().any(|x| x.start == unvisited[0] || x.start == unvisited[1]),
+        b.iter()
+            .any(|x| x.start == unvisited[0] || x.start == unvisited[1]),
         "the skipped blocks still exist in the second run"
     );
     for x in &b {

@@ -41,10 +41,46 @@ const EVEX_VSIB: &[VsibOp] = &[
     vsib(0x91, 1, "vpgatherqd", "vpgatherqq", Form::Two, 4, 8, 8),
     vsib(0x92, 1, "vgatherdps", "vgatherdpd", Form::Two, 4, 8, 4),
     vsib(0x93, 1, "vgatherqps", "vgatherqpd", Form::Two, 4, 8, 8),
-    vsib(0xa0, 1, "vpscatterdd", "vpscatterdq", Form::Scatter, 4, 8, 4),
-    vsib(0xa1, 1, "vpscatterqd", "vpscatterqq", Form::Scatter, 4, 8, 8),
-    vsib(0xa2, 1, "vscatterdps", "vscatterdpd", Form::Scatter, 4, 8, 4),
-    vsib(0xa3, 1, "vscatterqps", "vscatterqpd", Form::Scatter, 4, 8, 8),
+    vsib(
+        0xa0,
+        1,
+        "vpscatterdd",
+        "vpscatterdq",
+        Form::Scatter,
+        4,
+        8,
+        4,
+    ),
+    vsib(
+        0xa1,
+        1,
+        "vpscatterqd",
+        "vpscatterqq",
+        Form::Scatter,
+        4,
+        8,
+        8,
+    ),
+    vsib(
+        0xa2,
+        1,
+        "vscatterdps",
+        "vscatterdpd",
+        Form::Scatter,
+        4,
+        8,
+        4,
+    ),
+    vsib(
+        0xa3,
+        1,
+        "vscatterqps",
+        "vscatterqpd",
+        Form::Scatter,
+        4,
+        8,
+        8,
+    ),
 ];
 
 /// `const` constructor, so the table stays readable.
@@ -74,7 +110,5 @@ const fn vsib(
 /// The row for one opcode, in the encoding the caller is reading.
 pub fn lookup(evex: bool, op: u8, pp: u8) -> Option<&'static VsibOp> {
     let table = if evex { EVEX_VSIB } else { VEX_VSIB };
-    table
-        .iter()
-        .find(|e| e.op == op && e.pp == pp)
+    table.iter().find(|e| e.op == op && e.pp == pp)
 }

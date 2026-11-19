@@ -80,13 +80,21 @@ fn main() {
     for s in trace.syscalls.iter().take(12) {
         println!(
             "  syscall {}({:#x}, {:#x}, {:#x}) = {} {}",
-            s.name, s.args[0], s.args[1], s.args[2], s.ret, s.paths.join(" ")
+            s.name,
+            s.args[0],
+            s.args[1],
+            s.args[2],
+            s.ret,
+            s.paths.join(" ")
         );
     }
     if let Some(f) = analysis.function_by_name("main") {
         println!("  blocks of main:");
         for b in occ_dynamic::function_blocks(&trace, f) {
-            println!("    {}..{} {} insns, {} hits", b.start, b.end, b.insns, b.hits);
+            println!(
+                "    {}..{} {} insns, {} hits",
+                b.start, b.end, b.insns, b.hits
+            );
         }
     }
     for n in &trace.notes {

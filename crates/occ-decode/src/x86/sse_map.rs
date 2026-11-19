@@ -85,21 +85,18 @@ pub struct SseOp {
 /// The tables are sorted by the opcode byte and then by the prefix, so the
 /// lookup is a binary search.
 pub fn lookup(map: u8, op: u8, pp: u8) -> Option<&'static SseOp> {
-    let table = if map == 0x38 { LEGACY_0F38 } else { LEGACY_0F3A };
+    let table = if map == 0x38 {
+        LEGACY_0F38
+    } else {
+        LEGACY_0F3A
+    };
     table
         .binary_search_by_key(&(op, pp), |e| (e.op, e.pp))
         .ok()
         .map(|i| &table[i])
 }
 
-const fn sse_op(
-    op: u8,
-    pp: u8,
-    name: &'static str,
-    form: SseForm,
-    rm: Size,
-    imm8: bool,
-) -> SseOp {
+const fn sse_op(op: u8, pp: u8, name: &'static str, form: SseForm, rm: Size, imm8: bool) -> SseOp {
     SseOp {
         op,
         pp,
@@ -136,14 +133,7 @@ const fn sse_wq(
 
 /// An instruction for which `66` sets the operand size rather than naming
 /// the instruction.
-const fn sse_sz(
-    op: u8,
-    pp: u8,
-    name: &'static str,
-    form: SseForm,
-    rm: Size,
-    imm8: bool,
-) -> SseOp {
+const fn sse_sz(op: u8, pp: u8, name: &'static str, form: SseForm, rm: Size, imm8: bool) -> SseOp {
     SseOp {
         op,
         pp,

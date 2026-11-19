@@ -32,7 +32,11 @@ fn main() {
             std::process::exit(1);
         }
     };
-    println!("load          {:>10.3}ms  {} sections", t.elapsed().as_secs_f64() * 1e3, image.sections.len());
+    println!(
+        "load          {:>10.3}ms  {} sections",
+        t.elapsed().as_secs_f64() * 1e3,
+        image.sections.len()
+    );
 
     let view = View::new(&image, &data);
 
@@ -48,13 +52,25 @@ fn main() {
 
     let t = Instant::now();
     let strs = scan_strings(&view, &StringOptions::default());
-    println!("strings       {:>10.3}ms  {} found", t.elapsed().as_secs_f64() * 1e3, strs.len());
+    println!(
+        "strings       {:>10.3}ms  {} found",
+        t.elapsed().as_secs_f64() * 1e3,
+        strs.len()
+    );
 
     let t = Instant::now();
     let fp = fingerprint::fingerprint(&image, &view);
-    println!("fingerprint   {:>10.3}ms  {:?}", t.elapsed().as_secs_f64() * 1e3, fp.compiler);
+    println!(
+        "fingerprint   {:>10.3}ms  {:?}",
+        t.elapsed().as_secs_f64() * 1e3,
+        fp.compiler
+    );
 
     let t = Instant::now();
     let e = entropy::per_section(&view);
-    println!("entropy       {:>10.3}ms  {} sections", t.elapsed().as_secs_f64() * 1e3, e.len());
+    println!(
+        "entropy       {:>10.3}ms  {} sections",
+        t.elapsed().as_secs_f64() * 1e3,
+        e.len()
+    );
 }

@@ -114,7 +114,9 @@ fn mnemonic_eq(ours: &str, theirs: &str) -> bool {
 #[test]
 fn entry_point_matches_objdump_instruction_for_instruction() {
     let Some(l) = ls() else { return };
-    let Some(rows) = objdump(l.img.entry.get(), 0x100) else { return };
+    let Some(rows) = objdump(l.img.entry.get(), 0x100) else {
+        return;
+    };
     let dec = Decoder::new(l.img.bits).expect("decoder");
     let text = l.img.section_by_name(".text").expect(".text");
 
@@ -127,7 +129,13 @@ fn entry_point_matches_objdump_instruction_for_instruction() {
         let rel = (row.addr - text.addr.get()) as usize;
         let bytes = &l.bytes[rel..];
         let d = dec.decode(Addr(row.addr), bytes).expect("decode");
-        assert_eq!(d.insn.len, u32::from(row.len), "at {:#x}: {}", row.addr, d.insn.text);
+        assert_eq!(
+            d.insn.len,
+            u32::from(row.len),
+            "at {:#x}: {}",
+            row.addr,
+            d.insn.text
+        );
         // objdump prints prefixes as words of their own (`cs nop ...`,
         // `lock push ...`); accept the mnemonic wherever it appears in the
         // prefix chain.
@@ -151,7 +159,9 @@ fn entry_point_matches_objdump_instruction_for_instruction() {
 #[test]
 fn entry_point_renders_the_same_operands_as_objdump() {
     let Some(l) = ls() else { return };
-    let Some(rows) = objdump(l.img.entry.get(), 0x100) else { return };
+    let Some(rows) = objdump(l.img.entry.get(), 0x100) else {
+        return;
+    };
     let dec = Decoder::new(l.img.bits).expect("decoder");
     let text = l.img.section_by_name(".text").expect(".text");
 
@@ -182,7 +192,9 @@ fn entry_point_renders_the_same_operands_as_objdump() {
 #[test]
 fn rip_relative_operands_resolve_to_the_target_objdump_prints() {
     let Some(l) = ls() else { return };
-    let Some(rows) = objdump(l.img.entry.get(), 0x100) else { return };
+    let Some(rows) = objdump(l.img.entry.get(), 0x100) else {
+        return;
+    };
     let dec = Decoder::new(l.img.bits).expect("decoder");
     let text = l.img.section_by_name(".text").expect(".text");
 

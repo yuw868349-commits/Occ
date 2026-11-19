@@ -13,9 +13,9 @@ use occ_core::Addr;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().unwrap_or_else(|| {
-        "/lib/x86_64-linux-gnu/libc.so.6".to_string()
-    });
+    let path = args
+        .next()
+        .unwrap_or_else(|| "/lib/x86_64-linux-gnu/libc.so.6".to_string());
     let symbol = args.next().unwrap_or_else(|| "warn".to_string());
     let data = std::fs::read(&path).expect("read library");
     let img = occ_bin::load(&data, &path, occ_core::ImageId(0)).expect("parse");
@@ -33,7 +33,11 @@ fn main() {
             .unwrap_or_else(|| format!("sub_{:x}", a.get()))
     };
     let d = occ_decompile::decompile(&img, f, &occ_decompile::Options::default(), &name_of);
-    println!("// {symbol}: {} nodes, {} unstructured", d.body.len(), d.unstructured);
+    println!(
+        "// {symbol}: {} nodes, {} unstructured",
+        d.body.len(),
+        d.unstructured
+    );
     for note in &d.notes {
         println!("// note: {note}");
     }

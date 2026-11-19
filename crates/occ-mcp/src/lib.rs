@@ -4,7 +4,6 @@
 //! and keeps one [`occ_session::Session`] alive for the lifetime of the
 //! process so handles stay resolvable across requests.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 

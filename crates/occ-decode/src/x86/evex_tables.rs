@@ -104,11 +104,12 @@ pub struct EvexKey {
 /// The row for one key, if the table has one.
 pub fn lookup(op: u8, map: u8, pp: u8, w: bool) -> Option<&'static EvexOp> {
     let key = EvexKey { op, map, pp, w };
-    EVEX_OPS.binary_search_by(|row| {
-        (row.op, row.map, row.pp, row.w).cmp(&(key.op, key.map, key.pp, key.w))
-    })
-    .ok()
-    .map(|i| &EVEX_OPS[i])
+    EVEX_OPS
+        .binary_search_by(|row| {
+            (row.op, row.map, row.pp, row.w).cmp(&(key.op, key.map, key.pp, key.w))
+        })
+        .ok()
+        .map(|i| &EVEX_OPS[i])
 }
 
 include!("evex_ops.rs");

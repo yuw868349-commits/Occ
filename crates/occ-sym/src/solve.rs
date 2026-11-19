@@ -37,23 +37,13 @@ impl Constraint {
     /// comparison so the printed form reads the way the source would.
     pub fn predicate(&self) -> Expr {
         match (&self.expr, self.truth) {
-            (Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            }, true) => Expr::Cond {
+            (Expr::Cond { op, lhs, rhs, bits }, true) => Expr::Cond {
                 op: *op,
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
                 bits: *bits,
             },
-            (Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            }, false) => Expr::Cond {
+            (Expr::Cond { op, lhs, rhs, bits }, false) => Expr::Cond {
                 op: op.negated(),
                 lhs: lhs.clone(),
                 rhs: rhs.clone(),
@@ -64,20 +54,12 @@ impl Constraint {
                 args: args.clone(),
             },
             (Expr::Bool { op, args }, false) => negate_bool(*op, args),
-            (Expr::FlagCond {
-                cond,
-                state,
-                bits,
-            }, true) => Expr::FlagCond {
+            (Expr::FlagCond { cond, state, bits }, true) => Expr::FlagCond {
                 cond: *cond,
                 state: state.clone(),
                 bits: *bits,
             },
-            (Expr::FlagCond {
-                cond,
-                state,
-                bits,
-            }, false) => Expr::FlagCond {
+            (Expr::FlagCond { cond, state, bits }, false) => Expr::FlagCond {
                 cond: cond.negated(),
                 state: state.clone(),
                 bits: *bits,
@@ -128,12 +110,7 @@ fn negate_bool(op: BoolOp, args: &[Expr]) -> Expr {
 fn negate_bool_expr(e: &Expr) -> Expr {
     match e {
         Expr::Bool { op, args } => negate_bool(*op, args),
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            bits,
-        } => Expr::Cond {
+        Expr::Cond { op, lhs, rhs, bits } => Expr::Cond {
             op: op.negated(),
             lhs: lhs.clone(),
             rhs: rhs.clone(),
@@ -361,12 +338,7 @@ fn collect_vars(e: &Expr, out: &mut BTreeSet<String>) {
 /// to, and everything else into the shared pool.
 fn harvest(e: &Expr, domain: &mut BTreeMap<String, Vec<u64>>, global: &mut Vec<u64>) {
     match e {
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            ..
-        } => match (&**lhs, &**rhs) {
+        Expr::Cond { op, lhs, rhs, .. } => match (&**lhs, &**rhs) {
             (Expr::Var(name), Expr::Const(c)) => {
                 add_candidates(domain, name, *op, *c, 8);
                 global.push(*c);
@@ -450,7 +422,13 @@ struct View {
 
 /// Recognise a variable that a comparison reads through a width change.
 fn narrow_view(e: &Expr) -> Option<View> {
-    let Expr::Cast { kind, arg, from, to } = e else {
+    let Expr::Cast {
+        kind,
+        arg,
+        from,
+        to,
+    } = e
+    else {
         return None;
     };
     let Expr::Var(name) = &**arg else {
@@ -545,15 +523,7 @@ pub fn check(conds: &[Constraint], assignment: &HashMap<String, u64>) -> Option<
 pub fn holds_under(e: &Expr, assignment: &HashMap<String, u64>) -> bool {
     match (e, eval_bool(e, assignment)) {
         (_, Some(v)) => v,
-        (
-            Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            },
-            None,
-        ) => {
+        (Expr::Cond { op, lhs, rhs, bits }, None) => {
             let a = crate::value::eval_word(lhs, assignment).unwrap_or(0);
             let b = crate::value::eval_word(rhs, assignment).unwrap_or(0);
             holds_at(*op, a, b, *bits)
@@ -585,7 +555,10 @@ mod tests {
 
     #[test]
     fn an_equality_yields_the_compared_constant() {
-        let conds = [c(cmp(CondOp::Eq, Expr::var("rdi"), Expr::Const(0x2a)), true)];
+        let conds = [c(
+            cmp(CondOp::Eq, Expr::var("rdi"), Expr::Const(0x2a)),
+            true,
+        )];
         let m = solve(&conds, 4096);
         assert_eq!(m.verdict, Verdict::Satisfied);
         assert_eq!(m.inputs, vec![("rdi".to_string(), 0x2a)]);

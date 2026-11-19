@@ -17,7 +17,6 @@
 //! and the count of constructs that had to fall back to `goto` is reported with
 //! the result.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -130,7 +129,12 @@ pub fn decompile(
         };
     }
     let mut notes = program.notes.clone();
-    let graph = struct_::Graph::new(&program.blocks, &program.preds, &program.succs, program.entry);
+    let graph = struct_::Graph::new(
+        &program.blocks,
+        &program.preds,
+        &program.succs,
+        program.entry,
+    );
     let mut structurer = struct_::Structurer::new(&program.blocks, &graph);
     let body = structurer.run(program.entry);
     notes.extend(structurer.notes.iter().cloned());
@@ -212,7 +216,8 @@ fn parameter_types(
 pub fn is_liftable(arch: occ_core::Arch) -> bool {
     matches!(
         arch,
-        occ_core::Arch::X86 | occ_core::Arch::X86_64
+        occ_core::Arch::X86
+            | occ_core::Arch::X86_64
             | occ_core::Arch::Arm
             | occ_core::Arch::Aarch64
             | occ_core::Arch::RiscV32
@@ -265,11 +270,15 @@ fn lifter_for<'a>(
         }
         occ_core::Arch::Aarch64 => {
             static TARGET: lift::aarch64::Aarch64Target = lift::aarch64::Aarch64Target;
-            Some(Box::new(lift::aarch64::Lifter::new(&TARGET, name_of, symbols)))
+            Some(Box::new(lift::aarch64::Lifter::new(
+                &TARGET, name_of, symbols,
+            )))
         }
         occ_core::Arch::RiscV32 | occ_core::Arch::RiscV64 => {
             static TARGET: lift::riscv::RiscvTarget = lift::riscv::RiscvTarget;
-            Some(Box::new(lift::riscv::Lifter::new(&TARGET, name_of, symbols)))
+            Some(Box::new(lift::riscv::Lifter::new(
+                &TARGET, name_of, symbols,
+            )))
         }
         _ => None,
     }
@@ -346,11 +355,7 @@ fn indirect(lifted: &Lifted) -> Term {
 /// once, at the first statement: a comment before every assignment would say
 /// the same thing repeatedly and bury the body. The file name is printed when
 /// it changes, which is what makes inlined and multi-file functions readable.
-fn with_source_lines(
-    stmts: Vec<Stmt>,
-    at: &[Addr],
-    dbg: Option<&debug::DebugInfo>,
-) -> Vec<Stmt> {
+fn with_source_lines(stmts: Vec<Stmt>, at: &[Addr], dbg: Option<&debug::DebugInfo>) -> Vec<Stmt> {
     let Some(dbg) = dbg else {
         return stmts;
     };
@@ -951,8 +956,19 @@ fn pair_return(stmts: &[Stmt], lo: &str, hi: &str) -> Option<(Expr, &'static str
         _ => None,
     }) {
         Some(Expr::Bin { lhs, rhs, .. }) => {
-            let signed = matches!(lhs.as_ref(), Expr::Cast { kind: CastKind::Sext, .. })
-                || matches!(rhs.as_ref(), Expr::Cast { kind: CastKind::Sext, .. });
+            let signed = matches!(
+                lhs.as_ref(),
+                Expr::Cast {
+                    kind: CastKind::Sext,
+                    ..
+                }
+            ) || matches!(
+                rhs.as_ref(),
+                Expr::Cast {
+                    kind: CastKind::Sext,
+                    ..
+                }
+            );
             if signed { "i64" } else { "u64" }
         }
         _ => "u64",
@@ -967,7 +983,6 @@ fn cfa_slot(arch: occ_core::Arch) -> i64 {
         _ => 0,
     }
 }
-
 
 /// Describe a tail jump through a GOT slot.
 ///
@@ -1145,9 +1160,9 @@ fn is_bare_return(b: &Block) -> bool {
 fn successors_of(b: &Block) -> Vec<BlockId> {
     match &b.term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => {
-            then_bb.iter().chain(else_bb.iter()).copied().collect()
-        }
+        Term::Branch {
+            then_bb, else_bb, ..
+        } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
         // Every case of a switch is a successor: leaving them out of the
         // graph makes the phi placement and the rename pass treat the case
         // bodies as unreachable from the dispatch.
@@ -1159,7 +1174,9 @@ fn successors_of(b: &Block) -> Vec<BlockId> {
 fn redirect(term: &mut Term, from: BlockId, to: BlockId) {
     match term {
         Term::Jump(t) if *t == from => *t = to,
-        Term::Branch { then_bb, else_bb, .. } => {
+        Term::Branch {
+            then_bb, else_bb, ..
+        } => {
             if then_bb == &Some(from) {
                 *then_bb = Some(to);
             }
@@ -1411,9 +1428,9 @@ mod tests {
         for b in &blocks {
             let out: Vec<usize> = match &b.term {
                 Term::Jump(t) => vec![*t],
-                Term::Branch { then_bb, else_bb, .. } => {
-            then_bb.iter().chain(else_bb.iter()).copied().collect()
-        }
+                Term::Branch {
+                    then_bb, else_bb, ..
+                } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
                 _ => Vec::new(),
             };
             for s in out {

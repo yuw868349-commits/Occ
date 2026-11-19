@@ -150,9 +150,7 @@ fn an_address_inside_a_body_names_its_function() {
     let (data, img) = fixture();
     let view = View::new(&img, &data);
     let analysis = Analysis::build(&view, &AnalysisOptions::default());
-    let f = analysis
-        .function_by_name("sum")
-        .expect("sum is recovered");
+    let f = analysis.function_by_name("sum").expect("sum is recovered");
     let at = f.entry.add(u64::from(f.insns[2].len));
     assert_eq!(
         analysis.function_covering(at).map(|f| f.display_name()),

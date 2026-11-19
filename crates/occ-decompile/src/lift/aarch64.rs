@@ -39,9 +39,9 @@ const XZR: u8 = 32;
 
 /// Full-width names, by register index.
 const X_NAMES: [&str; 32] = [
-    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
-    "x14", "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
-    "x27", "x28", "x29", "x30", "sp",
+    "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14",
+    "x15", "x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26", "x27",
+    "x28", "x29", "x30", "sp",
 ];
 
 /// The AArch64 target.
@@ -78,7 +78,11 @@ impl Target for Aarch64Target {
         if idx == XZR {
             return "xzr".to_string();
         }
-        X_NAMES.get(usize::from(idx)).copied().unwrap_or("x0").to_string()
+        X_NAMES
+            .get(usize::from(idx))
+            .copied()
+            .unwrap_or("x0")
+            .to_string()
     }
 
     fn reg_width(&self, _idx: u8) -> u8 {
@@ -181,8 +185,7 @@ fn cond_of_suffix(suffix: &str) -> Option<FlagCond> {
 /// The condition names AArch64 uses, for recognising an operand that names
 /// one.
 const COND_NAMES: [&str; 16] = [
-    "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al",
-    "nv",
+    "eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc", "hi", "ls", "ge", "lt", "gt", "le", "al", "nv",
 ];
 
 /// Parse an AArch64 instruction's text.
@@ -437,10 +440,8 @@ impl<'a> Lifter<'a> {
             "uxth" => self.lift_extend(false, 2, &p.ops, &mut out.stmts),
             "ldp" => self.lift_pair(&p.ops, &mut out.stmts, false),
             "stp" => self.lift_pair(&p.ops, &mut out.stmts, true),
-            "ldr" | "ldur" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldurh"
-            | "ldurb" | "ldursb" | "ldursh" | "ldursw" => {
-                self.lift_load(m, &p.ops, &mut out.stmts)
-            }
+            "ldr" | "ldur" | "ldrb" | "ldrh" | "ldrsb" | "ldrsh" | "ldrsw" | "ldurh" | "ldurb"
+            | "ldursb" | "ldursh" | "ldursw" => self.lift_load(m, &p.ops, &mut out.stmts),
             "str" | "stur" | "strb" | "strh" | "sturb" | "sturh" => {
                 self.lift_store(m, &p.ops, &mut out.stmts)
             }
@@ -469,9 +470,7 @@ impl<'a> Lifter<'a> {
             return;
         };
         // `mov x29, sp` anchors the frame instead of assigning a value.
-        if dst.idx == 29
-            && matches!(&ops[1], Operand::Reg(r) if r.idx == SP && r.size == 8)
-        {
+        if dst.idx == 29 && matches!(&ops[1], Operand::Reg(r) if r.idx == SP && r.size == 8) {
             self.core.fp_off = Some(self.core.sp_off);
             self.core.fp_anchor = Some(self.core.sp_off);
             return;
@@ -847,7 +846,9 @@ impl<'a> Lifter<'a> {
         if ops.len() != 4 {
             return;
         }
-        let Some(cond) = ops[3].cond_suffix().and_then(|s| self.core.target.cmov_cond(s))
+        let Some(cond) = ops[3]
+            .cond_suffix()
+            .and_then(|s| self.core.target.cmov_cond(s))
         else {
             return;
         };
@@ -896,7 +897,9 @@ impl<'a> Lifter<'a> {
         if ops.len() != 2 {
             return;
         }
-        let Some(cond) = ops[1].cond_suffix().and_then(|s| self.core.target.setcc_cond(s))
+        let Some(cond) = ops[1]
+            .cond_suffix()
+            .and_then(|s| self.core.target.setcc_cond(s))
         else {
             return;
         };
@@ -918,7 +921,11 @@ impl<'a> Lifter<'a> {
         let src = self.core.read(&ops[1], stmts);
         let to = ops[0].size();
         let value = Expr::Cast {
-            kind: if signed { CastKind::Sext } else { CastKind::Zext },
+            kind: if signed {
+                CastKind::Sext
+            } else {
+                CastKind::Zext
+            },
             arg: Box::new(src),
             from,
             to,

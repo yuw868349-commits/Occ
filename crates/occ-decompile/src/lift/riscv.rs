@@ -37,14 +37,16 @@ pub struct RiscvTarget;
 
 impl Target for RiscvTarget {
     fn lookup_reg(&self, name: &str) -> Option<Reg> {
-        REGS
-            .iter()
+        REGS.iter()
             .position(|n| *n == name)
             .map(|n| Reg::full(n as u8, 8))
     }
 
     fn reg_name(&self, idx: u8) -> String {
-        REGS.get(usize::from(idx)).copied().unwrap_or("zero").to_string()
+        REGS.get(usize::from(idx))
+            .copied()
+            .unwrap_or("zero")
+            .to_string()
     }
 
     fn reg_width(&self, _idx: u8) -> u8 {

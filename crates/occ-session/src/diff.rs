@@ -296,7 +296,9 @@ fn hash_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 
 /// True when the function contains a loop (a block edge that points backwards).
 pub fn has_loop(f: &Function) -> bool {
-    f.blocks.iter().any(|b| b.edges.iter().any(|e| e.to.0 < b.start.0))
+    f.blocks
+        .iter()
+        .any(|b| b.edges.iter().any(|e| e.to.0 < b.start.0))
 }
 
 /// True when the function ends in a tail call rather than a return.
@@ -313,8 +315,14 @@ mod tests {
 
     #[test]
     fn fnv_is_stable() {
-        assert_eq!(hash_bytes(FNV_OFFSET, b"abc"), hash_bytes(FNV_OFFSET, b"abc"));
-        assert_ne!(hash_bytes(FNV_OFFSET, b"abc"), hash_bytes(FNV_OFFSET, b"abd"));
+        assert_eq!(
+            hash_bytes(FNV_OFFSET, b"abc"),
+            hash_bytes(FNV_OFFSET, b"abc")
+        );
+        assert_ne!(
+            hash_bytes(FNV_OFFSET, b"abc"),
+            hash_bytes(FNV_OFFSET, b"abd")
+        );
     }
 
     #[test]

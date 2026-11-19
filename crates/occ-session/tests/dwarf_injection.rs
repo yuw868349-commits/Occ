@@ -85,8 +85,7 @@ fn names_types_and_lines_reach_the_output() {
         .analysis
         .function_by_name("add")
         .expect("the object defines add");
-    let info = occ_session::dbginfo::debug_info_for(&file, add)
-        .expect("add has debug information");
+    let info = occ_session::dbginfo::debug_info_for(&file, add).expect("add has debug information");
     assert_eq!(info.name.as_deref(), Some("add"));
     assert_eq!(info.return_type.as_deref(), Some("int"));
     let names: Vec<&str> = info.params.iter().map(|p| p.name.as_str()).collect();
@@ -116,7 +115,10 @@ fn names_types_and_lines_reach_the_output() {
     // The lines must climb: a listing whose marks go backwards is worse than
     // none, because it claims a source order the code does not have.
     let mut last = 0u32;
-    for line in text.lines().filter_map(|l| l.trim().strip_prefix("// line ")) {
+    for line in text
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("// line "))
+    {
         let n: u32 = line.parse().expect("line mark is a number");
         assert!(n >= last, "line marks go backwards: {last} then {n}");
         last = n;
@@ -135,8 +137,8 @@ fn a_pointer_parameter_keeps_its_struct_type() {
         .analysis
         .function_by_name("scaled")
         .expect("the object defines scaled");
-    let info = occ_session::dbginfo::debug_info_for(&file, scaled)
-        .expect("scaled has debug information");
+    let info =
+        occ_session::dbginfo::debug_info_for(&file, scaled).expect("scaled has debug information");
     let types: Vec<&str> = info
         .params
         .iter()

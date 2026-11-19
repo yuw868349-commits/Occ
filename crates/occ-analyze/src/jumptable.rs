@@ -30,8 +30,8 @@
 
 use std::collections::BTreeSet;
 
-use occ_core::{Addr, Instruction, JumpTable};
 use occ_core::FlowKind;
+use occ_core::{Addr, Instruction, JumpTable};
 
 use crate::view::View;
 
@@ -282,10 +282,7 @@ fn family(reg: &str) -> &str {
 }
 
 /// Where the table lives and how an entry is read.
-fn shape(
-    window: &[&Instruction],
-    jmp: &Instruction,
-) -> Option<(Addr, u8, bool, Option<String>)> {
+fn shape(window: &[&Instruction], jmp: &Instruction) -> Option<(Addr, u8, bool, Option<String>)> {
     let operand = jmp.text.strip_prefix("jmp ")?;
     let before = &window[..window.len().saturating_sub(1)];
 
@@ -688,18 +685,14 @@ mod tests {
     fn a_function_pointer_load_is_not_a_table() {
         // `mov rax, [rbp - 8]; jmp rax` is a call through a local, not a
         // switch: no index and no scale.
-        let owned = [
-            insn("mov rax, qword ptr [rbp - 0x8]"),
-            insn("jmp rax"),
-        ];
+        let owned = [insn("mov rax, qword ptr [rbp - 0x8]"), insn("jmp rax")];
         let window: Vec<&Instruction> = owned.iter().collect();
         assert_eq!(shape(&window, window.last().unwrap()), None);
     }
 
     #[test]
     fn rip_relative_lea_reads_the_annotation() {
-        let (reg, addr) =
-            lea_target("lea rdx, qword ptr [rip+0xea4]  # 0x202c").unwrap();
+        let (reg, addr) = lea_target("lea rdx, qword ptr [rip+0xea4]  # 0x202c").unwrap();
         assert_eq!(reg, "rdx");
         assert_eq!(addr, Addr(0x202c));
     }

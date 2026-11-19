@@ -80,7 +80,11 @@ impl Target for ArmTarget {
     }
 
     fn reg_name(&self, idx: u8) -> String {
-        NAMES.get(usize::from(idx)).copied().unwrap_or("r0").to_string()
+        NAMES
+            .get(usize::from(idx))
+            .copied()
+            .unwrap_or("r0")
+            .to_string()
     }
 
     fn reg_width(&self, _idx: u8) -> u8 {
@@ -172,15 +176,14 @@ fn cond_of_suffix(suffix: &str) -> Option<FlagCond> {
 const BASES: &[&str] = &[
     "adc", "add", "adr", "and", "asr", "b", "bfc", "bfi", "bic", "bkpt", "bl", "blx", "blxns",
     "bx", "bxns", "cbz", "cbnz", "clz", "cmn", "cmp", "crc32b", "crc32cb", "crc32ch", "crc32cw",
-    "crc32h", "crc32w", "eor", "ldm", "ldmdb", "ldmia",
-    "ldr", "ldrb", "ldrd", "ldrex", "ldrexb", "ldrexd", "ldrexh", "ldrh", "ldrsb", "ldrsh",
-    "lsl", "lsr", "mla", "mls", "mov", "movw", "movt", "mul", "mvn", "nop", "orr", "pop",
-    "push", "qadd", "qdadd", "qdsub", "qsub", "rbit", "rev", "rev16", "revsh", "ror", "rrx",
-    "rsb", "sbc", "sbfx", "sdiv", "sel", "serv",
-    "smull", "smlal", "stm", "stmdb", "stmia", "str", "strb", "strd", "strex", "strexb",
-    "strexd", "strexh", "strh", "sub", "svc", "swi", "sxtab", "sxtab16", "sxtah", "sxtb",
-    "sxth", "teq", "tst", "ubfx", "udiv", "umaal", "umlal", "umull", "uxtab", "uxtab16",
-    "uxtah", "uxtb", "uxth", "wfe", "wfi", "yield",
+    "crc32h", "crc32w", "eor", "ldm", "ldmdb", "ldmia", "ldr", "ldrb", "ldrd", "ldrex", "ldrexb",
+    "ldrexd", "ldrexh", "ldrh", "ldrsb", "ldrsh", "lsl", "lsr", "mla", "mls", "mov", "movw",
+    "movt", "mul", "mvn", "nop", "orr", "pop", "push", "qadd", "qdadd", "qdsub", "qsub", "rbit",
+    "rev", "rev16", "revsh", "ror", "rrx", "rsb", "sbc", "sbfx", "sdiv", "sel", "serv", "smull",
+    "smlal", "stm", "stmdb", "stmia", "str", "strb", "strd", "strex", "strexb", "strexd", "strexh",
+    "strh", "sub", "svc", "swi", "sxtab", "sxtab16", "sxtah", "sxtb", "sxth", "teq", "tst", "ubfx",
+    "udiv", "umaal", "umlal", "umull", "uxtab", "uxtab16", "uxtah", "uxtb", "uxth", "wfe", "wfi",
+    "yield",
 ];
 
 /// The parallel and the exchanged operations, and the intrinsic each one
@@ -683,7 +686,9 @@ impl<'a> Lifter<'a> {
             }
             "mov" | "movw" => {
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let Some(op) = ops.get(1).cloned() else { return };
+                let Some(op) = ops.get(1).cloned() else {
+                    return;
+                };
                 // A move that carries a shift says which bit fell off the
                 // end, and that bit is read from the value before the
                 // shift — the write is about to overwrite it.
@@ -757,7 +762,11 @@ impl<'a> Lifter<'a> {
                 } else {
                     return;
                 };
-                let (lhs, rhs) = if base == "rsb" { (rhs, lhs) } else { (lhs, rhs) };
+                let (lhs, rhs) = if base == "rsb" {
+                    (rhs, lhs)
+                } else {
+                    (lhs, rhs)
+                };
                 let rhs = if base == "bic" {
                     Expr::Un {
                         op: UnOp::Not,
@@ -815,7 +824,9 @@ impl<'a> Lifter<'a> {
                 // from, and the write is about to overwrite it.
                 let previous = self.bind(self.core.read_reg(rm), &mut out.stmts);
                 let value = match ops.get(2) {
-                    Some(Operand::Imm(v)) => self.shifted(previous.clone(), kind, u32::try_from(*v).unwrap_or(0)),
+                    Some(Operand::Imm(v)) => {
+                        self.shifted(previous.clone(), kind, u32::try_from(*v).unwrap_or(0))
+                    }
                     Some(other) => {
                         // The amount is in a register, so the carry out of
                         // the shift is not a fixed bit and is not modelled.
@@ -827,7 +838,12 @@ impl<'a> Lifter<'a> {
                 self.write_reg(rd, value.clone(), guard, &mut out.stmts);
                 if sets_flags {
                     if let Some(Operand::Imm(v)) = ops.get(2) {
-                        self.set_shift_flags(kind, u32::try_from(*v).unwrap_or(0), &previous, &value);
+                        self.set_shift_flags(
+                            kind,
+                            u32::try_from(*v).unwrap_or(0),
+                            &previous,
+                            &value,
+                        );
                     }
                 }
             }
@@ -849,7 +865,11 @@ impl<'a> Lifter<'a> {
                 let (lhs, rhs) = match base {
                     "tst" | "teq" => (
                         Expr::Bin {
-                            op: if base == "tst" { BinOp::And } else { BinOp::Xor },
+                            op: if base == "tst" {
+                                BinOp::And
+                            } else {
+                                BinOp::Xor
+                            },
                             lhs: Box::new(lhs),
                             rhs: Box::new(rhs),
                             bits: 4,
@@ -857,7 +877,14 @@ impl<'a> Lifter<'a> {
                         Expr::Const(0),
                     ),
                     // `cmn` is a comparison against the negation.
-                    "cmn" => (lhs, Expr::Un { op: UnOp::Neg, arg: Box::new(rhs), bits: 4 }),
+                    "cmn" => (
+                        lhs,
+                        Expr::Un {
+                            op: UnOp::Neg,
+                            arg: Box::new(rhs),
+                            bits: 4,
+                        },
+                    ),
                     _ => (lhs, rhs),
                 };
                 let cmp = PendingCmp::int(lhs, rhs, 4);
@@ -923,10 +950,9 @@ impl<'a> Lifter<'a> {
                 // A multiply of one half of each operand. Which half is in
                 // the name: `bb` is the bottom half of both.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rm), Some(rs)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rm), Some(rs)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let half = |value: Expr, top: bool| {
@@ -967,16 +993,14 @@ impl<'a> Lifter<'a> {
                 // number, and the low half on its own is not the product:
                 // `1 << 31` has a low half of zero.
 
-                let (Some(lo_reg), Some(hi_reg)) = (
-                    ops.first().and_then(reg_of),
-                    ops.get(1).and_then(reg_of),
-                ) else {
+                let (Some(lo_reg), Some(hi_reg)) =
+                    (ops.first().and_then(reg_of), ops.get(1).and_then(reg_of))
+                else {
                     return;
                 };
-                let (Some(rm), Some(rs)) = (
-                    ops.get(2).and_then(reg_of),
-                    ops.get(3).and_then(reg_of),
-                ) else {
+                let (Some(rm), Some(rs)) =
+                    (ops.get(2).and_then(reg_of), ops.get(3).and_then(reg_of))
+                else {
                     return;
                 };
                 let signed = base.starts_with('s');
@@ -1106,10 +1130,9 @@ impl<'a> Lifter<'a> {
             }
             "sdiv" | "udiv" => {
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rn), Some(rm)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rn), Some(rm)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let value = Expr::Bin {
@@ -1225,10 +1248,9 @@ impl<'a> Lifter<'a> {
                 // as a plain addition loses the half of the value the
                 // instruction threw away.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rn), Some(rm)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rn), Some(rm)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 // The third operand may carry a rotation, which the
@@ -1306,10 +1328,9 @@ impl<'a> Lifter<'a> {
                 // The select picks each bit from one of two values, and
                 // the mask says which one.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rn), Some(rm)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rn), Some(rm)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let value = Expr::Intrinsic {
@@ -1328,10 +1349,9 @@ impl<'a> Lifter<'a> {
                 // doubled forms, which add or subtract twice the
                 // second operand.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rm), Some(rn)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rm), Some(rn)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let doubled = matches!(base, "qdadd" | "qdsub");
@@ -1363,10 +1383,9 @@ impl<'a> Lifter<'a> {
                 // the first.  The two families differ only in the
                 // polynomial they use.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rn), Some(rm)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rn), Some(rm)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let width: u32 = match base {
@@ -1400,10 +1419,9 @@ impl<'a> Lifter<'a> {
                 // exchanged ones that take the halves of the operands
                 // the other way round.
                 let Some(rd) = reg_at(ops, 0) else { return };
-                let (Some(rn), Some(rm)) = (
-                    ops.get(1).and_then(reg_of),
-                    ops.get(2).and_then(reg_of),
-                ) else {
+                let (Some(rn), Some(rm)) =
+                    (ops.get(1).and_then(reg_of), ops.get(2).and_then(reg_of))
+                else {
                     return;
                 };
                 let (op, lane) = op;
@@ -1736,9 +1754,8 @@ impl<'a> Lifter<'a> {
         // into an absolute address; reading it as arithmetic on a variable
         // called `pc` turns a global into a parameter, which is what made a
         // store to a known address read as a store through `a2`.
-        let literal = (base_reg.idx == PC).then(|| {
-            Addr((i128::from(addr.get()) + 8 + i128::from(disp)) as u64)
-        });
+        let literal = (base_reg.idx == PC)
+            .then(|| Addr((i128::from(addr.get()) + 8 + i128::from(disp)) as u64));
         // A post-indexed access writes back after the access, and its offset
         // is the third operand rather than part of the brackets.
         let post = if ops.len() >= 3 {
@@ -1751,7 +1768,11 @@ impl<'a> Lifter<'a> {
         };
         let op = Operand::Mem {
             size,
-            base: if literal.is_some() { None } else { Some(base_reg) },
+            base: if literal.is_some() {
+                None
+            } else {
+                Some(base_reg)
+            },
             index,
             scale: 1,
             disp: if literal.is_some() { 0 } else { disp },
@@ -1782,10 +1803,7 @@ impl<'a> Lifter<'a> {
             match (slot, base_reg.idx == SP) {
                 (Some(slot), true) => {
                     let name = super::slot_name(slot, size);
-                    let st = Stmt::Assign {
-                        dest: name,
-                        value,
-                    };
+                    let st = Stmt::Assign { dest: name, value };
                     match guard {
                         Some(cond) => stmts.push(Stmt::If {
                             cond: cond.clone(),
@@ -1990,9 +2008,7 @@ impl<'a> Lifter<'a> {
             }
             let addr = Expr::Bin {
                 op: BinOp::Add,
-                lhs: Box::new(Expr::var(
-                    self.core.name(pointer.idx),
-                )),
+                lhs: Box::new(Expr::var(self.core.name(pointer.idx))),
                 rhs: Box::new(Expr::Const(slot as u64)),
                 bits: 4,
             };
@@ -2077,7 +2093,10 @@ impl<'a> Lifter<'a> {
     fn indirect_target(&mut self, insn: &Instruction) -> Expr {
         let text = insn.text.trim();
         let (_, _, _) = split_mnemonic(text.split_whitespace().next().unwrap_or(""));
-        let rest = text.split_once(char::is_whitespace).map(|(_, r)| r).unwrap_or("");
+        let rest = text
+            .split_once(char::is_whitespace)
+            .map(|(_, r)| r)
+            .unwrap_or("");
         match register(rest.trim()) {
             Some(r) => self.core.read_reg(r),
             None => Expr::Unknown("jump target".into()),
@@ -2115,7 +2134,10 @@ fn reg_at(ops: &[Operand], i: usize) -> Option<u8> {
 /// same place.
 fn is_conditional_return(text: &str) -> bool {
     let text = text.trim();
-    if let Some(rest) = text.strip_prefix("bx").or_else(|| text.strip_prefix("bxns")) {
+    if let Some(rest) = text
+        .strip_prefix("bx")
+        .or_else(|| text.strip_prefix("bxns"))
+    {
         let rest = rest.trim();
         let Some(condition) = rest.strip_suffix(" lr") else {
             return false;

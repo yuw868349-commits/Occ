@@ -65,7 +65,9 @@ fn a_text_symbol_is_a_function_not_an_object() {
 
 #[test]
 fn the_object_recovers_a_function_with_instructions() {
-    let Some((data, img)) = load(OBJECT) else { return };
+    let Some((data, img)) = load(OBJECT) else {
+        return;
+    };
     let view = View::new(&img, &data);
     let rec = recover(
         &view,
@@ -90,7 +92,9 @@ fn the_object_recovers_a_function_with_instructions() {
 
 #[test]
 fn a_64_bit_dylib_parses_and_recovers_x86_functions() {
-    let Some((data, img)) = load(DYLIB_X86) else { return };
+    let Some((data, img)) = load(DYLIB_X86) else {
+        return;
+    };
     assert_eq!(img.format, Format::MachO);
     assert_eq!(img.arch, Arch::X86_64);
     assert!(!img.imports.is_empty(), "a dylib has imports");
@@ -110,7 +114,9 @@ fn a_64_bit_dylib_parses_and_recovers_x86_functions() {
 
 #[test]
 fn an_arm64_dylib_is_recognised_as_aarch64() {
-    let Some((data, img)) = load(DYLIB_ARM) else { return };
+    let Some((data, img)) = load(DYLIB_ARM) else {
+        return;
+    };
     assert_eq!(img.format, Format::MachO);
     assert_eq!(img.arch, Arch::Aarch64);
     assert_eq!(img.bits, 64);
@@ -125,14 +131,20 @@ fn an_arm64_dylib_is_recognised_as_aarch64() {
     let analysis = Analysis::build(&view, &AnalysisOptions::default());
     // The AArch64 decoder is fixed-width, so every recovered instruction is four
     // bytes and the bodies must not be empty.
-    let with_body = analysis.functions.iter().filter(|f| !f.insns.is_empty()).count();
+    let with_body = analysis
+        .functions
+        .iter()
+        .filter(|f| !f.insns.is_empty())
+        .count();
     assert!(with_body > 0, "no AArch64 function was recovered");
 }
 
 #[test]
 fn every_section_address_lands_inside_the_file_or_is_zero_fill() {
     for path in [OBJECT, DYLIB_X86, DYLIB_ARM] {
-        let Some((data, img)) = load(path) else { continue };
+        let Some((data, img)) = load(path) else {
+            continue;
+        };
         for s in &img.sections {
             if s.file_size == 0 {
                 continue;

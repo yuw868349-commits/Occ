@@ -180,7 +180,8 @@ fn decompile(loaded: &Loaded, f: &occ_core::Function) -> String {
         &name_of,
     );
     assert_eq!(
-        d.unstructured, 0,
+        d.unstructured,
+        0,
         "{}: the function structured without a goto:\n{}",
         loaded.image.arch.label(),
         occ_decompile::render::render(&d)

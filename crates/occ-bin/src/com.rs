@@ -74,6 +74,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
             kind: SectionKind::Code,
             perm: Perm::R.union(Perm::X),
         }],
+        resources: Vec::new(),
         symbols: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),

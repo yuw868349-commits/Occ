@@ -291,11 +291,7 @@ fn debug_section_offset(image: &Image, addr: u64) -> Option<u64> {
     image
         .sections
         .iter()
-        .find(|s| {
-            s.name.starts_with(".debug")
-                && addr >= s.addr.0
-                && addr < s.addr.0 + s.file_size
-        })
+        .find(|s| s.name.starts_with(".debug") && addr >= s.addr.0 && addr < s.addr.0 + s.file_size)
         .map(|s| addr - s.addr.0)
 }
 
@@ -329,20 +325,11 @@ fn patch_one(
     match arch {
         Arch::X86_64 => patch_x86_64(data, r.raw_type, place, off, value, addend, endian),
         Arch::X86 => patch_x86(data, r.raw_type, place, off, value, addend, endian),
-        Arch::Arm => patch_arm(
-            data,
-            r.raw_type,
-            place,
-            off,
-            value,
-            addend,
-            endian,
-            thumb,
-        ),
+        Arch::Arm => patch_arm(data, r.raw_type, place, off, value, addend, endian, thumb),
         Arch::Aarch64 => patch_aarch64(data, r.raw_type, place, off, value, addend, endian),
-        Arch::RiscV32 | Arch::RiscV64 => patch_riscv(
-            data, r, place, off, value, addend, endian, pcrel_hi,
-        ),
+        Arch::RiscV32 | Arch::RiscV64 => {
+            patch_riscv(data, r, place, off, value, addend, endian, pcrel_hi)
+        }
         _ => Outcome::Deferred,
     }
 }
@@ -580,7 +567,8 @@ fn patch_arm(
             // The addend is the sign-extended field, and it is already `-8`
             // for a branch the assembler emitted.
             let inplace = sext_arm(bits32(word, 23, 0) << 2, 26);
-            let d = i128::from(value) + i128::from(addend) + i128::from(inplace) - i128::from(place);
+            let d =
+                i128::from(value) + i128::from(addend) + i128::from(inplace) - i128::from(place);
             if !(-(1i128 << 25)..(1i128 << 25)).contains(&d) {
                 return Outcome::OutOfRange;
             }
@@ -673,12 +661,7 @@ fn sext_arm(v: u32, n: u32) -> i64 {
 /// bit 7 of the first halfword, and it is left alone: the relocation says
 /// which half of the address to write, and the instruction says which
 /// half of the register to write it into.
-fn patch_thumb_mov_imm(
-    data: &mut [u8],
-    off: usize,
-    imm16: u16,
-    endian: Endian,
-) -> Outcome {
+fn patch_thumb_mov_imm(data: &mut [u8], off: usize, imm16: u16, endian: Endian) -> Outcome {
     let Some(mut hw1) = get_u16(data, off, endian) else {
         return Outcome::Deferred;
     };
@@ -1255,9 +1238,20 @@ pub fn encodable(arch: Arch, raw: u32) -> bool {
         ),
         Arch::RiscV32 | Arch::RiscV64 => matches!(
             raw,
-            1 | 2 | RV_BRANCH | RV_JAL | RV_CALL | RV_CALL_PLT | RV_PCREL_HI20
-                | RV_PCREL_LO12_I | RV_PCREL_LO12_S | RV_HI20 | RV_LO12_I | RV_LO12_S
-                | RV_32_PCREL | RV_RVC_BRANCH | RV_RVC_JUMP
+            1 | 2
+                | RV_BRANCH
+                | RV_JAL
+                | RV_CALL
+                | RV_CALL_PLT
+                | RV_PCREL_HI20
+                | RV_PCREL_LO12_I
+                | RV_PCREL_LO12_S
+                | RV_HI20
+                | RV_LO12_I
+                | RV_LO12_S
+                | RV_32_PCREL
+                | RV_RVC_BRANCH
+                | RV_RVC_JUMP
         ),
         _ => false,
     }
@@ -1283,10 +1277,7 @@ mod tests {
         let mut data = vec![0u8; 0x1010];
         data[0x1004..0x1008].copy_from_slice(&(-4i32).to_le_bytes());
         let outcome = patch_x86(&mut data, 2, 0x1004, 0x1004, 0x1000, 0, Endian::Little);
-        assert!(
-            matches!(outcome, Outcome::Patched),
-            "the displacement fits"
-        );
+        assert!(matches!(outcome, Outcome::Patched), "the displacement fits");
         let written = i32::from_le_bytes(data[0x1004..0x1008].try_into().unwrap());
         assert_eq!(written, -8, "target minus the end of the field");
     }
@@ -1315,7 +1306,11 @@ mod tests {
                 | ((((enc >> 25) & 0x3f) as i64) << 5)
                 | ((((enc >> 8) & 0xf) as i64) << 1)
                 | ((((enc >> 7) & 1) as i64) << 11);
-            let signed = if back & (1 << 12) != 0 { back - (1 << 13) } else { back };
+            let signed = if back & (1 << 12) != 0 {
+                back - (1 << 13)
+            } else {
+                back
+            };
             assert_eq!(signed, imm, "b-type immediate {imm:#x}");
         }
     }
@@ -1328,7 +1323,11 @@ mod tests {
                 | ((((enc >> 21) & 0x3ff) as i64) << 1)
                 | ((((enc >> 20) & 1) as i64) << 11)
                 | ((((enc >> 12) & 0xff) as i64) << 12);
-            let signed = if back & (1 << 20) != 0 { back - (1 << 21) } else { back };
+            let signed = if back & (1 << 20) != 0 {
+                back - (1 << 21)
+            } else {
+                back
+            };
             assert_eq!(signed, imm, "j-type immediate {imm:#x}");
         }
     }
@@ -1342,7 +1341,11 @@ mod tests {
                 | ((((enc >> 5) & 0x3) as i64) << 6)
                 | ((((enc >> 3) & 0x3) as i64) << 1)
                 | ((((enc >> 2) & 1) as i64) << 5);
-            let signed = if back & (1 << 8) != 0 { back - (1 << 9) } else { back };
+            let signed = if back & (1 << 8) != 0 {
+                back - (1 << 9)
+            } else {
+                back
+            };
             assert_eq!(signed, imm, "cb immediate {imm:#x}");
         }
     }
@@ -1359,7 +1362,11 @@ mod tests {
                 | ((((enc >> 6) & 1) as i64) << 7)
                 | ((((enc >> 3) & 0x7) as i64) << 1)
                 | ((((enc >> 2) & 1) as i64) << 5);
-            let signed = if back & (1 << 11) != 0 { back - (1 << 12) } else { back };
+            let signed = if back & (1 << 11) != 0 {
+                back - (1 << 12)
+            } else {
+                back
+            };
             assert_eq!(signed, imm, "cj immediate {imm:#x}");
         }
     }

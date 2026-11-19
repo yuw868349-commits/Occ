@@ -17,9 +17,9 @@
 //! it is an anonymous indirect branch.
 
 use occ_core::{
-    Addr, Arch, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId, Import,
-    ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind, Segment,
-    Symbol, SymbolBinding, SymbolKind, CoreError,
+    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
+    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind,
+    Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 use crate::reader::Reader;
@@ -159,7 +159,10 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
     let object = filetype == 1;
     let ncmds = r.u32(16)? as usize;
     if ncmds > 4096 {
-        return Err(malformed(16, format!("header claims {ncmds} load commands")));
+        return Err(malformed(
+            16,
+            format!("header claims {ncmds} load commands"),
+        ));
     }
     let header_size = if is64 { 32 } else { 28 };
 
@@ -181,7 +184,10 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         let cmd = r.u32(off)?;
         let cmdsize = r.u32(off + 4)? as usize;
         if cmdsize < 8 || off + cmdsize > data.len() {
-            return Err(malformed(off, format!("load command size {cmdsize} is invalid")));
+            return Err(malformed(
+                off,
+                format!("load command size {cmdsize} is invalid"),
+            ));
         }
         match cmd {
             LC_SEGMENT | LC_SEGMENT_64 => {
@@ -249,7 +255,11 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
                         sections.push(Section {
                             index: sections.len() + 1,
                             name: format!("{segname},{sectname}"),
-                            addr: if object { Addr(file_offset) } else { Addr(addr) },
+                            addr: if object {
+                                Addr(file_offset)
+                            } else {
+                                Addr(addr)
+                            },
                             file_offset,
                             size,
                             file_size: if flags & 0xff == 0x1 { 0 } else { size },
@@ -354,8 +364,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         for (name, slot, ordinal) in bound {
             if let Some(existing) = imports.iter_mut().find(|i| i.name == name) {
                 existing.slot = Some(slot);
-                existing.library = ordinal
-                    .and_then(|o| dylibs.get(o.saturating_sub(1)).cloned());
+                existing.library = ordinal.and_then(|o| dylibs.get(o.saturating_sub(1)).cloned());
             } else {
                 imports.push(Import {
                     name,
@@ -373,8 +382,14 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         && fix_size > 0
         && !object
     {
-        let chained_imports =
-            read_chained_fixups(data, base, fix_off as usize, fix_size as usize, &segs, &dylibs);
+        let chained_imports = read_chained_fixups(
+            data,
+            base,
+            fix_off as usize,
+            fix_size as usize,
+            &segs,
+            &dylibs,
+        );
         let before = imports.len();
         for (name, slot, library) in chained_imports {
             if let Some(existing) = imports.iter_mut().find(|i| i.name == name) {
@@ -486,6 +501,7 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         sha256: crate::sha256::hex_digest(data),
         segments,
         sections,
+        resources: Vec::new(),
         symbols,
         imports,
         exports,
@@ -581,7 +597,9 @@ fn read_symbols(
         }
         let kind_bits = ntype & 0x0e;
         let ext = ntype & 0x01 != 0;
-        let name = r.str_at(data.get(str_base..).unwrap_or(&[]), strx as usize).to_string();
+        let name = r
+            .str_at(data.get(str_base..).unwrap_or(&[]), strx as usize)
+            .to_string();
         if name.is_empty() {
             continue;
         }
@@ -698,7 +716,9 @@ fn read_function_starts(
     let mut addr = text_base;
     let mut starts: Vec<u64> = Vec::new();
     while pos < chunk.len() && starts.len() < 1_000_000 {
-        let Some(delta) = uleb(chunk, &mut pos) else { break };
+        let Some(delta) = uleb(chunk, &mut pos) else {
+            break;
+        };
         if delta == 0 {
             break;
         }
@@ -746,9 +766,15 @@ fn read_chained_fixups(
     };
     let Some(starts_off) = rd(4) else { return out };
     let Some(imports_off) = rd(8) else { return out };
-    let Some(symbols_off) = rd(12) else { return out };
-    let Some(imports_count) = rd(16) else { return out };
-    let Some(imports_format) = rd(20) else { return out };
+    let Some(symbols_off) = rd(12) else {
+        return out;
+    };
+    let Some(imports_count) = rd(16) else {
+        return out;
+    };
+    let Some(imports_format) = rd(20) else {
+        return out;
+    };
 
     // Import records, then their names in the symbol pool.
     let import_size = match imports_format {
@@ -766,9 +792,9 @@ fn read_chained_fixups(
             2 => chunk
                 .get(at..at + 4)
                 .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) & 0x7f_ffff),
-            3 => chunk.get(at..at + 8).map(|b| {
-                u32::from_le_bytes([b[4], b[5], b[6], b[7]])
-            }),
+            3 => chunk
+                .get(at..at + 8)
+                .map(|b| u32::from_le_bytes([b[4], b[5], b[6], b[7]])),
             _ => None,
         }) else {
             break;
@@ -786,7 +812,9 @@ fn read_chained_fixups(
     }
 
     // Walks of the chain, segment by segment.
-    let Some(seg_count) = rd(starts_off as usize) else { return out };
+    let Some(seg_count) = rd(starts_off as usize) else {
+        return out;
+    };
     for s in 0..seg_count as usize {
         let Some(info_off) = rd(starts_off as usize + 4 + s * 4) else {
             continue;
@@ -842,9 +870,10 @@ fn read_chained_fixups(
                 // The chain pointer lives in the segment's bytes, not in the
                 // fixups blob: `chunk` holds the table that describes the
                 // chains, and the pointers themselves are in the image.
-                let Some(raw) = data.get(base + file_at..base + file_at + 8).map(|b| {
-                    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-                }) else {
+                let Some(raw) = data
+                    .get(base + file_at..base + file_at + 8)
+                    .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+                else {
                     break;
                 };
                 let bind = raw >> 63 != 0;
@@ -1077,7 +1106,11 @@ fn read_exports(
             let Some(child_off) = uleb(data, &mut pos) else {
                 break;
             };
-            stack.push((start + child_off as usize, format!("{prefix}{edge}"), depth + 1));
+            stack.push((
+                start + child_off as usize,
+                format!("{prefix}{edge}"),
+                depth + 1,
+            ));
         }
     }
     out

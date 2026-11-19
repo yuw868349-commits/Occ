@@ -217,8 +217,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     };
 
     let (mut imports, exports) = split_dynamic(&symbols);
-    let (relocations, debug_relocations) =
-        read_relocations(&r, &h, &shdrs, &names, &symbols, data);
+    let (relocations, debug_relocations) = read_relocations(&r, &h, &shdrs, &names, &symbols, data);
     bind_import_slots(&mut imports, &relocations);
     // The relocation tables name their target by the index of the symbol in
     // the table, so the mapping symbols have to stay until they have been
@@ -282,6 +281,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         sha256: crate::sha256::hex_digest(data),
         segments,
         sections,
+        resources: Vec::new(),
         symbols,
         imports,
         exports,
@@ -767,11 +767,7 @@ fn bind_import_slots(imports: &mut [Import], relocs: &[Relocation]) {
 /// value with that bit cleared.  A file that states no mapping symbols at
 /// all still says which set each of its functions is in, through that bit,
 /// and that is enough to read a stripped binary.
-fn arm_regions(
-    symbols: &mut [Symbol],
-    entry: &mut Addr,
-    mapping: &mut Vec<usize>,
-) -> ArmModes {
+fn arm_regions(symbols: &mut [Symbol], entry: &mut Addr, mapping: &mut Vec<usize>) -> ArmModes {
     let mut modes = ArmModes::new();
     let mut stated = false;
 
@@ -1065,9 +1061,7 @@ struct Cie {
 fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<FunctionBound> {
     let r = Reader::new(data, endian);
     let start = sec.file_offset as usize;
-    let end = start
-        .saturating_add(sec.file_size as usize)
-        .min(data.len());
+    let end = start.saturating_add(sec.file_size as usize).min(data.len());
     let mut pos = start;
     let mut cies: HashMap<usize, Cie> = HashMap::new();
     let mut out = Vec::new();
@@ -1097,8 +1091,12 @@ fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<
             p += 1;
             let aug = cstr_at(data, p);
             p += aug.len() + 1;
-            let Some(_code_align) = uleb(data, &mut p) else { break };
-            let Some(_data_align) = sleb(data, &mut p) else { break };
+            let Some(_code_align) = uleb(data, &mut p) else {
+                break;
+            };
+            let Some(_data_align) = sleb(data, &mut p) else {
+                break;
+            };
             if version == 1 {
                 p += 1;
             } else if uleb(data, &mut p).is_none() {
@@ -1110,7 +1108,9 @@ fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<
                 addr_size = data.get(p).copied().unwrap_or(addr_size);
             }
             if let Some(aug_body) = aug.strip_prefix('z') {
-                let Some(aug_len) = uleb(data, &mut p) else { break };
+                let Some(aug_len) = uleb(data, &mut p) else {
+                    break;
+                };
                 let aug_end = p.saturating_add(aug_len as usize);
                 let mut q = p;
                 for c in aug_body.chars() {
@@ -1121,7 +1121,9 @@ fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<
                         }
                         'L' => q += 1,
                         'P' => {
-                            let Some(enc) = data.get(q).copied() else { break };
+                            let Some(enc) = data.get(q).copied() else {
+                                break;
+                            };
                             q += 1;
                             if skip_encoded(data, endian, &mut q, enc, addr_size).is_none() {
                                 break;
@@ -1149,9 +1151,14 @@ fn eh_frame_bounds(data: &[u8], sec: &Section, endian: Endian, bits: u8) -> Vec<
             // An FDE names its CIE by distance back from the id field.
             let mut p = body_start + 4;
             let field_at = sec.addr.0 + (p - start) as u64;
-            let Some(location) =
-                read_encoded(data, endian, &mut p, cie.fde_encoding, cie.addr_size, field_at)
-            else {
+            let Some(location) = read_encoded(
+                data,
+                endian,
+                &mut p,
+                cie.fde_encoding,
+                cie.addr_size,
+                field_at,
+            ) else {
                 pos = body_end;
                 continue;
             };
@@ -1435,8 +1442,7 @@ mod tests {
         let s1 = 0x200 + 40;
         d[s1..s1 + 4].copy_from_slice(&1u32.to_le_bytes()); // sh_name
         d[s1 + 4..s1 + 8].copy_from_slice(&1u32.to_le_bytes()); // SHT_PROGBITS
-        d[s1 + 8..s1 + 12]
-            .copy_from_slice(&((SHF_ALLOC | SHF_EXECINSTR) as u32).to_le_bytes());
+        d[s1 + 8..s1 + 12].copy_from_slice(&((SHF_ALLOC | SHF_EXECINSTR) as u32).to_le_bytes());
         d[s1 + 12..s1 + 16].copy_from_slice(&0x10000u32.to_le_bytes()); // sh_addr
         d[s1 + 16..s1 + 20].copy_from_slice(&0x100u32.to_le_bytes()); // sh_offset
         d[s1 + 20..s1 + 24].copy_from_slice(&8u32.to_le_bytes()); // sh_size

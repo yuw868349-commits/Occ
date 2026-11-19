@@ -38,12 +38,7 @@ fn main() {
     let mut missing: BTreeMap<String, usize> = BTreeMap::new();
     let mut total = 0usize;
     for func in &analysis.functions {
-        let d = occ_decompile::decompile(
-            &img,
-            func,
-            &occ_decompile::Options::default(),
-            &names,
-        );
+        let d = occ_decompile::decompile(&img, func, &occ_decompile::Options::default(), &names);
         let text = occ_decompile::render::render(&d);
         for line in text.lines() {
             let Some(rest) = line.trim().strip_prefix("// ") else {

@@ -17,7 +17,6 @@
 //! desynchronises every following instruction and the listing still looks
 //! plausible.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 

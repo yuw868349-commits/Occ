@@ -180,6 +180,10 @@ mod tests {
     fn path_arguments_are_listed_only_where_they_exist() {
         assert_eq!(path_args(59), &[0], "execve's first argument is a path");
         assert_eq!(path_args(257), &[1], "openat's path is the second argument");
-        assert_eq!(path_args(1), &[] as &[u8], "write takes a buffer, not a path");
+        assert_eq!(
+            path_args(1),
+            &[] as &[u8],
+            "write takes a buffer, not a path"
+        );
     }
 }

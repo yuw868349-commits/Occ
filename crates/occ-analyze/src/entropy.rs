@@ -85,7 +85,13 @@ pub struct Window {
 ///
 /// Adjacent windows above the threshold are merged into runs by the caller;
 /// this function reports every window so no boundary judgement is baked in.
-pub fn sliding(view: &View, addr: occ_core::Addr, len: usize, window: usize, threshold: f32) -> Vec<Window> {
+pub fn sliding(
+    view: &View,
+    addr: occ_core::Addr,
+    len: usize,
+    window: usize,
+    threshold: f32,
+) -> Vec<Window> {
     if window == 0 {
         return Vec::new();
     }

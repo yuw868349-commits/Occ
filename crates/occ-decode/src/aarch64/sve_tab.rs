@@ -39,8 +39,11 @@ pub(super) struct IvClass {
 }
 
 /// The first class that claims the word, with its rendered text.
-pub(super) fn iv_scan(classes: &'static [IvClass], cands: &[u16],
-                      word: u32) -> Option<(&'static str, String)> {
+pub(super) fn iv_scan(
+    classes: &'static [IvClass],
+    cands: &[u16],
+    word: u32,
+) -> Option<(&'static str, String)> {
     for &i in cands {
         let c = &classes[i as usize];
         if word & c.mask != c.val {
@@ -116,8 +119,7 @@ fn iv_operand(op: &IvOp, word: u32) -> Option<String> {
             } else if n == 2 {
                 format!("z{}.{}, z{}.{}", lo, op.elem, (lo + 1) & 31, op.elem)
             } else if lo + n <= 32 {
-                format!("z{}.{} - z{}.{}", lo, op.elem,
-                        (lo + n - 1) & 31, op.elem)
+                format!("z{}.{} - z{}.{}", lo, op.elem, (lo + n - 1) & 31, op.elem)
             } else {
                 let mut s = String::new();
                 for i in 0..n {
@@ -134,4 +136,3 @@ fn iv_operand(op: &IvOp, word: u32) -> Option<String> {
     };
     Some(out)
 }
-

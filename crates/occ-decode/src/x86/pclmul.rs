@@ -34,12 +34,18 @@
 ///
 /// The four names cover the values `0x00` through `0x03`.
 const NAMES: [&str; 4] = [
-    "pclmullqlqdq", "pclmulhqlqdq", "pclmullqhqdq", "pclmulhqhqdq",
+    "pclmullqlqdq",
+    "pclmulhqlqdq",
+    "pclmullqhqdq",
+    "pclmulhqhqdq",
 ];
 
 /// The vector forms of the same names.
 const VECTOR_NAMES: [&str; 4] = [
-    "vpclmullqlqdq", "vpclmulhqlqdq", "vpclmullqhqdq", "vpclmulhqhqdq",
+    "vpclmullqlqdq",
+    "vpclmulhqlqdq",
+    "vpclmullqhqdq",
+    "vpclmulhqhqdq",
 ];
 
 /// The name of the carry-less multiplication for the given immediate byte.

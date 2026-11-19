@@ -31,6 +31,7 @@ pub fn image_with_sections(sections: Vec<Section>) -> Image {
         sha256: String::new(),
         segments: Vec::new(),
         sections,
+        resources: Vec::new(),
         symbols: Vec::new(),
         imports: Vec::new(),
         exports: Vec::new(),

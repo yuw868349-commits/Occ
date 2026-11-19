@@ -73,12 +73,8 @@ fn a_subtraction_borrows_and_the_carry_flag_says_so() {
     let Some(mut p) = probe() else { return };
     // `sub rax, rcx` where the minuend is smaller than the subtrahend: the
     // borrow must come out of the carry flag.
-    let regs = step(
-        &mut p,
-        &[0x48, 0x29, 0xc8],
-        &[("rax", 1), ("rcx", 2)],
-    )
-    .expect("the instruction runs");
+    let regs =
+        step(&mut p, &[0x48, 0x29, 0xc8], &[("rax", 1), ("rcx", 2)]).expect("the instruction runs");
     assert_eq!(regs.rax, u64::MAX, "1 - 2 wraps to all ones");
     assert_ne!(regs.eflags & 1, 0, "the borrow must set the carry flag");
 }
@@ -123,13 +119,12 @@ fn a_memory_operand_reads_the_region_the_probe_wrote() {
     p.set_data(&bytes);
     let base = p.data_base();
     // `mov al, [rbx + 8]` — read the byte the probe wrote.
-    let regs = step(
-        &mut p,
-        &[0x8a, 0x43, 0x08],
-        &[("rbx", base)],
-    )
-    .expect("the instruction runs");
-    assert_eq!(regs.rax & 0xff, 0xab, "the probe must read back what it wrote");
+    let regs = step(&mut p, &[0x8a, 0x43, 0x08], &[("rbx", base)]).expect("the instruction runs");
+    assert_eq!(
+        regs.rax & 0xff,
+        0xab,
+        "the probe must read back what it wrote"
+    );
 }
 
 #[test]
@@ -138,7 +133,8 @@ fn a_write_to_the_region_is_visible_to_the_parent() {
     let base = p.data_base();
     // `mov byte [rbx + 16], 0x5a` — the instruction writes memory, not a
     // register, so the register is checked for being untouched instead.
-    let regs = step(&mut p, &[0xc6, 0x43, 0x10, 0x5a], &[("rbx", base)]).expect("the instruction runs");
+    let regs =
+        step(&mut p, &[0xc6, 0x43, 0x10, 0x5a], &[("rbx", base)]).expect("the instruction runs");
     assert_eq!(
         regs.rax & 0xff,
         0xaa,

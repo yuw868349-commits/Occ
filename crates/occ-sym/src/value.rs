@@ -148,12 +148,7 @@ impl Value {
     pub fn truth(&self) -> Option<bool> {
         match self {
             Value::Const(v) => Some(*v != 0),
-            Value::Sym(Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            }) => {
+            Value::Sym(Expr::Cond { op, lhs, rhs, bits }) => {
                 let a = const_of(lhs)?;
                 let b = const_of(rhs)?;
                 Some(holds_at(*op, a, b, *bits))
@@ -188,21 +183,13 @@ pub fn eval_bool(e: &Expr, env: &std::collections::HashMap<String, u64>) -> Opti
     match e {
         Expr::Const(v) => Some(*v != 0),
         Expr::Var(name) => Some(*env.get(name).unwrap_or(&0) != 0),
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            bits,
-        } => {
+        Expr::Cond { op, lhs, rhs, bits } => {
             let a = eval_word(lhs, env)?;
             let b = eval_word(rhs, env)?;
             Some(holds_at(*op, a, b, *bits))
         }
         Expr::Bool { op, args } => {
-            let values: Option<Vec<bool>> = args
-                .iter()
-                .map(|a| eval_bool(a, env))
-                .collect();
+            let values: Option<Vec<bool>> = args.iter().map(|a| eval_bool(a, env)).collect();
             let values = values?;
             Some(match op {
                 BoolOp::And => values.iter().all(|v| *v),
@@ -259,21 +246,13 @@ pub fn eval_word(e: &Expr, env: &std::collections::HashMap<String, u64>) -> Opti
             };
             Some(truncate(v, usize::from(*bits)))
         }
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            bits,
-        } => {
+        Expr::Cond { op, lhs, rhs, bits } => {
             let a = eval_word(lhs, env)?;
             let b = eval_word(rhs, env)?;
             Some(u64::from(holds_at(*op, a, b, *bits)))
         }
         Expr::Bool { op, args } => {
-            let values: Option<Vec<bool>> = args
-                .iter()
-                .map(|a| eval_bool(a, env))
-                .collect();
+            let values: Option<Vec<bool>> = args.iter().map(|a| eval_bool(a, env)).collect();
             let values = values?;
             Some(u64::from(match op {
                 BoolOp::And => values.iter().all(|v| *v),
@@ -297,9 +276,7 @@ pub fn eval_word(e: &Expr, env: &std::collections::HashMap<String, u64>) -> Opti
             let narrowed = truncate(v, usize::from((*from).min(*to)));
             Some(match kind {
                 CastKind::Sext => truncate(sign_extend(narrowed, *from) as u64, usize::from(*to)),
-                CastKind::Zext | CastKind::Trunc => {
-                    truncate(narrowed, usize::from(*to))
-                }
+                CastKind::Zext | CastKind::Trunc => truncate(narrowed, usize::from(*to)),
             })
         }
         Expr::Select { cond, yes, no } => {
@@ -525,7 +502,10 @@ mod tests {
     #[test]
     fn casts_narrow_then_extend() {
         let v = Value::num(0xffff_ffff_ffff_fffe);
-        assert_eq!(Value::cast(CastKind::Trunc, &v, 8, 4), Value::num(0xffff_fffe));
+        assert_eq!(
+            Value::cast(CastKind::Trunc, &v, 8, 4),
+            Value::num(0xffff_fffe)
+        );
         assert_eq!(
             Value::cast(CastKind::Sext, &v, 1, 8),
             Value::num(0xffff_ffff_ffff_fffe)

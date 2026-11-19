@@ -178,7 +178,10 @@ mod tests {
     #[test]
     fn a_truncated_line_is_skipped_not_guessed() {
         assert!(parse("not a mapping\n").is_empty());
-        assert!(parse("1000-900 rw-p 0 0 0\n").is_empty(), "end before start");
+        assert!(
+            parse("1000-900 rw-p 0 0 0\n").is_empty(),
+            "end before start"
+        );
         assert!(parse("").is_empty());
     }
 }

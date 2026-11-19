@@ -483,11 +483,7 @@ impl VecOp {
             // the encoding is not an instruction.
             return "";
         }
-        if w {
-            self.name_w
-        } else {
-            self.name
-        }
+        if w { self.name_w } else { self.name }
     }
 
     /// Whether the prefix's fields allow the instruction to exist.
@@ -771,54 +767,27 @@ pub const fn vop_m(
 /// sixteen conditions and four precisions, and the machine has one
 /// spelling for each pair.
 const CMP_NAMES: [[&str; 4]; 16] = [
+    ["vcmpeqps", "vcmpeqpd", "vcmpeqss", "vcmpeqsd"],
+    ["vcmpltps", "vcmpltpd", "vcmpltss", "vcmpltsd"],
+    ["vcmpleps", "vcmplepd", "vcmpless", "vcmplesd"],
+    ["vcmpunordps", "vcmpunordpd", "vcmpunordss", "vcmpunordsd"],
+    ["vcmpneqps", "vcmpneqpd", "vcmpneqss", "vcmpneqsd"],
+    ["vcmpnltps", "vcmpnltpd", "vcmpnltss", "vcmpnltsd"],
+    ["vcmpnleps", "vcmpnlepd", "vcmpnless", "vcmpnlesd"],
+    ["vcmpordps", "vcmpordpd", "vcmpordss", "vcmpordsd"],
+    ["vcmpeq_uqps", "vcmpeq_uqpd", "vcmpeq_uqss", "vcmpeq_uqsd"],
+    ["vcmpngeps", "vcmpngepd", "vcmpngess", "vcmpngesd"],
+    ["vcmpngtps", "vcmpngtpd", "vcmpngtss", "vcmpngtsd"],
+    ["vcmpfalseps", "vcmpfalsepd", "vcmpfalsess", "vcmpfalsesd"],
     [
-        "vcmpeqps", "vcmpeqpd", "vcmpeqss", "vcmpeqsd",
+        "vcmpneq_oqps",
+        "vcmpneq_oqpd",
+        "vcmpneq_oqss",
+        "vcmpneq_oqsd",
     ],
-    [
-        "vcmpltps", "vcmpltpd", "vcmpltss", "vcmpltsd",
-    ],
-    [
-        "vcmpleps", "vcmplepd", "vcmpless", "vcmplesd",
-    ],
-    [
-        "vcmpunordps", "vcmpunordpd", "vcmpunordss", "vcmpunordsd",
-    ],
-    [
-        "vcmpneqps", "vcmpneqpd", "vcmpneqss", "vcmpneqsd",
-    ],
-    [
-        "vcmpnltps", "vcmpnltpd", "vcmpnltss", "vcmpnltsd",
-    ],
-    [
-        "vcmpnleps", "vcmpnlepd", "vcmpnless", "vcmpnlesd",
-    ],
-    [
-        "vcmpordps", "vcmpordpd", "vcmpordss", "vcmpordsd",
-    ],
-    [
-        "vcmpeq_uqps", "vcmpeq_uqpd", "vcmpeq_uqss", "vcmpeq_uqsd",
-    ],
-    [
-        "vcmpngeps", "vcmpngepd", "vcmpngess", "vcmpngesd",
-    ],
-    [
-        "vcmpngtps", "vcmpngtpd", "vcmpngtss", "vcmpngtsd",
-    ],
-    [
-        "vcmpfalseps", "vcmpfalsepd", "vcmpfalsess", "vcmpfalsesd",
-    ],
-    [
-        "vcmpneq_oqps", "vcmpneq_oqpd", "vcmpneq_oqss", "vcmpneq_oqsd",
-    ],
-    [
-        "vcmpgeps", "vcmpgepd", "vcmpgess", "vcmpgesd",
-    ],
-    [
-        "vcmpgtps", "vcmpgtpd", "vcmpgtss", "vcmpgtsd",
-    ],
-    [
-        "vcmptrueps", "vcmptruepd", "vcmptruess", "vcmptruesd",
-    ],
+    ["vcmpgeps", "vcmpgepd", "vcmpgess", "vcmpgesd"],
+    ["vcmpgtps", "vcmpgtpd", "vcmpgtss", "vcmpgtsd"],
+    ["vcmptrueps", "vcmptruepd", "vcmptruess", "vcmptruesd"],
 ];
 
 impl Decoder {
@@ -878,7 +847,11 @@ impl Decoder {
                 0x77 => {
                     // Clearing the upper half of the vector registers takes
                     // no operands at all.
-                    let name = if vp.length == 32 { "vzeroall" } else { "vzeroupper" };
+                    let name = if vp.length == 32 {
+                        "vzeroall"
+                    } else {
+                        "vzeroupper"
+                    };
                     return Some((name, FlowKind::Next, None, vec![]));
                 }
                 0xc2 => return self.decode_vector_compare(&vp, &fake, asz, b, i),
@@ -906,9 +879,7 @@ impl Decoder {
         // The table has one row for every combination of the opcode byte
         // and the mandatory prefix, because that is the granularity at
         // which the instruction is named.
-        let entry = table
-            .iter()
-            .find(|e| e.op == opcode && e.pp == vp.pp);
+        let entry = table.iter().find(|e| e.op == opcode && e.pp == vp.pp);
 
         // The ModRM byte is read before the name is settled, because a
         // few instructions name themselves by the `reg` field of that
@@ -1347,8 +1318,7 @@ impl Decoder {
             // an instruction has no operands to read.
             return Some(("(bad)", FlowKind::Next, None, vec![]));
         }
-        let (name, form, has_imm, mem, elem) =
-            (n, entry.form, entry.imm8, entry.mem, entry.elem);
+        let (name, form, has_imm, mem, elem) = (n, entry.form, entry.imm8, entry.mem, entry.elem);
 
         let mut size = mem_size(mem, vp.length);
         let mut m = self.modrm(fake, size, asz, b, i)?;
@@ -1449,7 +1419,9 @@ impl Decoder {
         let mut ops = Vec::new();
         // The `vvvv` field is a source register, and a scalar
         // instruction names it at the same width as the destination.
-        self.push_operands(&mut ops, form, &dst_shape, &m, reg, rm, size, os, fake, None);
+        self.push_operands(
+            &mut ops, form, &dst_shape, &m, reg, rm, size, os, fake, None,
+        );
         let mut imm_value = 0i64;
         if has_imm {
             imm_value = self.imm(b, i, 1)?;
@@ -1732,7 +1704,6 @@ fn with_broadcast(op: super::Operand, size: super::Size, lanes: u8) -> super::Op
         other => other,
     }
 }
-
 
 /// The size of the memory operand.
 /// The width of the memory operand in bytes, which is the unit a

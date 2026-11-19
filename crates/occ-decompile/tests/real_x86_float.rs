@@ -101,10 +101,10 @@ fn build() -> PathBuf {
     BINARY
         .get_or_init(|| {
             let n = SEQ.fetch_add(1, Ordering::SeqCst);
-            let dir = std::env::temp_dir()
-                .join(format!("occ-x86-float-{}-{n}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("occ-x86-float-{}-{n}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("create scratch directory");
-    occ_sys::cleanup::remove_dir_at_exit(&dir);
+            occ_sys::cleanup::remove_dir_at_exit(&dir);
             let src = dir.join("unit.c");
             std::fs::write(&src, SOURCE).expect("write source");
             let out = dir.join("unit");
@@ -228,10 +228,7 @@ fn the_atomic_path_survives_a_real_compilation() {
         !returned.contains('*'),
         "the result is the old value, not a re-read of memory:\n{add}"
     );
-    assert!(
-        add.contains("+ 3"),
-        "the addend is the constant:\n{add}"
-    );
+    assert!(add.contains("+ 3"), "the addend is the constant:\n{add}");
     let cas = decompile(&loaded, &function(&loaded, "atomic_cas"));
     println!("{cas}");
     // The exchange is conditional: the memory is written only when the

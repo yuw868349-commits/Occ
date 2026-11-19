@@ -13,17 +13,17 @@
 //!    works.
 
 use occ_core::{
-    Addr, Depth, Evidence, EvidenceKind, EvidenceSource, Function, Handle,
+    Addr, Depth, Evidence, EvidenceKind, EvidenceSource, Function, Handle, ResourceName,
 };
 use occ_json::Value;
-use std::sync::Arc;
 use occ_session::render::{
-    Envelope, addr, block_json, fingerprint_json, function_json, hexdump, image_json,
-    import_json, insn_json, reloc_json, section_json, string_json, symbol_json, xref_json,
-    export_json,
+    Envelope, addr, block_json, export_json, fingerprint_json, function_json, hexdump, image_json,
+    import_json, insn_json, reloc_json, resource_json, section_json, string_json, symbol_json,
+    xref_json,
 };
 use occ_session::session::{Session, Target};
 use occ_session::{ImageFile, diff, pattern};
+use std::sync::Arc;
 
 use crate::args::Args;
 use occ_session::obj;
@@ -81,7 +81,7 @@ macro_rules! tool {
     };
 }
 
-static TOOLS: [ToolDef; 39] = [
+static TOOLS: [ToolDef; 40] = [
     tool!(
         "session.info",
         "List open images and their ids, plus hypotheses and notes. Call this first when continuing a conversation to see what state exists.",
@@ -117,6 +117,12 @@ static TOOLS: [ToolDef; 39] = [
         "List sections with address, size, permissions and kind. Filter by name substring or kind.",
         r#"{"type":"object","properties":{"image":{"type":"integer"},"filter":{"type":"string","description":"substring of the section name"},"kind":{"type":"string","description":"code, data, rodata, bss, unwind, debug, ..."},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
         binary_sections
+    ),
+    tool!(
+        "binary.resources",
+        "List PE resource leaves: type, name, language, address, size. Dialog templates and string-table bundles are the two kinds that carry text a GUI never references by address.",
+        r#"{"type":"object","properties":{"image":{"type":"integer"},"type":{"type":"string","description":"substring of the resource type label, e.g. dialog or string-table"},"filter":{"type":"string","description":"substring of a string name"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
+        binary_resources
     ),
     tool!(
         "binary.imports",
@@ -377,7 +383,9 @@ fn handle_target(session: &Session, id: u32, target: &str) -> Result<Target, Str
     let file = session.image(id).ok_or("image is not open")?;
     // A function handle, a symbol name, or a bare address.
     if target.starts_with("fn:") {
-        return session.resolve(id, target, occ_core::HandleKind::Function).map_err(|e| e.to_string());
+        return session
+            .resolve(id, target, occ_core::HandleKind::Function)
+            .map_err(|e| e.to_string());
     }
     if let Some(addr) = occ_core::addr::parse_addr(target) {
         if let Some(f) = file.analysis.function_covering(addr) {
@@ -484,7 +492,10 @@ fn session_restore(session: &Session, args: &Args) -> Result<Value, String> {
         saved.images.len(),
         saved.hypotheses.len()
     ))
-    .field("warnings", Value::Array(warnings.iter().cloned().map(Value::String).collect()))
+    .field(
+        "warnings",
+        Value::Array(warnings.iter().cloned().map(Value::String).collect()),
+    )
     .caveats(warnings.clone());
     Ok(e.build())
 }
@@ -504,10 +515,7 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
         .field("image", Value::from(id))
         .field("identity", image_json(&file.image))
         .field("fingerprint", fp)
-        .field(
-            "coverage",
-            static_coverage_json(&file.analysis.coverage),
-        )
+        .field("coverage", static_coverage_json(&file.analysis.coverage))
         .field(
             "notes",
             Value::Array(
@@ -522,7 +530,14 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
         )
         .field(
             "warnings",
-            Value::Array(file.image.warnings.iter().cloned().map(Value::String).collect()),
+            Value::Array(
+                file.image
+                    .warnings
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         )
         .field(
             "entry",
@@ -557,10 +572,9 @@ fn binary_open(session: &Session, args: &Args) -> Result<Value, String> {
                 None => obj!("image" => Value::from(*mid)),
             })
             .collect::<Vec<_>>();
-        e = e.field("member_count", Value::from(ids.len())).field(
-            "members",
-            Value::Array(members),
-        );
+        e = e
+            .field("member_count", Value::from(ids.len()))
+            .field("members", Value::Array(members));
     }
     Ok(e.build())
 }
@@ -601,7 +615,14 @@ fn binary_info(session: &Session, args: &Args) -> Result<Value, String> {
         .field("coverage", static_coverage_json(&file.analysis.coverage))
         .field(
             "notes",
-            Value::Array(file.analysis.notes.iter().cloned().map(Value::String).collect()),
+            Value::Array(
+                file.analysis
+                    .notes
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
         );
     Ok(e.build())
 }
@@ -635,6 +656,38 @@ fn binary_sections(session: &Session, args: &Args) -> Result<Value, String> {
         .field("total", Value::from(total))
         .truncated(truncated)
         .next(vec!["binary.hexdump with a section address".into()])
+        .build())
+}
+
+fn binary_resources(session: &Session, args: &Args) -> Result<Value, String> {
+    let file = args.file(session)?;
+    let type_filter = args.opt_str("type").map(|s| s.to_ascii_lowercase());
+    let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
+    let (offset, limit) = args.page(200, 2000)?;
+    let items: Vec<Value> = file
+        .image
+        .resources
+        .iter()
+        .filter(|r| {
+            type_filter
+                .as_ref()
+                .map(|f| r.kind.label().to_ascii_lowercase().contains(f))
+                .unwrap_or(true)
+        })
+        .filter(|r| match (&filter, &r.name) {
+            (Some(f), ResourceName::String(s)) => s.to_ascii_lowercase().contains(f),
+            (Some(f), ResourceName::Id(id)) => id.to_string().contains(f.as_str()),
+            (None, _) => true,
+        })
+        .map(resource_json)
+        .collect();
+    let total = items.len();
+    let (page, truncated) = paginate(&items, offset, limit);
+    Ok(Envelope::ok(format!("{total} resource(s) match"))
+        .field("resources", Value::Array(page))
+        .field("total", Value::from(total))
+        .truncated(truncated)
+        .next(vec!["binary.hexdump at a resource address".into()])
         .build())
 }
 
@@ -903,15 +956,13 @@ fn binary_entropy(session: &Session, args: &Args) -> Result<Value, String> {
             .section_by_name(name)
             .ok_or_else(|| format!("no section named {name}"))?;
         let window = args.u64_in("window", 256, 1, 65536)? as usize;
-        let threshold = args.raw("threshold").and_then(|v| v.as_f64()).unwrap_or(7.2) as f32;
+        let threshold = args
+            .raw("threshold")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(7.2) as f32;
         let view = occ_analyze::view::View::new(&file.image, &file.data);
-        let wins = occ_analyze::entropy::sliding(
-            &view,
-            s.addr,
-            s.file_size as usize,
-            window,
-            threshold,
-        );
+        let wins =
+            occ_analyze::entropy::sliding(&view, s.addr, s.file_size as usize, window, threshold);
         return Ok(e
             .field("section", name)
             .field("window", Value::from(window))
@@ -934,26 +985,25 @@ fn binary_entropy(session: &Session, args: &Args) -> Result<Value, String> {
             .field("truncated_windows", Value::from(wins.len() > 500))
             .build());
     }
-    Ok(e
-        .field(
-            "sections",
-            Value::Array(
-                file.analysis
-                    .entropy
-                    .iter()
-                    .map(|s| {
-                        obj!(
-                            "section" => s.name.clone(),
-                            "kind" => format!("{:?}", s.kind),
-                            "size" => Value::from(s.size),
-                            "entropy" => f64::from(s.entropy),
-                            "high" => s.entropy >= occ_analyze::entropy::HIGH_ENTROPY,
-                        )
-                    })
-                    .collect(),
-            ),
-        )
-        .build())
+    Ok(e.field(
+        "sections",
+        Value::Array(
+            file.analysis
+                .entropy
+                .iter()
+                .map(|s| {
+                    obj!(
+                        "section" => s.name.clone(),
+                        "kind" => format!("{:?}", s.kind),
+                        "size" => Value::from(s.size),
+                        "entropy" => f64::from(s.entropy),
+                        "high" => s.entropy >= occ_analyze::entropy::HIGH_ENTROPY,
+                    )
+                })
+                .collect(),
+        ),
+    )
+    .build())
 }
 
 fn binary_fingerprint(session: &Session, args: &Args) -> Result<Value, String> {
@@ -1051,14 +1101,11 @@ fn code_function(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let target = args.req_str("target")?;
     let t = handle_target(session, id, target)?;
-    let f = function_of(&file, &t)
-        .ok_or_else(|| format!("no function contains {target}"))?;
+    let f = function_of(&file, &t).ok_or_else(|| format!("no function contains {target}"))?;
     let depth = args.depth()?;
     let include_body = args.bool_or("include_body", depth == Depth::Raw)?;
     let mut data = function_json(f, &file.analysis, depth, &file.image);
-    if include_body
-        && let Value::Object(m) = &mut data
-    {
+    if include_body && let Value::Object(m) = &mut data {
         m.insert(
             "body",
             Value::Array(
@@ -1086,11 +1133,13 @@ fn code_function(session: &Session, args: &Args) -> Result<Value, String> {
     .confidence(f.boundary_confidence)
     .next(vec![
         format!("code.blocks for {}", Handle::function(f.entry)),
-        format!("code.xrefs direction=to target={}", Handle::function(f.entry)),
+        format!(
+            "code.xrefs direction=to target={}",
+            Handle::function(f.entry)
+        ),
     ])
     .build())
 }
-
 
 fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
     let id = args.image(session)?;
@@ -1188,12 +1237,14 @@ fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
             );
         }
     }
-    Ok(e
-        .next(vec![
-            format!("code.disasm target={} for the instruction listing", Handle::function(f.entry)),
-            "debug.variables for names and types when the image carries DWARF".into(),
-        ])
-        .build())
+    Ok(e.next(vec![
+        format!(
+            "code.disasm target={} for the instruction listing",
+            Handle::function(f.entry)
+        ),
+        "debug.variables for names and types when the image carries DWARF".into(),
+    ])
+    .build())
 }
 
 /// Turn a solver verdict into a word a model can branch on.
@@ -1252,9 +1303,7 @@ fn code_explore(session: &Session, args: &Args) -> Result<Value, String> {
                         .and_then(occ_core::addr::parse_addr)
                         .map(|a| a.get())
                 })
-                .ok_or_else(|| {
-                    format!("`inputs.{name}` must be an integer or a hex string")
-                })?;
+                .ok_or_else(|| format!("`inputs.{name}` must be an integer or a hex string"))?;
             cfg.inputs.push((name.to_string(), word));
         }
     }
@@ -1360,7 +1409,11 @@ fn code_explore(session: &Session, args: &Args) -> Result<Value, String> {
 
     let feasible = report.feasible();
     let returns = report.returns();
-    let mut notes: Vec<Value> = report.notes.iter().map(|n| Value::from(n.as_str())).collect();
+    let mut notes: Vec<Value> = report
+        .notes
+        .iter()
+        .map(|n| Value::from(n.as_str()))
+        .collect();
     notes.extend(report.lift_notes.iter().map(|n| Value::from(n.as_str())));
     if cfg.mode == occ_sym::Mode::Symbolic {
         notes.push(Value::from(
@@ -1501,9 +1554,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
         Some(value) => {
             let list = value.as_array().ok_or("`sources` must be an array")?;
             for entry in list {
-                let word = entry
-                    .as_str()
-                    .ok_or("`sources` entries must be strings")?;
+                let word = entry.as_str().ok_or("`sources` entries must be strings")?;
                 sources.push(parse_source(word)?);
             }
         }
@@ -1546,7 +1597,11 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
             )
         })
         .collect();
-    let mut notes: Vec<Value> = report.notes.iter().map(|n| Value::from(n.as_str())).collect();
+    let mut notes: Vec<Value> = report
+        .notes
+        .iter()
+        .map(|n| Value::from(n.as_str()))
+        .collect();
     notes.extend(report.lift_notes.iter().map(|n| Value::from(n.as_str())));
     notes.push(Value::from(
         "calls are not interpreted: their return values inherit their arguments",
@@ -1587,7 +1642,13 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
         )
         .field(
             "sources",
-            Value::Array(report.sources.iter().map(|s| Value::from(s.as_str())).collect()),
+            Value::Array(
+                report
+                    .sources
+                    .iter()
+                    .map(|s| Value::from(s.as_str()))
+                    .collect(),
+            ),
         )
         .field("flows", Value::Array(flows))
         .field("converged", Value::from(report.converged))
@@ -1629,8 +1690,7 @@ fn code_taint(session: &Session, args: &Args) -> Result<Value, String> {
 fn callee_forwards(
     analysis: &occ_analyze::Analysis,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    let mut out: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut out: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
     for f in &analysis.functions {
         if f.insns.is_empty() {
             continue;
@@ -1673,14 +1733,8 @@ fn image_names_any(
     image: &occ_core::Image,
     wanted: &str,
 ) -> bool {
-    image
-        .imports
-        .iter()
-        .any(|i| i.name.contains(wanted))
-        || image
-        .exports
-        .iter()
-        .any(|e| e.name.contains(wanted))
+    image.imports.iter().any(|i| i.name.contains(wanted))
+        || image.exports.iter().any(|e| e.name.contains(wanted))
         || image.symbols.iter().any(|s| s.name.contains(wanted))
         || analysis
             .functions
@@ -1714,10 +1768,7 @@ fn parse_source(word: &str) -> Result<occ_sym::Source, String> {
     if word.starts_with("0x")
         && let Some(a) = occ_core::addr::parse_addr(word)
     {
-        return Ok(occ_sym::Source::Memory {
-            addr: a,
-            bytes: 8,
-        });
+        return Ok(occ_sym::Source::Memory { addr: a, bytes: 8 });
     }
     Ok(occ_sym::Source::Name(word.to_string()))
 }
@@ -1753,10 +1804,7 @@ fn code_disasm(session: &Session, args: &Args) -> Result<Value, String> {
         // Every instruction says which source line produced it, when the image
         // carries a line table. This is the join that turns a disassembly into
         // something a reader can check against the source.
-        if let Some((file, line, _col)) = file
-            .dwarf
-            .as_ref()
-            .and_then(|d| d.line_for(addr.addr))
+        if let Some((file, line, _col)) = file.dwarf.as_ref().and_then(|d| d.line_for(addr.addr))
             && let Some(obj) = v.as_object_mut()
         {
             obj.insert("source", Value::from(format!("{file}:{line}")));
@@ -1766,16 +1814,14 @@ fn code_disasm(session: &Session, args: &Args) -> Result<Value, String> {
     if out.is_empty() {
         return Err(format!("no instruction at {start}"));
     }
-    Ok(Envelope::ok(format!(
-        "{} instruction(s) from {}",
-        out.len(),
-        start
-    ))
-    .handle(Handle::insn(start).to_string())
-    .field("addr", addr(start))
-    .field("function", f.map(|f| f.display_name()).unwrap_or_default())
-    .field("insns", Value::Array(out))
-    .build())
+    Ok(
+        Envelope::ok(format!("{} instruction(s) from {}", out.len(), start))
+            .handle(Handle::insn(start).to_string())
+            .field("addr", addr(start))
+            .field("function", f.map(|f| f.display_name()).unwrap_or_default())
+            .field("insns", Value::Array(out))
+            .build(),
+    )
 }
 
 fn code_blocks(session: &Session, args: &Args) -> Result<Value, String> {
@@ -1942,12 +1988,24 @@ fn code_xrefs(session: &Session, args: &Args) -> Result<Value, String> {
     };
     let mut rows = Vec::new();
     if direction == "to" || direction == "both" {
-        for x in file.analysis.xrefs.to(at).filter(|x| kind_of(x)).take(limit) {
+        for x in file
+            .analysis
+            .xrefs
+            .to(at)
+            .filter(|x| kind_of(x))
+            .take(limit)
+        {
             rows.push(xref_json(x));
         }
     }
     if direction == "from" || direction == "both" {
-        for x in file.analysis.xrefs.from(at).filter(|x| kind_of(x)).take(limit) {
+        for x in file
+            .analysis
+            .xrefs
+            .from(at)
+            .filter(|x| kind_of(x))
+            .take(limit)
+        {
             rows.push(xref_json(x));
         }
     }
@@ -2044,7 +2102,10 @@ fn code_search(session: &Session, args: &Args) -> Result<Value, String> {
         for i in &f.insns {
             let ok = mnemonic
                 .as_ref()
-                .map(|m| i.mnemonic.to_ascii_lowercase() == *m || i.mnemonic.to_ascii_lowercase().starts_with(m))
+                .map(|m| {
+                    i.mnemonic.to_ascii_lowercase() == *m
+                        || i.mnemonic.to_ascii_lowercase().starts_with(m)
+                })
                 .unwrap_or(true)
                 && text
                     .as_ref()
@@ -2071,10 +2132,12 @@ fn code_search(session: &Session, args: &Args) -> Result<Value, String> {
         }
     }
     let truncated = rows.len() >= limit;
-    Ok(Envelope::ok(format!("{} matching instruction(s)", rows.len()))
-        .field("hits", Value::Array(rows))
-        .truncated(truncated)
-        .build())
+    Ok(
+        Envelope::ok(format!("{} matching instruction(s)", rows.len()))
+            .field("hits", Value::Array(rows))
+            .truncated(truncated)
+            .build(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,11 +2231,13 @@ fn hypothesis_evidence(session: &Session, args: &Args) -> Result<Value, String> 
         ev = ev.at(a);
     }
     let (verdict, confidence) = session.add_evidence(id, ev).map_err(|e| e.to_string())?;
-    Ok(Envelope::ok(format!("hypothesis {id}: {}", verdict.label()))
-        .handle(Handle::hypothesis(id).to_string())
-        .field("verdict", verdict.label())
-        .field("confidence", f64::from(confidence))
-        .build())
+    Ok(
+        Envelope::ok(format!("hypothesis {id}: {}", verdict.label()))
+            .handle(Handle::hypothesis(id).to_string())
+            .field("verdict", verdict.label())
+            .field("confidence", f64::from(confidence))
+            .build(),
+    )
 }
 
 fn hypothesis_list(session: &Session, _args: &Args) -> Result<Value, String> {
@@ -2210,8 +2275,12 @@ fn hypothesis_list(session: &Session, _args: &Args) -> Result<Value, String> {
 fn diff_functions(session: &Session, args: &Args) -> Result<Value, String> {
     let a_id = args.opt_u64("image_a")?.ok_or("`image_a` is required")? as u32;
     let b_id = args.opt_u64("image_b")?.ok_or("`image_b` is required")? as u32;
-    let fa = session.image(a_id).ok_or_else(|| format!("image {a_id} is not open"))?;
-    let fb = session.image(b_id).ok_or_else(|| format!("image {b_id} is not open"))?;
+    let fa = session
+        .image(a_id)
+        .ok_or_else(|| format!("image {a_id} is not open"))?;
+    let fb = session
+        .image(b_id)
+        .ok_or_else(|| format!("image {b_id} is not open"))?;
     let d = diff::diff(&fa.analysis, &fb.analysis);
     let only_changed = args.bool_or("only_changed", true)?;
     let limit = args.u64_in("limit", 100, 1, 2000)? as usize;
@@ -2250,13 +2319,16 @@ fn diff_functions(session: &Session, args: &Args) -> Result<Value, String> {
     Ok(Envelope::ok(d.summary())
         .field("summary", d.summary())
         .field("pairs", Value::Array(rows))
-        .field("counts", obj!(
-            "identical" => Value::from(d.count(diff::Change::Identical)),
-            "modified" => Value::from(d.count(diff::Change::Modified)),
-            "rewritten" => Value::from(d.count(diff::Change::Rewritten)),
-            "added" => Value::from(d.count(diff::Change::Added)),
-            "removed" => Value::from(d.count(diff::Change::Removed)),
-        ))
+        .field(
+            "counts",
+            obj!(
+                "identical" => Value::from(d.count(diff::Change::Identical)),
+                "modified" => Value::from(d.count(diff::Change::Modified)),
+                "rewritten" => Value::from(d.count(diff::Change::Rewritten)),
+                "added" => Value::from(d.count(diff::Change::Added)),
+                "removed" => Value::from(d.count(diff::Change::Removed)),
+            ),
+        )
         .truncated(d.pairs.len() > limit)
         .build())
 }
@@ -2284,14 +2356,10 @@ fn scan_pattern(session: &Session, args: &Args) -> Result<Value, String> {
     // a sweep.
     let mut rows: Vec<(String, String, Addr, Vec<String>)> = Vec::new();
     for s in &sections {
-        let Some(bytes) = file
-            .image
-            .section_by_name(&s.name)
-            .and_then(|sec| {
-                let view = occ_analyze::view::View::new(&file.image, &file.data);
-                view.bytes(sec.addr, sec.file_size as usize)
-            })
-        else {
+        let Some(bytes) = file.image.section_by_name(&s.name).and_then(|sec| {
+            let view = occ_analyze::view::View::new(&file.image, &file.data);
+            view.bytes(sec.addr, sec.file_size as usize)
+        }) else {
             continue;
         };
         for m in pattern::scan(bytes, s.start, &rules, &sections) {
@@ -2306,7 +2374,7 @@ fn scan_pattern(session: &Session, args: &Args) -> Result<Value, String> {
             }
         }
     }
-    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2 .0.cmp(&b.2 .0)));
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.0.cmp(&b.2.0)));
 
     let known_strings: std::collections::HashSet<u64> =
         file.analysis.strings.iter().map(|s| s.addr.0).collect();
@@ -2329,7 +2397,9 @@ fn scan_pattern(session: &Session, args: &Args) -> Result<Value, String> {
             if known_strings.contains(&at.0) {
                 m.insert(
                     "handle",
-                    Value::String(Handle::new(occ_core::HandleKind::Str, at.0.to_string()).to_string()),
+                    Value::String(
+                        Handle::new(occ_core::HandleKind::Str, at.0.to_string()).to_string(),
+                    ),
                 );
             }
             Value::Object(m)
@@ -2435,7 +2505,11 @@ fn debug_info(session: &Session, args: &Args) -> Result<Value, String> {
             )
         })
         .collect();
-    let files: Vec<Value> = dw.source_files().iter().map(|f| Value::from(f.as_str())).collect();
+    let files: Vec<Value> = dw
+        .source_files()
+        .iter()
+        .map(|f| Value::from(f.as_str()))
+        .collect();
     let notes: Vec<Value> = dw.notes.iter().map(|n| Value::from(n.as_str())).collect();
     let funcs = dw.function_count();
     Ok(Envelope::ok(format!(
@@ -2499,11 +2573,16 @@ fn debug_line(session: &Session, args: &Args) -> Result<Value, String> {
         .iter()
         .filter(|r| r.get("file").is_some_and(|v| !v.is_null()))
         .count();
-    Ok(Envelope::ok(format!("{found}/{} address(es) have a source line", rows.len()))
-        .field("lines", Value::Array(rows))
-        .truncated(false)
-        .next(vec!["debug.variables at the same address to see live variables".into()])
-        .build())
+    Ok(Envelope::ok(format!(
+        "{found}/{} address(es) have a source line",
+        rows.len()
+    ))
+    .field("lines", Value::Array(rows))
+    .truncated(false)
+    .next(vec![
+        "debug.variables at the same address to see live variables".into(),
+    ])
+    .build())
 }
 
 fn debug_functions(session: &Session, args: &Args) -> Result<Value, String> {
@@ -2547,12 +2626,14 @@ fn debug_functions(session: &Session, args: &Args) -> Result<Value, String> {
         })
         .collect();
     let (page, truncated) = paginate(&rows, offset, limit);
-    Ok(Envelope::ok(format!("{total} function(s) with debug info; sorted by {sort}"))
-        .field("functions", Value::Array(page))
-        .field("total", Value::from(total))
-        .truncated(truncated)
-        .next(vec!["debug.function with one of these handles".into()])
-        .build())
+    Ok(Envelope::ok(format!(
+        "{total} function(s) with debug info; sorted by {sort}"
+    ))
+    .field("functions", Value::Array(page))
+    .field("total", Value::from(total))
+    .truncated(truncated)
+    .next(vec!["debug.function with one of these handles".into()])
+    .build())
 }
 
 fn debug_function(session: &Session, args: &Args) -> Result<Value, String> {
@@ -2560,7 +2641,11 @@ fn debug_function(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let dw = dwarf_of(&file)?;
     let target = args.req_str("target")?;
-    let at = match args.opt_str("at").or(Some(target)).and_then(occ_core::addr::parse_addr) {
+    let at = match args
+        .opt_str("at")
+        .or(Some(target))
+        .and_then(occ_core::addr::parse_addr)
+    {
         Some(a) => a,
         None => {
             let t = handle_target(session, id, target)?;
@@ -2575,8 +2660,14 @@ fn debug_function(session: &Session, args: &Args) -> Result<Value, String> {
         .function_by_name(target)
         .or_else(|| dw.function_for(at))
         .ok_or_else(|| format!("no debug entry for {target}"))?;
-    let at = if at == f.low_pc { at } else { at.min(f.high_pc) };
-    let line = dw.line_for(at).map(|(file, line, col)| format!("{file}:{line}:{col}"));
+    let at = if at == f.low_pc {
+        at
+    } else {
+        at.min(f.high_pc)
+    };
+    let line = dw
+        .line_for(at)
+        .map(|(file, line, col)| format!("{file}:{line}:{col}"));
     let mut env = Envelope::ok(format!(
         "{}: {} param(s), {} local(s) at {}",
         f.name,
@@ -2652,7 +2743,9 @@ fn debug_types(session: &Session, args: &Args) -> Result<Value, String> {
         .field("types", Value::Array(page))
         .field("total", Value::from(total))
         .truncated(truncated)
-        .next(vec!["debug.function to see which types its variables use".into()])
+        .next(vec![
+            "debug.function to see which types its variables use".into(),
+        ])
         .build())
 }
 
@@ -2681,12 +2774,16 @@ fn debug_variables(session: &Session, args: &Args) -> Result<Value, String> {
         .chain(f.locals.iter())
         .map(|v| variable_json(v, at))
         .collect();
-    vars.sort_by_key(|v| std::cmp::Reverse(v.get("live").and_then(|x| x.as_bool()).unwrap_or(false)));
+    vars.sort_by_key(|v| {
+        std::cmp::Reverse(v.get("live").and_then(|x| x.as_bool()).unwrap_or(false))
+    });
     let live = vars
         .iter()
         .filter(|v| v.get("live").and_then(|x| x.as_bool()).unwrap_or(false))
         .count();
-    let line = dw.line_for(at).map(|(file, line, col)| format!("{file}:{line}:{col}"));
+    let line = dw
+        .line_for(at)
+        .map(|(file, line, col)| format!("{file}:{line}:{col}"));
     let mut env = Envelope::ok(format!(
         "{} variable(s), {live} with a location at {} inside {}",
         vars.len(),
@@ -2706,7 +2803,6 @@ fn debug_variables(session: &Session, args: &Args) -> Result<Value, String> {
         ])
         .build())
 }
-
 
 // ---------------------------------------------------------------------------
 // dynamic tracing
@@ -2924,7 +3020,11 @@ fn trace_run(session: &Session, args: &Args) -> Result<Value, String> {
         trace.millis,
         trace.end.label(),
         corr.functions.iter().filter(|f| f.hits > 0).count(),
-        file.analysis.functions.iter().filter(|f| !f.insns.is_empty()).count(),
+        file.analysis
+            .functions
+            .iter()
+            .filter(|f| !f.insns.is_empty())
+            .count(),
         corr.missed.len(),
         corr.orphans.len(),
         corr.calls.iter().filter(|c| c.indirect).count(),
@@ -2940,7 +3040,10 @@ fn trace_run(session: &Session, args: &Args) -> Result<Value, String> {
                 "{} reached {} target(s) at run time, first {}",
                 c.site,
                 c.targets.len(),
-                c.targets.first().map(|t| t.addr.to_string()).unwrap_or_default()
+                c.targets
+                    .first()
+                    .map(|t| t.addr.to_string())
+                    .unwrap_or_default()
             ),
             0.9,
         ));
@@ -3041,7 +3144,11 @@ fn trace_get(session: &Session, args: &Args) -> Result<Value, String> {
             trace.steps,
             trace.end.label(),
             corr.functions.iter().filter(|f| f.hits > 0).count(),
-            file.analysis.functions.iter().filter(|f| !f.insns.is_empty()).count(),
+            file.analysis
+                .functions
+                .iter()
+                .filter(|f| !f.insns.is_empty())
+                .count(),
             corr.orphans.len(),
             kinds
         );
@@ -3105,9 +3212,7 @@ fn trace_get(session: &Session, args: &Args) -> Result<Value, String> {
         .caveats(if complete {
             vec!["a block with zero hits was not entered during this run".into()]
         } else {
-            vec![
-                "the run was cut short, so a block with zero hits may still be reachable".into(),
-            ]
+            vec!["the run was cut short, so a block with zero hits may still be reachable".into()]
         })
         .next(vec![
             "trace.get without a target for the whole-run summary".into(),
@@ -3115,7 +3220,6 @@ fn trace_get(session: &Session, args: &Args) -> Result<Value, String> {
         ])
         .build())
 }
-
 
 #[cfg(test)]
 mod tests {

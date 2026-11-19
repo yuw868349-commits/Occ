@@ -634,7 +634,12 @@ impl Decoder {
                 // `66` prefix picks the other of the two.
                 let r = usize::from(op & 7);
                 let name = if op & 8 == 0 { "inc" } else { "dec" };
-                Some((name, FlowKind::Next, None, vec![Operand::Reg(os.regs(p.rex_present)[r])]))
+                Some((
+                    name,
+                    FlowKind::Next,
+                    None,
+                    vec![Operand::Reg(os.regs(p.rex_present)[r])],
+                ))
             }
             // The loop family: rel8 conditional branches that also decrement
             // rcx. `jrcxz` is the only one gcc emits, for `do { } while (n--)`.
@@ -712,7 +717,7 @@ impl Decoder {
                 let slot = self.push_size(os);
                 let r = ((op & 7) | p.rex_b()) as usize;
                 Some((
-                "push",
+                    "push",
                     FlowKind::Next,
                     None,
                     vec![Operand::Reg(slot.regs(p.rex_present)[r])],
@@ -722,7 +727,7 @@ impl Decoder {
                 let slot = self.push_size(os);
                 let r = ((op & 7) | p.rex_b()) as usize;
                 Some((
-                "pop",
+                    "pop",
                     FlowKind::Next,
                     None,
                     vec![Operand::Reg(slot.regs(p.rex_present)[r])],
@@ -1100,7 +1105,12 @@ impl Decoder {
                 // immediate byte, the base.
                 let base = self.imm(b, i, 1)?;
                 let name = if op == 0xd4 { "aam" } else { "aad" };
-                Some((name, FlowKind::Next, None, vec![Operand::Imm(base, Size::B)]))
+                Some((
+                    name,
+                    FlowKind::Next,
+                    None,
+                    vec![Operand::Imm(base, Size::B)],
+                ))
             }
             0x6c..=0x6f => {
                 // The string forms of `in` and `out`. The port is always `dx`
@@ -1339,7 +1349,12 @@ impl Decoder {
             }
             0xc2 => {
                 let v = self.imm(b, i, 2)?;
-                Some(("ret", FlowKind::Return, None, vec![Operand::Imm(v, Size::W)]))
+                Some((
+                    "ret",
+                    FlowKind::Return,
+                    None,
+                    vec![Operand::Imm(v, Size::W)],
+                ))
             }
             0xc3 => Some(("ret", FlowKind::Return, None, vec![])),
             // The far returns differ from the near ones in one bit, and
@@ -1348,7 +1363,12 @@ impl Decoder {
             // does not read.
             0xca => {
                 let v = self.imm(b, i, 2)?;
-                Some(("retf", FlowKind::Return, None, vec![Operand::Imm(v, Size::W)]))
+                Some((
+                    "retf",
+                    FlowKind::Return,
+                    None,
+                    vec![Operand::Imm(v, Size::W)],
+                ))
             }
             0xcb => Some(("retf", FlowKind::Return, None, vec![])),
             0xc6 | 0xc7 => {
@@ -1361,7 +1381,12 @@ impl Decoder {
                 if m.mode == 3 && (m.reg & 7) == 7 {
                     if op == 0xc6 {
                         let v = self.imm(b, i, 1)?;
-                        return Some(("xabort", FlowKind::Exception, None, vec![Operand::Imm(v, Size::B)]));
+                        return Some((
+                            "xabort",
+                            FlowKind::Exception,
+                            None,
+                            vec![Operand::Imm(v, Size::B)],
+                        ));
                     }
                     let v = self.imm(b, i, 4)?;
                     return Some((
@@ -1389,17 +1414,19 @@ impl Decoder {
                     "enter",
                     FlowKind::Next,
                     None,
-                    vec![
-                        Operand::Imm(frame, Size::W),
-                        Operand::Imm(level, Size::B),
-                    ],
+                    vec![Operand::Imm(frame, Size::W), Operand::Imm(level, Size::B)],
                 ))
             }
             0xc9 => Some(("leave", FlowKind::Next, None, vec![])),
             0xcc => Some(("int3", FlowKind::Interrupt, None, vec![])),
             0xcd => {
                 let v = self.imm(b, i, 1)?;
-                Some(("int", FlowKind::Interrupt, None, vec![Operand::Imm(v, Size::B)]))
+                Some((
+                    "int",
+                    FlowKind::Interrupt,
+                    None,
+                    vec![Operand::Imm(v, Size::B)],
+                ))
             }
             0xd0..=0xd3 => {
                 let size = if op & 1 == 0 { Size::B } else { os };
@@ -1560,7 +1587,11 @@ impl Decoder {
             // byte, because that byte is the whole instruction.
             match x87_register_form(op, modrm) {
                 Some((name, ops)) => {
-                    let name = if wait && name == "fnstsw" { "fstsw" } else { name };
+                    let name = if wait && name == "fnstsw" {
+                        "fstsw"
+                    } else {
+                        name
+                    };
                     Some((name, FlowKind::Next, None, ops))
                 }
                 None => Some((
@@ -1596,8 +1627,7 @@ impl Decoder {
             // The environment and state forms have no single width, so
             // they are printed without a size tag rather than with a
             // wrong one.
-            let operand = if matches!(name, "fldenv" | "fnstenv" | "frstor" | "fnsave")
-            {
+            let operand = if matches!(name, "fldenv" | "fnstenv" | "frstor" | "fnsave") {
                 let mem = m.mem.as_ref()?;
                 Operand::Mem {
                     base: mem.base,
@@ -1641,11 +1671,7 @@ impl Decoder {
                 // Forms 0/1 are `op r/m, r`; forms 2/3 are `op r, r/m`. The
                 // direction bit is the low bit of the form, not its parity of
                 // the byte size.
-                let ops = if form < 2 {
-                    vec![rm, r]
-                } else {
-                    vec![r, rm]
-                };
+                let ops = if form < 2 { vec![rm, r] } else { vec![r, rm] };
                 Some((name, FlowKind::Next, None, ops))
             }
             4 => {
@@ -1699,7 +1725,12 @@ impl Decoder {
                     5 => "verw",
                     _ => return None,
                 };
-                Some((name, FlowKind::Next, None, vec![mem_operand(&m, Size::W, p)]))
+                Some((
+                    name,
+                    FlowKind::Next,
+                    None,
+                    vec![mem_operand(&m, Size::W, p)],
+                ))
             }
             0x01 => {
                 // Group 7. The register forms are the privileged and
@@ -1866,11 +1897,7 @@ impl Decoder {
                         // `nop` forms of this opcode are the reserved
                         // encodings; this one is not reserved.
                         if p.rep == Some(0xf3) && m.mode == 3 && (m.reg & 7) == 1 {
-                            let name = if os == Size::Q {
-                                "rdsspq"
-                            } else {
-                                "rdsspd"
-                            };
+                            let name = if os == Size::Q { "rdsspq" } else { "rdsspd" };
                             return Some((name, FlowKind::Next, None, vec![]));
                         }
                         Some(("nop", FlowKind::Next, None, vec![mem_operand(&m, os, p)]))
@@ -2162,9 +2189,7 @@ impl Decoder {
         // The width of the r/m operand. The general-purpose forms follow the
         // operand-size prefix, except the ones the table says work on a byte.
         let rm_size = match entry.form {
-            sse_map::SseForm::GpReg
-            | sse_map::SseForm::GpMemStore
-            | sse_map::SseForm::GpRegMem => {
+            sse_map::SseForm::GpReg | sse_map::SseForm::GpMemStore | sse_map::SseForm::GpRegMem => {
                 if entry.rm == Size::D {
                     os
                 } else {
@@ -2318,7 +2343,12 @@ impl Decoder {
             } else {
                 mm_operand(&m, Size::X)
             };
-            return Some((name, FlowKind::Next, None, vec![dst, Operand::Imm(v, Size::B)]));
+            return Some((
+                name,
+                FlowKind::Next,
+                None,
+                vec![dst, Operand::Imm(v, Size::B)],
+            ));
         }
         // Two mandatory prefixes at once is not an encoding.
         let idx = match (p.op66, p.rep) {
@@ -2698,7 +2728,11 @@ impl Decoder {
                     // 64-bit mask is what a listing would print anyway.
                     _ => 64,
                 };
-                let mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+                let mask = if bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits) - 1
+                };
                 format!("{:#x}", (*v as u64) & mask)
             }
             Operand::Rel(v) => {
@@ -2788,37 +2822,37 @@ impl Decoder {
                         }
                         first = false;
                     } else {
-                    if let Some(b) = base {
-                        s.push_str(regs[usize::from(*b & 15)]);
-                        first = false;
-                    }
-                    if let Some(ix) = index {
-                        if !first {
-                            s.push_str(" + ");
+                        if let Some(b) = base {
+                            s.push_str(regs[usize::from(*b & 15)]);
+                            first = false;
                         }
-                        // A vector index register is named at the width
-                        // of the vector the instruction works on: the
-                        // gather reads its lanes from `ymm1`, not from
-                        // `rcx`.
-                        match vsib {
-                            Some(bits) => {
-                                let prefix = match bits {
-                                    256 => "ymm",
-                                    512 => "zmm",
-                                    _ => "xmm",
-                                };
-                                // A vector index has thirty-two names,
-                                // not sixteen: EVEX spends a second bit
-                                // on it.
-                                s.push_str(&format!("{prefix}{}", ix & 0x1f));
+                        if let Some(ix) = index {
+                            if !first {
+                                s.push_str(" + ");
                             }
-                            None => s.push_str(regs[usize::from(*ix & 15)]),
+                            // A vector index register is named at the width
+                            // of the vector the instruction works on: the
+                            // gather reads its lanes from `ymm1`, not from
+                            // `rcx`.
+                            match vsib {
+                                Some(bits) => {
+                                    let prefix = match bits {
+                                        256 => "ymm",
+                                        512 => "zmm",
+                                        _ => "xmm",
+                                    };
+                                    // A vector index has thirty-two names,
+                                    // not sixteen: EVEX spends a second bit
+                                    // on it.
+                                    s.push_str(&format!("{prefix}{}", ix & 0x1f));
+                                }
+                                None => s.push_str(regs[usize::from(*ix & 15)]),
+                            }
+                            if *scale > 1 {
+                                s.push_str(&format!("*{scale}"));
+                            }
+                            first = false;
                         }
-                        if *scale > 1 {
-                            s.push_str(&format!("*{scale}"));
-                        }
-                        first = false;
-                    }
                     }
                     if *disp != 0 || first {
                         if !first {
@@ -2863,8 +2897,6 @@ struct Prefix {
     rex_present: bool,
     count: usize,
 }
-
-
 
 impl Prefix {
     /// REX.R as a register-number offset: 0 or 8.
@@ -3015,8 +3047,20 @@ fn group7_mod3(reg: u8, rm: u8, p: &Prefix) -> Option<&'static str> {
 fn is_string_op(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
-        "movsb" | "movs" | "cmpsb" | "cmps" | "stosb" | "stos" | "lodsb" | "lods" | "scasb"
-            | "scas" | "insb" | "ins" | "outsb" | "outs"
+        "movsb"
+            | "movs"
+            | "cmpsb"
+            | "cmps"
+            | "stosb"
+            | "stos"
+            | "lodsb"
+            | "lods"
+            | "scasb"
+            | "scas"
+            | "insb"
+            | "ins"
+            | "outsb"
+            | "outs"
     )
 }
 
@@ -3115,54 +3159,22 @@ const fn sse_imm(op: u8, names: [&'static str; 4]) -> SseOp {
 /// conditions have a name of their own; the other eight keep the plain
 /// name, because the machine has no other spelling for them.
 const LEGACY_CMP_NAMES: [[&str; 4]; 16] = [
-    [
-        "cmpeqps", "cmpeqpd", "cmpeqss", "cmpeqsd",
-    ],
-    [
-        "cmpltps", "cmpltpd", "cmpltss", "cmpltsd",
-    ],
-    [
-        "cmpleps", "cmplepd", "cmpless", "cmplesd",
-    ],
-    [
-        "cmpunordps", "cmpunordpd", "cmpunordss", "cmpunordsd",
-    ],
-    [
-        "cmpneqps", "cmpneqpd", "cmpneqss", "cmpneqsd",
-    ],
-    [
-        "cmpnltps", "cmpnltpd", "cmpnltss", "cmpnltsd",
-    ],
-    [
-        "cmpnleps", "cmpnlepd", "cmpnless", "cmpnlesd",
-    ],
-    [
-        "cmpordps", "cmpordpd", "cmpordss", "cmpordsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
-    [
-        "cmpps", "cmppd", "cmpss", "cmpsd",
-    ],
+    ["cmpeqps", "cmpeqpd", "cmpeqss", "cmpeqsd"],
+    ["cmpltps", "cmpltpd", "cmpltss", "cmpltsd"],
+    ["cmpleps", "cmplepd", "cmpless", "cmplesd"],
+    ["cmpunordps", "cmpunordpd", "cmpunordss", "cmpunordsd"],
+    ["cmpneqps", "cmpneqpd", "cmpneqss", "cmpneqsd"],
+    ["cmpnltps", "cmpnltpd", "cmpnltss", "cmpnltsd"],
+    ["cmpnleps", "cmpnlepd", "cmpnless", "cmpnlesd"],
+    ["cmpordps", "cmpordpd", "cmpordss", "cmpordsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
+    ["cmpps", "cmppd", "cmpss", "cmpsd"],
 ];
 
 /// The SSE, SSE2, SSE3 and SSSE3 opcode map. Ops that are not listed decode as
@@ -3189,7 +3201,8 @@ const SSE_OPS: &[SseOp] = &[
         gp_reg: true,
         ..sse(0x50, ["movmskps", "movmskpd", "", ""])
     },
-    sse(0x51, ["sqrtps", "sqrtpd", "sqrtss", "sqrtsd"]),    sse(0x52, ["rsqrtps", "", "rsqrtss", ""]),
+    sse(0x51, ["sqrtps", "sqrtpd", "sqrtss", "sqrtsd"]),
+    sse(0x52, ["rsqrtps", "", "rsqrtss", ""]),
     sse(0x53, ["rcpps", "", "rcpss", ""]),
     sse(0x54, ["andps", "andpd", "", ""]),
     sse(0x55, ["andnps", "andnpd", "", ""]),
@@ -3476,32 +3489,46 @@ const SSE_OPS: &[SseOp] = &[
 /// are named for the few that appear in practice and otherwise reported with
 /// their own encoding.
 const X87_MEM: [[&str; 8]; 8] = [
-    ["fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr"],
-    ["fld", "", "fst", "fstp", "fldenv", "fldcw", "fnstenv", "fnstcw"],
-    ["fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr"],
+    [
+        "fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr",
+    ],
+    [
+        "fld", "", "fst", "fstp", "fldenv", "fldcw", "fnstenv", "fnstcw",
+    ],
+    [
+        "fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr",
+    ],
     ["fild", "fisttp", "fist", "fistp", "", "fld", "", "fstp"],
-    ["fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr"],
-    ["fld", "fisttp", "fst", "fstp", "frstor", "", "fnsave", "fnstsw"],
-    ["fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr"],
-    ["fild", "fisttp", "fist", "fistp", "fbld", "fild", "fbstp", "fistp"],
+    [
+        "fadd", "fmul", "fcom", "fcomp", "fsub", "fsubr", "fdiv", "fdivr",
+    ],
+    [
+        "fld", "fisttp", "fst", "fstp", "frstor", "", "fnsave", "fnstsw",
+    ],
+    [
+        "fiadd", "fimul", "ficom", "ficomp", "fisub", "fisubr", "fidiv", "fidivr",
+    ],
+    [
+        "fild", "fisttp", "fist", "fistp", "fbld", "fild", "fbstp", "fistp",
+    ],
 ];
 
 /// Width of an x87 memory operand. The encodings differ per opcode and, in a
 /// few slots, per register field.
 fn x87_mem_size(op: u8, reg: u8) -> Size {
     match (op & 7, reg) {
-        (0, _) => Size::D,          // D8: m32fp
+        (0, _) => Size::D,                   // D8: m32fp
         (1, 0) | (1, 2) | (1, 3) => Size::D, // D9: fld/fst/fstp m32fp
-        (1, _) => Size::W,          // D9: fldcw/fnstcw m16
-        (2, _) => Size::D,          // DA: m32int
-        (3, 5) | (3, 7) => Size::T, // DB: m80fp
-        (3, _) => Size::D,          // DB: m32int
-        (4, _) => Size::Q,          // DC: m64fp
-        (5, 7) => Size::W,          // DD /7: fnstsw m16
-        (5, _) => Size::Q,          // DD: m64fp
-        (6, _) => Size::W,          // DE: m16int
-        (7, 4) | (7, 6) => Size::X, // DF: packed BCD
-        (7, 5) | (7, 7) => Size::Q, // DF: m64int
+        (1, _) => Size::W,                   // D9: fldcw/fnstcw m16
+        (2, _) => Size::D,                   // DA: m32int
+        (3, 5) | (3, 7) => Size::T,          // DB: m80fp
+        (3, _) => Size::D,                   // DB: m32int
+        (4, _) => Size::Q,                   // DC: m64fp
+        (5, 7) => Size::W,                   // DD /7: fnstsw m16
+        (5, _) => Size::Q,                   // DD: m64fp
+        (6, _) => Size::W,                   // DE: m16int
+        (7, 4) | (7, 6) => Size::X,          // DF: packed BCD
+        (7, 5) | (7, 7) => Size::Q,          // DF: m64int
         _ => Size::W,
     }
 }
@@ -3657,8 +3684,6 @@ fn x87_register_form(op: u8, modrm: u8) -> Option<(&'static str, Vec<Operand>)> 
         _ => None,
     }
 }
-
-
 
 /// Width of the memory operand, from the mnemonic's suffix.
 fn sse_mem_size(name: &str) -> Size {
@@ -3885,7 +3910,12 @@ mod tests {
         ];
         for (bytes, mnemonic, len) in cases {
             let d = d64(bytes);
-            assert_eq!(d.insn.len, u32::from(*len), "{bytes:02x?} decoded as {}", d.insn.len);
+            assert_eq!(
+                d.insn.len,
+                u32::from(*len),
+                "{bytes:02x?} decoded as {}",
+                d.insn.len
+            );
             assert_eq!(d.insn.mnemonic.as_ref(), *mnemonic, "{}", d.insn.text);
         }
     }
@@ -4055,8 +4085,14 @@ mod tests {
 
     #[test]
     fn a_prefixed_instruction_keeps_its_prefix() {
-        assert_eq!(text(&[0xf0, 0x0f, 0xb1, 0x07]), "lock cmpxchg dword ptr [rdi], eax");
-        assert_eq!(text(&[0xf3, 0xa4]), "rep movsb byte ptr [rsi], byte ptr [rdi]");
+        assert_eq!(
+            text(&[0xf0, 0x0f, 0xb1, 0x07]),
+            "lock cmpxchg dword ptr [rdi], eax"
+        );
+        assert_eq!(
+            text(&[0xf3, 0xa4]),
+            "rep movsb byte ptr [rsi], byte ptr [rdi]"
+        );
     }
 
     #[test]
@@ -4445,7 +4481,10 @@ mod tests {
         // listing has five and loses the instruction stream for the rest of
         // the function, which is how a missing entry in one group turns into
         // hundreds of `not decoded` lines.
-        assert_eq!(text(&[0x0f, 0xc7, 0x5c, 0x24, 0x40]), "xrstors [rsp + 0x40]");
+        assert_eq!(
+            text(&[0x0f, 0xc7, 0x5c, 0x24, 0x40]),
+            "xrstors [rsp + 0x40]"
+        );
         assert_eq!(
             text(&[0x48, 0x0f, 0xc7, 0x5c, 0x24, 0x40]),
             "xrstors64 [rsp + 0x40]"
@@ -4484,7 +4523,10 @@ mod tests {
         assert_eq!(text(&[0xf3, 0x0f, 0x12, 0xc1]), "movsldup xmm0, xmm1");
         assert_eq!(text(&[0x0f, 0x16, 0xc1]), "movlhps xmm0, xmm1");
         assert_eq!(text(&[0xf3, 0x0f, 0x16, 0xc1]), "movshdup xmm0, xmm1");
-        assert_eq!(text(&[0xf2, 0x0f, 0x12, 0x01]), "movddup xmm0, qword ptr [rcx]");
+        assert_eq!(
+            text(&[0xf2, 0x0f, 0x12, 0x01]),
+            "movddup xmm0, qword ptr [rcx]"
+        );
     }
 
     #[test]

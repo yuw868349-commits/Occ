@@ -95,7 +95,11 @@ fn check(path: &Path, functions: &[&str]) -> (Image, usize) {
     let mut addrs: Vec<Addr> = analysis
         .functions
         .iter()
-        .filter(|f| functions.iter().any(|n| f.display_name().trim_start_matches('_') == *n))
+        .filter(|f| {
+            functions
+                .iter()
+                .any(|n| f.display_name().trim_start_matches('_') == *n)
+        })
         .map(|f| f.entry)
         .collect();
     addrs.sort_by_key(|a| a.0);
@@ -152,7 +156,11 @@ fn a_coff_object_yields_its_functions() {
 
 #[test]
 fn a_macho_object_yields_its_functions() {
-    let Some(path) = compile("clang", &["--target=x86_64-apple-macos11", "-O0"], "unit.mo") else {
+    let Some(path) = compile(
+        "clang",
+        &["--target=x86_64-apple-macos11", "-O0"],
+        "unit.mo",
+    ) else {
         return;
     };
     let (img, total) = check(&path, &["entry_point", "helper"]);

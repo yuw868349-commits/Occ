@@ -12,10 +12,7 @@ use occ_core::{Addr, ImageId};
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: sweep <file> [limit]");
-    let limit: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(40);
+    let limit: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(40);
 
     let data = std::fs::read(&path).expect("read");
     let img = occ_bin::load(&data, &path, ImageId(0)).expect("parse");

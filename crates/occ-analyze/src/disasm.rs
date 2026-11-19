@@ -24,8 +24,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use occ_core::{
     Addr, Arch, ArmMode, BasicBlock, CallTarget, EdgeKind, Evidence, EvidenceKind, EvidenceSource,
-    FlowKind, Function, Image, ImportKind, Instruction, RelocKind, SectionKind, Symbol,
-    SymbolKind, Xref, XrefKind,
+    FlowKind, Function, Image, ImportKind, Instruction, RelocKind, SectionKind, Symbol, SymbolKind,
+    Xref, XrefKind,
 };
 use occ_decode::AnyDecoder;
 
@@ -47,10 +47,12 @@ fn decode_at(view: &View, dec: &AnyDecoder, pc: Addr, bytes: &[u8]) -> Option<oc
         return dec.decode(pc, bytes);
     };
     match view.image().arm_mode_at(pc).unwrap_or(ArmMode::A32) {
-        ArmMode::T32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Thumb)
-            .decode(pc, bytes),
-        ArmMode::A32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Arm)
-            .decode(pc, bytes),
+        ArmMode::T32 => {
+            occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Thumb).decode(pc, bytes)
+        }
+        ArmMode::A32 => {
+            occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Arm).decode(pc, bytes)
+        }
         ArmMode::Data => None,
     }
 }
@@ -173,7 +175,11 @@ fn decode_native(
         let limit = match seed.size {
             Some(size) if size > 0 => {
                 let hinted = seed.addr.add(size);
-                if hinted < next_entry { hinted } else { next_entry }
+                if hinted < next_entry {
+                    hinted
+                } else {
+                    next_entry
+                }
             }
             _ => next_entry,
         };
@@ -196,10 +202,7 @@ fn decode_native(
             f.boundary_evidence.push(Evidence::support(
                 EvidenceKind::Symbol,
                 EvidenceSource::Loader,
-                format!(
-                    "{source} states a {}-byte body at {:#x}",
-                    f.size, f.entry.0
-                ),
+                format!("{source} states a {}-byte body at {:#x}", f.size, f.entry.0),
                 1.0,
             ));
         }
@@ -469,7 +472,10 @@ pub fn recover(view: &View, opts: &RecoverOptions) -> Recovery {
     }
     let code = code_bytes(view);
     if code > 0 {
-        let covered: u64 = functions.iter().map(|f| f.size.max(f.end().0 - f.entry.0)).sum();
+        let covered: u64 = functions
+            .iter()
+            .map(|f| f.size.max(f.end().0 - f.entry.0))
+            .sum();
         let pct = 100.0 * covered as f64 / code as f64;
         if pct < 40.0 {
             notes.push(format!(
@@ -558,7 +564,6 @@ fn decode_function(
     owned: &BTreeMap<u64, u64>,
     opts: &RecoverOptions,
 ) -> Outcome {
-
     let mut insns: BTreeMap<u64, Instruction> = BTreeMap::new();
     let mut case_targets: BranchTargets = BranchTargets::new();
     let mut tables: Vec<occ_core::JumpTable> = Vec::new();
@@ -754,10 +759,7 @@ fn decode_function(
     func.boundary_evidence = evidence;
     callees.sort_by_key(|a| a.0);
     callees.dedup();
-    Outcome {
-        func,
-        callees,
-    }
+    Outcome { func, callees }
 }
 
 /// Make every function's body and range exclusive.
@@ -1068,11 +1070,21 @@ fn collect_seeds(view: &View, thunks: &[(Addr, String)]) -> Vec<Seed> {
         if let Some(s) = image.section_by_name(name)
             && s.size > 0
         {
-            push(s.addr, Some(s.size), Some(name.trim_start_matches('.').into()));
+            push(
+                s.addr,
+                Some(s.size),
+                Some(name.trim_start_matches('.').into()),
+            );
         }
     }
     // Initialiser arrays hold function pointers.
-    for name in [".init_array", ".fini_array", ".preinit_array", ".ctors", ".dtors"] {
+    for name in [
+        ".init_array",
+        ".fini_array",
+        ".preinit_array",
+        ".ctors",
+        ".dtors",
+    ] {
         let Some(s) = image.section_by_name(name) else {
             continue;
         };
@@ -1083,7 +1095,9 @@ fn collect_seeds(view: &View, thunks: &[(Addr, String)]) -> Vec<Seed> {
             let target = image
                 .relocations
                 .iter()
-                .find(|r| r.offset == slot && matches!(r.kind, RelocKind::Relative | RelocKind::Absolute))
+                .find(|r| {
+                    r.offset == slot && matches!(r.kind, RelocKind::Relative | RelocKind::Absolute)
+                })
                 .and_then(|r| r.addend)
                 .map(|a| Addr(a as u64))
                 .or_else(|| view.read_ptr(slot).map(Addr));
@@ -1133,7 +1147,9 @@ fn find_thunks(view: &View, dec: &AnyDecoder) -> Vec<(Addr, String)> {
             let mut pc = addr;
             let mut rest = bytes;
             for _ in 0..4 {
-                let Some(d) = decode_at(view, dec, pc, rest) else { break };
+                let Some(d) = decode_at(view, dec, pc, rest) else {
+                    break;
+                };
                 let mut hit = None;
                 for m in d.insn.mem_reads.iter() {
                     if let Some(imp) = image.import_by_slot(*m) {
@@ -1269,8 +1285,8 @@ fn resolve_aarch64(view: &View, insns: &mut [Instruction]) {
 fn writes_rd(w: u32, _sf: bool) -> bool {
     let op0 = (w >> 25) & 0xf;
     match op0 {
-        0b1000 | 0b1001 => true,         // data processing immediate
-        0b0101 | 0b1101 => true,         // data processing register
+        0b1000 | 0b1001 => true, // data processing immediate
+        0b0101 | 0b1101 => true, // data processing register
         _ => {
             // Loads write Rt; stores do not.
             let top = (w >> 24) & 0x3f;
@@ -1511,9 +1527,17 @@ fn startup_main(view: &View, dec: &AnyDecoder, functions: &[Function]) -> Option
         Some(f) if f.insns.len() >= 2 => f.insns.clone(),
         _ => {
             let limit = section_end(view, entry).unwrap_or_else(|| entry.add(0x1000));
-            decode_function(view, dec, entry, None, limit, &owned, &RecoverOptions::default())
-                .func
-                .insns
+            decode_function(
+                view,
+                dec,
+                entry,
+                None,
+                limit,
+                &owned,
+                &RecoverOptions::default(),
+            )
+            .func
+            .insns
         }
     };
     if body.len() < 2 {
@@ -1604,7 +1628,8 @@ fn x86_writes_rdi(b: &[u8]) -> bool {
     let writes_reg = matches!(
         op,
         0x89 | 0x8b | 0x31 | 0x33 | 0x01 | 0x03 | 0x21 | 0x23 | 0x09 | 0x0b | 0x29 | 0x2b
-    ) || matches!(op, 0x0f) && b.get(1).is_some_and(|v| matches!(v & 0xf0, 0xb0..=0xbf));
+    ) || matches!(op, 0x0f)
+        && b.get(1).is_some_and(|v| matches!(v & 0xf0, 0xb0..=0xbf));
     if !writes_reg {
         return false;
     }
@@ -1691,6 +1716,59 @@ fn first_argument_riscv(insns: &[Instruction]) -> Option<u64> {
     None
 }
 
+/// True when `addr` falls inside the storage of a recovered jump table.
+fn inside_jump_table(functions: &[Function], addr: Addr) -> bool {
+    functions.iter().any(|f| {
+        f.jump_tables.iter().any(|t| {
+            let span = u64::from(t.entry_bytes) * u64::from(t.count);
+            addr.0 >= t.base.0 && addr.0 < t.base.0.saturating_add(span)
+        })
+    })
+}
+
+/// True when a decoded body begins like code rather than like data the
+/// decoder walked into.
+///
+/// The sweep has no symbol to trust, so a body that ends in `ret` is its only
+/// proof that the bytes are a function. That proof is too weak on x86: a
+/// jump table or a string can decode into a hundred instructions and happen
+/// to end on a `ret` byte. Two properties separate such a walk from a real
+/// entry without a frame record: it does not open with an instruction no
+/// compiler emits at a function entry, and it is not a run of the same
+/// instruction repeated — which is what a table of identical pointers
+/// decodes into.
+fn starts_like_code(insns: &[Instruction]) -> bool {
+    let Some(first) = insns.first() else {
+        return false;
+    };
+    if matches!(
+        &*first.mnemonic,
+        "into"
+            | "hlt"
+            | "iret"
+            | "iretd"
+            | "iretq"
+            | "cli"
+            | "sti"
+            | "in"
+            | "out"
+            | "bound"
+            | "int"
+            | "int3"
+            | "ud2"
+    ) {
+        return false;
+    }
+    let head: Vec<&str> = insns.iter().take(8).map(|i| i.text.as_str()).collect();
+    let mut duplicates = 0usize;
+    for (i, text) in head.iter().enumerate() {
+        if head[..i].iter().any(|t| *t == *text) {
+            duplicates += 1;
+        }
+    }
+    duplicates <= 2
+}
+
 /// True when the byte before `addr` is padding the compiler emitted between
 /// functions rather than code that falls through.
 fn padding_before(view: &View, addr: Addr) -> bool {
@@ -1772,7 +1850,12 @@ fn sweep(
     // that happen to open with a recognisable prologue, which is less than half
     // of a real binary.
     let mut pending: Vec<Addr> = Vec::new();
-    for s in view.image().sections.iter().filter(|s| s.is_code() && s.file_size > 0) {
+    for s in view
+        .image()
+        .sections
+        .iter()
+        .filter(|s| s.is_code() && s.file_size > 0)
+    {
         let mut addr = s.addr;
         // Only bytes the file holds can be decoded. `size` is the virtual
         // extent, which for `.bss`-like sections is larger than the file — and
@@ -1800,6 +1883,15 @@ fn sweep(
                 addr = addr.add(1);
                 continue;
             }
+            // A recovered switch owns the bytes of its table even though
+            // those bytes are not part of the body. Decoding from the middle
+            // of a table walks through pointers and lands in the next
+            // function, which is how a table became a 427-instruction
+            // "function" whose first instruction was `into`.
+            if inside_jump_table(functions, addr) {
+                addr = addr.add(1);
+                continue;
+            }
             // Padding is not code. Starting a decode in a run of `nop`/`int3`
             // produces a "function" whose body is the padding followed by the
             // real one, and its entry is a byte the compiler never meant as a
@@ -1811,7 +1903,10 @@ fn sweep(
             let boundary = if addr == s.addr {
                 true
             } else {
-                matches!(view.bytes(addr.offset(-1), 1), Some([0xcc] | [0x90] | [0x00]))
+                matches!(
+                    view.bytes(addr.offset(-1), 1),
+                    Some([0xcc] | [0x90] | [0x00])
+                )
             };
             // Fixed-width architectures do not need a prologue to prove a
             // function starts here: every arm64 instruction is four bytes and
@@ -1839,7 +1934,10 @@ fn sweep(
                 // those bytes belong to that function, whatever the decoder
                 // finds there.
                 let next_owned = owned
-                    .range((std::ops::Bound::Excluded(addr.0), std::ops::Bound::Unbounded))
+                    .range((
+                        std::ops::Bound::Excluded(addr.0),
+                        std::ops::Bound::Unbounded,
+                    ))
                     .next()
                     .map(|(start, _)| Addr(*start))
                     .unwrap_or(end);
@@ -1848,7 +1946,9 @@ fn sweep(
                     out.func.insns.last().map(|i| i.flow),
                     Some(FlowKind::Return)
                 );
-                if out.func.insns.len() >= 3 && (prologue || ends_in_return) {
+                if out.func.insns.len() >= 3
+                    && (prologue || (ends_in_return && starts_like_code(&out.func.insns)))
+                {
                     let mut f = out.func;
                     f.is_thunk = is_thunk(&f);
                     owned.insert(f.entry.0, f.end().0);
@@ -1879,7 +1979,10 @@ fn sweep(
             continue;
         }
         let next_owned = owned
-            .range((std::ops::Bound::Excluded(addr.0), std::ops::Bound::Unbounded))
+            .range((
+                std::ops::Bound::Excluded(addr.0),
+                std::ops::Bound::Unbounded,
+            ))
             .next()
             .map(|(start, _)| Addr(*start))
             .unwrap_or_else(|| section_end(view, addr).unwrap_or_else(|| addr.add(0x10_0000)));
@@ -1901,7 +2004,9 @@ fn sweep(
         ));
     }
     if added > 0 {
-        notes.push(format!("sweep recovered {added} functions without symbol support"));
+        notes.push(format!(
+            "sweep recovered {added} functions without symbol support"
+        ));
     }
 }
 

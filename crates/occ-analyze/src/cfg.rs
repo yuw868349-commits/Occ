@@ -113,9 +113,10 @@ pub fn build_blocks_with_branch_targets(
 /// Direct branch target, when the instruction has one that stays in the image.
 fn branch_target(insn: &Instruction) -> Option<Addr> {
     match (&insn.flow, &insn.target) {
-        (FlowKind::ConditionalBranch | FlowKind::UnconditionalBranch, Some(CallTarget::Direct { to })) => {
-            Some(*to)
-        }
+        (
+            FlowKind::ConditionalBranch | FlowKind::UnconditionalBranch,
+            Some(CallTarget::Direct { to }),
+        ) => Some(*to),
         _ => None,
     }
 }
@@ -224,8 +225,20 @@ mod tests {
         let b = build_blocks(&v, Addr(0x1000));
         assert_eq!(b.len(), 3);
         assert_eq!(b[0].edges.len(), 2);
-        assert_eq!(b[0].edges[0], Edge { to: Addr(0x1006), kind: EdgeKind::True });
-        assert_eq!(b[0].edges[1], Edge { to: Addr(0x1002), kind: EdgeKind::False });
+        assert_eq!(
+            b[0].edges[0],
+            Edge {
+                to: Addr(0x1006),
+                kind: EdgeKind::True
+            }
+        );
+        assert_eq!(
+            b[0].edges[1],
+            Edge {
+                to: Addr(0x1002),
+                kind: EdgeKind::False
+            }
+        );
     }
 
     #[test]

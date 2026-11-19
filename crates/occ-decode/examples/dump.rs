@@ -36,12 +36,7 @@ fn main() {
         // instructions around it have been read.
         occ_decode::arm::apply_it_conditions(&mut list);
         for insn in &list {
-            println!(
-                "{:8x}: {:<44} {}",
-                insn.addr.get(),
-                insn.text,
-                hex(insn)
-            );
+            println!("{:8x}: {:<44} {}", insn.addr.get(), insn.text, hex(insn));
         }
     }
 }
@@ -57,10 +52,12 @@ fn decode(
         return dec.decode(addr, bytes);
     };
     match img.arm_mode_at(addr).unwrap_or(ArmMode::A32) {
-        ArmMode::T32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Thumb)
-            .decode(addr, bytes),
-        ArmMode::A32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Arm)
-            .decode(addr, bytes),
+        ArmMode::T32 => {
+            occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Thumb).decode(addr, bytes)
+        }
+        ArmMode::A32 => {
+            occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Arm).decode(addr, bytes)
+        }
         ArmMode::Data => None,
     }
 }

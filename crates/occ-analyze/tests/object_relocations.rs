@@ -191,7 +191,10 @@ fn aarch64_tail_call_reaches_outside_the_object() {
     let path = fixture("fixture.aarch64.o");
     let (mut data, image) = open(&path);
     let applied = occ_bin::reloc::apply(&mut data, &image).expect("an object needs relocations");
-    assert!(applied.externals > 0, "the fixture calls `ext`: {applied:?}");
+    assert!(
+        applied.externals > 0,
+        "the fixture calls `ext`: {applied:?}"
+    );
     let view = View::new(&image, &data);
     let analysis = Analysis::build(&view, &AnalysisOptions::default());
 

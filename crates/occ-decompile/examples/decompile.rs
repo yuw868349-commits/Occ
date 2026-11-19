@@ -33,9 +33,18 @@ fn main() {
         .expect("function not found");
 
     if std::env::var("OCC_DEBUG").is_ok() {
-        eprintln!("function {} entry={} blocks={} insns={}", func.display_name(), func.entry, func.blocks.len(), func.insns.len());
+        eprintln!(
+            "function {} entry={} blocks={} insns={}",
+            func.display_name(),
+            func.entry,
+            func.blocks.len(),
+            func.insns.len()
+        );
         for b in &func.blocks {
-            eprintln!("  block {:#x} insns {}..{}", b.start.0, b.insn_start, b.insn_end);
+            eprintln!(
+                "  block {:#x} insns {}..{}",
+                b.start.0, b.insn_start, b.insn_end
+            );
             for i in &func.insns[b.insn_start..b.insn_end] {
                 eprintln!("      {}", i.text);
             }

@@ -57,9 +57,10 @@ impl Args {
     pub fn opt_u64(&self, key: &str) -> Result<Option<u64>, String> {
         match self.get(key) {
             None => Ok(None),
-            Some(Value::Number(n)) => n.as_u64().map(Some).ok_or_else(|| {
-                format!("`{key}` must be a non-negative integer, got {n}")
-            }),
+            Some(Value::Number(n)) => n
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| format!("`{key}` must be a non-negative integer, got {n}")),
             Some(other) => Err(format!(
                 "`{key}` must be a non-negative integer, got {}",
                 other.type_name()
@@ -93,7 +94,10 @@ impl Args {
         match self.get(key) {
             None => Ok(default),
             Some(Value::Bool(b)) => Ok(*b),
-            Some(other) => Err(format!("`{key}` must be true or false, got {}", other.type_name())),
+            Some(other) => Err(format!(
+                "`{key}` must be true or false, got {}",
+                other.type_name()
+            )),
         }
     }
 
@@ -136,17 +140,22 @@ impl Args {
                 "`{key}` is {s:?}; use one of {}",
                 allowed.join(", ")
             )),
-            Some(other) => Err(format!("`{key}` must be a string, got {}", other.type_name())),
+            Some(other) => Err(format!(
+                "`{key}` must be a string, got {}",
+                other.type_name()
+            )),
         }
     }
 
     /// Render depth, defaulting to `detail`.
     pub fn depth(&self) -> Result<Depth, String> {
-        Ok(match self.one_of("depth", "detail", &["summary", "detail", "raw"])? {
-            "summary" => Depth::Summary,
-            "raw" => Depth::Raw,
-            _ => Depth::Detail,
-        })
+        Ok(
+            match self.one_of("depth", "detail", &["summary", "detail", "raw"])? {
+                "summary" => Depth::Summary,
+                "raw" => Depth::Raw,
+                _ => Depth::Detail,
+            },
+        )
     }
 
     /// Pagination as `(offset, limit)`. Callers compute truncation as

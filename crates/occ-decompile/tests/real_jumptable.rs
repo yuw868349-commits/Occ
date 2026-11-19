@@ -138,7 +138,11 @@ fn a_switch_compiled_to_a_table_is_recovered() {
     let mut unique = table.targets.clone();
     unique.sort_by_key(|a| a.0);
     unique.dedup();
-    assert_eq!(unique.len(), table.targets.len(), "the table repeats a target");
+    assert_eq!(
+        unique.len(),
+        table.targets.len(),
+        "the table repeats a target"
+    );
 }
 
 #[test]
@@ -158,12 +162,7 @@ fn the_decompiled_switch_lists_every_case() {
             .map(|f| f.display_name())
             .unwrap_or_else(|| format!("sub_{:x}", a.get()))
     };
-    let d = occ_decompile::decompile(
-        &image,
-        f,
-        &occ_decompile::Options::default(),
-        &name_of,
-    );
+    let d = occ_decompile::decompile(&image, f, &occ_decompile::Options::default(), &name_of);
     let code = occ_decompile::render::render(&d);
 
     assert!(
@@ -181,5 +180,8 @@ fn the_decompiled_switch_lists_every_case() {
         code.contains("0xa;") || code.contains("10;"),
         "a case body is missing:\n{code}"
     );
-    assert_eq!(d.unstructured, 0, "the switch structured without a goto:\n{code}");
+    assert_eq!(
+        d.unstructured, 0,
+        "the switch structured without a goto:\n{code}"
+    );
 }

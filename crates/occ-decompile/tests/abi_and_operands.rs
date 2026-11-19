@@ -286,8 +286,11 @@ fn windows_x64_takes_its_arguments_from_the_first_four_registers() {
         }
     }
     assert!(
-        four.iter()
-            .any(|r| r == &["rcx", "rdx", "r8", "r9"].iter().map(|s| s.to_string()).collect::<Vec<_>>()),
+        four.iter().any(|r| r
+            == &["rcx", "rdx", "r8", "r9"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()),
         "a four-argument function reads all four registers: {four:?}"
     );
 }
@@ -326,7 +329,10 @@ fn a_parameter_lists_every_position_up_to_the_last_one_used() {
         // The last parameter has to be the highest register the body reads,
         // and every register below it has to be listed too.
         if let Some(last) = program.param_regs.last() {
-            let at = order.iter().position(|r| r == last).expect("an ABI register");
+            let at = order
+                .iter()
+                .position(|r| r == last)
+                .expect("an ABI register");
             assert_eq!(
                 program.param_regs.len(),
                 at + 1,

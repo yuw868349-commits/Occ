@@ -16,7 +16,6 @@
 //! can be rebuilt from the same bytes and will make the same decisions, which
 //! is what makes a cached result safe to reuse across turns of a conversation.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 

@@ -13,7 +13,6 @@
 //! without one rather than guessed: a wrong variable location is worse than a
 //! missing one, because it looks like a finding.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -250,9 +249,13 @@ impl Dwarf {
         let mut pos = 0usize;
         while pos + 11 < info.len() {
             let unit_start = pos;
-            let Some(len) = read_u32(info, &mut pos) else { break };
+            let Some(len) = read_u32(info, &mut pos) else {
+                break;
+            };
             let (unit_len, is64) = if len == 0xffff_ffff {
-                let Some(l) = read_u64(info, &mut pos) else { break };
+                let Some(l) = read_u64(info, &mut pos) else {
+                    break;
+                };
                 (l as usize, true)
             } else {
                 (len as usize, false)
@@ -264,19 +267,31 @@ impl Dwarf {
                 ));
                 break;
             }
-            let Some(version) = read_u16(info, &mut pos) else { break };
+            let Some(version) = read_u16(info, &mut pos) else {
+                break;
+            };
             let (unit_type, addr_size, abbrev_off) = if version >= 5 {
-                let Some(ut) = read_u8(info, &mut pos) else { break };
-                let Some(as_) = read_u8(info, &mut pos) else { break };
-                let Some(ab) = read_u32(info, &mut pos) else { break };
+                let Some(ut) = read_u8(info, &mut pos) else {
+                    break;
+                };
+                let Some(as_) = read_u8(info, &mut pos) else {
+                    break;
+                };
+                let Some(ab) = read_u32(info, &mut pos) else {
+                    break;
+                };
                 // Skeleton and split units carry an extra 8-byte signature.
                 if ut == 0x04 || ut == 0x05 || ut == 0x02 {
                     pos += 8;
                 }
                 (ut, as_, u64::from(ab))
             } else {
-                let Some(ab) = read_u32(info, &mut pos) else { break };
-                let Some(as_) = read_u8(info, &mut pos) else { break };
+                let Some(ab) = read_u32(info, &mut pos) else {
+                    break;
+                };
+                let Some(as_) = read_u8(info, &mut pos) else {
+                    break;
+                };
                 (0x01u8, as_, u64::from(ab))
             };
             if addr_size != 4 && addr_size != 8 {
@@ -306,7 +321,8 @@ impl Dwarf {
                 str_offsets_base: std::cell::Cell::new(8),
                 addr_base: std::cell::Cell::new(8),
             };
-            let (mut dies, _consumed) = read_dies(&context, info, pos, unit_start, &abbrevs, addr_size);
+            let (mut dies, _consumed) =
+                read_dies(&context, info, pos, unit_start, &abbrevs, addr_size);
             // The root DIE's own string references were read before its
             // base was known. When the unit names a base other than the
             // usual 8, read it again so the unit's name comes from the right
@@ -492,11 +508,14 @@ fn parse_abbrevs(data: &[u8], offset: usize) -> Option<HashMap<u64, Abbrev>> {
             };
             attrs.push((at, form, implicit));
         }
-        out.insert(code, Abbrev {
-            tag,
-            children,
-            attrs,
-        });
+        out.insert(
+            code,
+            Abbrev {
+                tag,
+                children,
+                attrs,
+            },
+        );
     }
     Some(out)
 }
@@ -518,7 +537,9 @@ fn read_dies(
         // References point at the abbreviation code byte, so the offset has to
         // be taken before the code is consumed.
         let die_offset = pos;
-        let Some(code) = uleb(info, &mut pos) else { break };
+        let Some(code) = uleb(info, &mut pos) else {
+            break;
+        };
         if code == 0 {
             if depth == 0 {
                 break;
@@ -741,9 +762,8 @@ fn read_uint_bytes(data: &[u8], pos: &mut usize, n: usize) -> Option<u64> {
 
 fn read_strx(ctx: &Context<'_>, idx: u64) -> String {
     let width = if ctx.is64 { 8 } else { 4 };
-    let at = (ctx.str_offsets_base.get() as usize).saturating_add(
-        (idx as usize).saturating_mul(width),
-    );
+    let at =
+        (ctx.str_offsets_base.get() as usize).saturating_add((idx as usize).saturating_mul(width));
     let Some(b) = ctx.str_offsets.get(at..at + width) else {
         return String::new();
     };
@@ -903,19 +923,22 @@ const DW_AT_COUNT: u64 = 0x37;
 const DW_AT_CALL_FILE: u64 = 0x58;
 const DW_AT_CALL_LINE: u64 = 0x59;
 
-fn build_unit(
-    ctx: &Context<'_>,
-    dies: &[Die],
-    unit: &mut Unit,
-    line_sec: &[u8],
-    view: &View<'_>,
-) {
+fn build_unit(ctx: &Context<'_>, dies: &[Die], unit: &mut Unit, line_sec: &[u8], view: &View<'_>) {
     if let Some(root) = dies.first() {
         if root.tag == DW_TAG_COMPILE_UNIT {
-            unit.producer = root.get(DW_AT_PRODUCER).and_then(|v| v.as_str()).map(str::to_string);
+            unit.producer = root
+                .get(DW_AT_PRODUCER)
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             unit.language = root.get(DW_AT_LANGUAGE).and_then(|v| v.as_u64());
-            unit.comp_dir = root.get(DW_AT_COMP_DIR).and_then(|v| v.as_str()).map(str::to_string);
-            unit.name = root.get(DW_AT_NAME).and_then(|v| v.as_str()).map(str::to_string);
+            unit.comp_dir = root
+                .get(DW_AT_COMP_DIR)
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            unit.name = root
+                .get(DW_AT_NAME)
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             if let Some(Value::Uint(off)) = root.get(DW_AT_STMT_LIST) {
                 unit.lines = line::parse(
                     line_sec,
@@ -1017,7 +1040,10 @@ fn build_unit(
                     low_pc: Addr(low),
                     high_pc: Addr(high),
                     decl_file: decl_file(d, unit, ctx.version),
-                    decl_line: d.get(DW_AT_DECL_LINE).and_then(|v| v.as_u64()).map(|n| n as u32),
+                    decl_line: d
+                        .get(DW_AT_DECL_LINE)
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32),
                     return_type: d
                         .get(DW_AT_TYPE)
                         .and_then(|v| v.as_u64())
@@ -1076,8 +1102,7 @@ fn build_unit(
                                         }
                                         Some(v) => {
                                             let ranges = locate(ctx, v.as_u64(), unit_base);
-                                            let first =
-                                                ranges.first().map(|r| r.expr.clone());
+                                            let first = ranges.first().map(|r| r.expr.clone());
                                             (first, ranges)
                                         }
                                         None => (None, Vec::new()),
@@ -1283,7 +1308,11 @@ fn byte_size_at(
 /// 0-based file indices.
 fn decl_file(d: &Die, unit: &Unit, version: u16) -> Option<String> {
     let idx = d.get(DW_AT_DECL_FILE).and_then(|v| v.as_u64())? as usize;
-    let idx = if version >= 5 { idx } else { idx.checked_sub(1)? };
+    let idx = if version >= 5 {
+        idx
+    } else {
+        idx.checked_sub(1)?
+    };
     unit.lines.files.get(idx).cloned()
 }
 
@@ -1314,7 +1343,11 @@ fn inline_frame(
         .and_then(|v| v.as_u64())
         .and_then(|n| {
             let n = n as usize;
-            let n = if ctx.version >= 5 { n } else { n.checked_sub(1)? };
+            let n = if ctx.version >= 5 {
+                n
+            } else {
+                n.checked_sub(1)?
+            };
             unit.lines.files.get(n).cloned()
         });
     Some(InlineFrame {
@@ -1322,7 +1355,10 @@ fn inline_frame(
         low_pc: Addr(low),
         high_pc: Addr(high),
         call_file,
-        call_line: d.get(DW_AT_CALL_LINE).and_then(|v| v.as_u64()).map(|n| n as u32),
+        call_line: d
+            .get(DW_AT_CALL_LINE)
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u32),
     })
 }
 
@@ -1353,7 +1389,6 @@ fn attr_chain(
     }
     None
 }
-
 
 /// Resolve a location-list reference into address ranges.
 ///
@@ -1527,7 +1562,11 @@ fn render_expr(bytes: &[u8], parts: &mut Vec<String>, depth: u32) {
             },
             0x94 | 0x95 => match read_u8(bytes, &mut pos) {
                 Some(n) => {
-                    let name = if op == 0x94 { "deref_size" } else { "xderef_size" };
+                    let name = if op == 0x94 {
+                        "deref_size"
+                    } else {
+                        "xderef_size"
+                    };
                     parts.push(format!("{name} {n}"));
                 }
                 None => break,
@@ -1551,9 +1590,13 @@ fn render_expr(bytes: &[u8], parts: &mut Vec<String>, depth: u32) {
                 parts.push(format!("bit_piece {size} {offset}"));
             }
             0x9e => {
-                let Some(len) = uleb(bytes, &mut pos) else { break };
+                let Some(len) = uleb(bytes, &mut pos) else {
+                    break;
+                };
                 let Ok(len) = usize::try_from(len) else { break };
-                let Some(block) = bytes.get(pos..pos + len) else { break };
+                let Some(block) = bytes.get(pos..pos + len) else {
+                    break;
+                };
                 pos += len;
                 parts.push(format!("implicit_value {}", hex_block(block)));
             }
@@ -1572,9 +1615,13 @@ fn render_expr(bytes: &[u8], parts: &mut Vec<String>, depth: u32) {
             },
             0xa3 => {
                 // A nested expression inside a ULEB-length block.
-                let Some(len) = uleb(bytes, &mut pos) else { break };
+                let Some(len) = uleb(bytes, &mut pos) else {
+                    break;
+                };
                 let Ok(len) = usize::try_from(len) else { break };
-                let Some(block) = bytes.get(pos..pos + len) else { break };
+                let Some(block) = bytes.get(pos..pos + len) else {
+                    break;
+                };
                 pos += len;
                 let mut inner = Vec::new();
                 if depth < 4 {
@@ -1592,7 +1639,11 @@ fn render_expr(bytes: &[u8], parts: &mut Vec<String>, depth: u32) {
             },
             0xa6 | 0xa7 => match uleb(bytes, &mut pos) {
                 Some(n) => {
-                    let name = if op == 0xa6 { "deref_type" } else { "xderef_type" };
+                    let name = if op == 0xa6 {
+                        "deref_type"
+                    } else {
+                        "xderef_type"
+                    };
                     parts.push(format!("{name} {n}"));
                 }
                 None => break,
@@ -1648,9 +1699,15 @@ mod tests {
         assert_eq!(describe_expr(&[0x9c]), "call_frame_cfa");
         assert_eq!(describe_expr(&[0x50]), "reg0");
         // DW_OP_breg5 +8 ; DW_OP_deref_size 4
-        assert_eq!(describe_expr(&[0x75, 0x08, 0x94, 0x04]), "breg5+8 deref_size 4");
+        assert_eq!(
+            describe_expr(&[0x75, 0x08, 0x94, 0x04]),
+            "breg5+8 deref_size 4"
+        );
         // DW_OP_lit3 ; DW_OP_stack_value ; DW_OP_piece 4
-        assert_eq!(describe_expr(&[0x33, 0x9f, 0x93, 0x04]), "const 3 stack_value piece 4");
+        assert_eq!(
+            describe_expr(&[0x33, 0x9f, 0x93, 0x04]),
+            "const 3 stack_value piece 4"
+        );
         // DW_OP_addr 0x1000
         assert_eq!(
             describe_expr(&[0x03, 0x00, 0x10, 0, 0, 0, 0, 0, 0]),

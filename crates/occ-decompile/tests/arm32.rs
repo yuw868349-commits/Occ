@@ -24,8 +24,7 @@ struct Loaded {
 fn load() -> Loaded {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/fixture.arm32.o");
-    let mut data =
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut data = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     let image = occ_bin::load(&data, &path.display().to_string(), occ_core::ImageId(0))
         .expect("the fixture parses");
     assert_eq!(image.arch, occ_core::Arch::Arm, "the fixture is 32-bit ARM");
@@ -92,7 +91,10 @@ fn a_32_bit_function_is_lifted_rather_than_outlined() {
     // And the width is read from the image, not assumed: a 32-bit function
     // that returns `u64` tells its caller about an upper half that never
     // existed.
-    assert!(!code.contains("u64"), "the word is four bytes wide:\n{code}");
+    assert!(
+        !code.contains("u64"),
+        "the word is four bytes wide:\n{code}"
+    );
     assert!(code.contains("u32 add("), "{code}");
 }
 
@@ -162,7 +164,10 @@ fn the_frame_a_function_builds_is_not_part_of_what_it_computes() {
     // traffic says the function stores four values it never uses.
     let code = loaded.code("chain");
     assert!(!code.contains("frame"), "the frame is not a value:\n{code}");
-    assert!(!code.contains("*(u32*)"), "the frame is not a store:\n{code}");
+    assert!(
+        !code.contains("*(u32*)"),
+        "the frame is not a store:\n{code}"
+    );
     // The two calls are still there, and the second one is not a tail
     // call: the value it returns is added to the first one's.
     assert!(code.contains("add(a0, 1)"), "{code}");
@@ -181,7 +186,10 @@ fn a_double_word_load_reads_two_words() {
         2,
         "two four-byte reads:\n{code}"
     );
-    assert!(code.contains("+ 4"), "the second word is at the next address:\n{code}");
+    assert!(
+        code.contains("+ 4"),
+        "the second word is at the next address:\n{code}"
+    );
 }
 
 #[test]
@@ -231,7 +239,10 @@ fn a_signed_product_is_signed() {
     // `smull` is the same multiply read as a signed number, and its high
     // half is not the unsigned one's.
     assert!(code.contains("i64 signed_wide("), "{code}");
-    assert!(code.contains("(i64)"), "the factors are widened signed:\n{code}");
+    assert!(
+        code.contains("(i64)"),
+        "the factors are widened signed:\n{code}"
+    );
 }
 
 #[test]
@@ -248,7 +259,10 @@ fn a_shift_says_which_bit_fell_off_the_end() {
     // take the second bit of the number instead of the first, and the
     // product would lose its top bit: the shift's own result is dead here,
     // because only the flag it sets is used.
-    assert!(code.contains("rcr("), "the rotate through the carry:\n{code}");
+    assert!(
+        code.contains("rcr("),
+        "the rotate through the carry:\n{code}"
+    );
     assert!(
         code.contains("& 1) == 1"),
         "the carry is the bit that fell off the end:\n{code}"

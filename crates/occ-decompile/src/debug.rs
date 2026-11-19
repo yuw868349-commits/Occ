@@ -26,9 +26,9 @@ use std::collections::HashMap;
 
 use occ_core::Addr;
 
+use crate::Program;
 use crate::ir::{Expr, Stmt};
 use crate::lift::slot_name;
-use crate::Program;
 
 /// Everything the debug information says about one function.
 #[derive(Clone, Debug, Default)]
@@ -171,10 +171,7 @@ impl DebugInfo {
 
     /// The type of a variable, for the signature.
     pub fn param_types(&self) -> Vec<Option<String>> {
-        self.params
-            .iter()
-            .map(|p| p.type_name.clone())
-            .collect()
+        self.params.iter().map(|p| p.type_name.clone()).collect()
     }
 
     /// Render a parameter declaration: `struct point *p`, or `u64 p` when the
@@ -203,7 +200,11 @@ impl DebugInfo {
 pub fn apply(program: &mut Program, info: &DebugInfo, frame_base_slot: Option<i64>) {
     let mut renames: Vec<(String, String)> = Vec::new();
     let mut aliases: HashMap<String, String> = program.param_aliases.iter().cloned().collect();
-    let mut alias_order: Vec<String> = program.param_aliases.iter().map(|(r, _)| r.clone()).collect();
+    let mut alias_order: Vec<String> = program
+        .param_aliases
+        .iter()
+        .map(|(r, _)| r.clone())
+        .collect();
 
     for (i, p) in info.params.iter().enumerate() {
         match &p.loc {
@@ -435,9 +436,7 @@ pub fn pointee<'a>(info: &'a DebugInfo, ty: &str) -> Option<&'a DebugType> {
         .or_else(|| base.strip_prefix("union "))
         .or_else(|| base.strip_prefix("class "))
         .unwrap_or(base);
-    info.types
-        .iter()
-        .find(|t| t.name == base || t.name == bare)
+    info.types.iter().find(|t| t.name == base || t.name == bare)
 }
 
 /// The expression for a member access, when one applies.
@@ -570,10 +569,7 @@ mod tests {
             succs: vec![Vec::new()],
             params: vec!["a0".into(), "a1".into()],
             param_regs: vec!["rdi".into(), "rsi".into()],
-            param_aliases: vec![
-                ("rdi".into(), "a0".into()),
-                ("rsi".into(), "a1".into()),
-            ],
+            param_aliases: vec![("rdi".into(), "a0".into()), ("rsi".into(), "a1".into())],
             ret_type: None,
             notes: Vec::new(),
         };

@@ -235,12 +235,19 @@ impl SignatureDb {
             if matching.len() < 2 {
                 continue;
             }
-            let best = matching.iter().map(|&i| self.entries[i].len()).max().unwrap_or(0);
+            let best = matching
+                .iter()
+                .map(|&i| self.entries[i].len())
+                .max()
+                .unwrap_or(0);
             let winners: Vec<usize> = matching
                 .into_iter()
                 .filter(|&i| self.entries[i].len() == best)
                 .collect();
-            let mut names: Vec<&str> = winners.iter().map(|&i| self.entries[i].name.as_str()).collect();
+            let mut names: Vec<&str> = winners
+                .iter()
+                .map(|&i| self.entries[i].name.as_str())
+                .collect();
             names.sort_unstable();
             names.dedup();
             if names.len() > 1 {
@@ -294,7 +301,9 @@ impl SignatureDb {
             // A body at the end of a section is shorter than the read; fall
             // back rather than skipping it, and let `matches` reject a
             // signature longer than what could be read.
-            let Some(code) = view.bytes(f.entry, 64).or_else(|| view.bytes(f.entry, DEFAULT_LEN))
+            let Some(code) = view
+                .bytes(f.entry, 64)
+                .or_else(|| view.bytes(f.entry, DEFAULT_LEN))
             else {
                 continue;
             };
@@ -376,14 +385,14 @@ impl SignatureDb {
             };
             let bytes = unhex(hex).ok_or_else(|| format!("line {}: bytes are not hex", n + 1))?;
             if mask.len() != bytes.len() || !mask.bytes().all(|c| c == b'0' || c == b'1') {
-                return Err(format!(
-                    "line {}: mask must be one 0/1 per byte",
-                    n + 1
-                ));
+                return Err(format!("line {}: mask must be one 0/1 per byte", n + 1));
             }
             let mask: Vec<bool> = mask.bytes().map(|c| c == b'1').collect();
             if bytes.len() < MIN_LEN {
-                return Err(format!("line {}: signature shorter than {MIN_LEN} bytes", n + 1));
+                return Err(format!(
+                    "line {}: signature shorter than {MIN_LEN} bytes",
+                    n + 1
+                ));
             }
             db.insert(Signature {
                 name: name.to_string(),

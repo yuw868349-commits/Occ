@@ -382,13 +382,9 @@ fn byte_accounting(functions: &[Function]) -> (u64, u64, u64) {
     let mut ranges: Vec<(u64, u64, bool)> = functions
         .iter()
         .flat_map(|f| {
-            f.insns.iter().map(|i| {
-                (
-                    i.addr.0,
-                    i.end().0,
-                    i.mnemonic.starts_with('.'),
-                )
-            })
+            f.insns
+                .iter()
+                .map(|i| (i.addr.0, i.end().0, i.mnemonic.starts_with('.')))
         })
         .filter(|(a, b, _)| b > a)
         .collect();
@@ -404,7 +400,8 @@ fn byte_accounting(functions: &[Function]) -> (u64, u64, u64) {
 
     // Sweep the endpoints. Depths are per kind; a byte is understood when at
     // least one instruction covers it, whatever else also covers it.
-    let mut events: Vec<(u64, i32, i32, i32)> = Vec::with_capacity(ranges.len() * 2 + bodies.len() * 2);
+    let mut events: Vec<(u64, i32, i32, i32)> =
+        Vec::with_capacity(ranges.len() * 2 + bodies.len() * 2);
     for (a, b, is_data) in ranges {
         if is_data {
             events.push((a, 1, 0, 0));
@@ -540,7 +537,13 @@ mod tests {
         let b = body(0x1008, 0x10, Vec::new());
         let (insn, unparsed, holes) = byte_accounting(&[a, b]);
         assert_eq!((insn, unparsed, holes), (4, 0, 0x14));
-        assert_eq!(union_len(&[body(0x1000, 0x10, Vec::new()), body(0x1008, 0x10, Vec::new())]), 0x18);
+        assert_eq!(
+            union_len(&[
+                body(0x1000, 0x10, Vec::new()),
+                body(0x1008, 0x10, Vec::new())
+            ]),
+            0x18
+        );
     }
 
     #[test]

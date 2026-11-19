@@ -41,7 +41,11 @@ struct Rng(u64);
 
 impl Rng {
     fn new(seed: u64) -> Rng {
-        Rng(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+        Rng(if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        })
     }
 
     fn next(&mut self) -> u64 {
@@ -54,7 +58,11 @@ impl Rng {
     }
 
     fn below(&mut self, n: usize) -> usize {
-        if n == 0 { 0 } else { (self.next() % n as u64) as usize }
+        if n == 0 {
+            0
+        } else {
+            (self.next() % n as u64) as usize
+        }
     }
 
     fn byte(&mut self) -> u8 {
@@ -196,8 +204,8 @@ fn panics() -> &'static Mutex<Vec<String>> {
 
 /// Run one input at the requested depth.
 fn exercise(data: &[u8], path: &Path, deep: bool) -> Result<(), String> {
-    let image = occ_bin::load(data, &path.display().to_string(), ImageId(0))
-        .map_err(|e| e.to_string())?;
+    let image =
+        occ_bin::load(data, &path.display().to_string(), ImageId(0)).map_err(|e| e.to_string())?;
     if !deep {
         return Ok(());
     }
@@ -365,7 +373,10 @@ fn main() {
         }
     }
     if corpus.is_empty() {
-        eprintln!("fuzz_probe: no seed under {} is <= {max_seed} bytes", seeds_dir.display());
+        eprintln!(
+            "fuzz_probe: no seed under {} is <= {max_seed} bytes",
+            seeds_dir.display()
+        );
         std::process::exit(2);
     }
 

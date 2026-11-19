@@ -12,7 +12,6 @@
 //! section sequence. A unified reader would have to abstract away the very
 //! differences each parser exists to handle.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -22,10 +21,10 @@ pub mod demangle;
 pub mod elf;
 pub mod macho;
 pub mod pe;
-pub mod wasm;
 pub mod reader;
 pub mod reloc;
 pub mod sha256;
+pub mod wasm;
 
 use occ_core::{CoreError, Format, Image, ImageId, Result};
 

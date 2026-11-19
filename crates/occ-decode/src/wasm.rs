@@ -136,26 +136,134 @@ const SIMPLE: &[(u8, &str, Imm)] = &[
 
 /// 0x45..=0xc4, the arithmetic block, in encoding order.
 const ARITH: [&str; 0x80] = [
-    "i32.eqz", "i32.eq", "i32.ne", "i32.lt_s", "i32.lt_u", "i32.gt_s", "i32.gt_u", "i32.le_s",
-    "i32.le_u", "i32.ge_s", "i32.ge_u", "i64.eqz", "i64.eq", "i64.ne", "i64.lt_s", "i64.lt_u",
-    "i64.gt_s", "i64.gt_u", "i64.le_s", "i64.le_u", "i64.ge_s", "i64.ge_u", "f32.eq", "f32.ne",
-    "f32.lt", "f32.gt", "f32.le", "f32.ge", "f64.eq", "f64.ne", "f64.lt", "f64.gt", "f64.le",
-    "f64.ge", "i32.clz", "i32.ctz", "i32.popcnt", "i32.add", "i32.sub", "i32.mul", "i32.div_s",
-    "i32.div_u", "i32.rem_s", "i32.rem_u", "i32.and", "i32.or", "i32.xor", "i32.shl", "i32.shr_s",
-    "i32.shr_u", "i32.rotl", "i32.rotr", "i64.clz", "i64.ctz", "i64.popcnt", "i64.add", "i64.sub",
-    "i64.mul", "i64.div_s", "i64.div_u", "i64.rem_s", "i64.rem_u", "i64.and", "i64.or", "i64.xor",
-    "i64.shl", "i64.shr_s", "i64.shr_u", "i64.rotl", "i64.rotr", "f32.abs", "f32.neg", "f32.ceil",
-    "f32.floor", "f32.trunc", "f32.nearest", "f32.sqrt", "f32.add", "f32.sub", "f32.mul",
-    "f32.div", "f32.min", "f32.max", "f32.copysign", "f64.abs", "f64.neg", "f64.ceil", "f64.floor",
-    "f64.trunc", "f64.nearest", "f64.sqrt", "f64.add", "f64.sub", "f64.mul", "f64.div", "f64.min",
-    "f64.max", "f64.copysign", "i32.wrap_i64", "i32.trunc_f32_s", "i32.trunc_f32_u",
-    "i32.trunc_f64_s", "i32.trunc_f64_u", "i64.extend_i32_s", "i64.extend_i32_u",
-    "i64.trunc_f32_s", "i64.trunc_f32_u", "i64.trunc_f64_s", "i64.trunc_f64_u",
-    "f32.convert_i32_s", "f32.convert_i32_u", "f32.convert_i64_s", "f32.convert_i64_u",
-    "f32.demote_f64", "f64.convert_i32_s", "f64.convert_i32_u", "f64.convert_i64_s",
-    "f64.convert_i64_u", "f64.promote_f32", "i32.reinterpret_f32", "i64.reinterpret_f64",
-    "f32.reinterpret_i32", "f64.reinterpret_i64", "i32.extend8_s", "i32.extend16_s",
-    "i64.extend8_s", "i64.extend16_s", "i64.extend32_s",
+    "i32.eqz",
+    "i32.eq",
+    "i32.ne",
+    "i32.lt_s",
+    "i32.lt_u",
+    "i32.gt_s",
+    "i32.gt_u",
+    "i32.le_s",
+    "i32.le_u",
+    "i32.ge_s",
+    "i32.ge_u",
+    "i64.eqz",
+    "i64.eq",
+    "i64.ne",
+    "i64.lt_s",
+    "i64.lt_u",
+    "i64.gt_s",
+    "i64.gt_u",
+    "i64.le_s",
+    "i64.le_u",
+    "i64.ge_s",
+    "i64.ge_u",
+    "f32.eq",
+    "f32.ne",
+    "f32.lt",
+    "f32.gt",
+    "f32.le",
+    "f32.ge",
+    "f64.eq",
+    "f64.ne",
+    "f64.lt",
+    "f64.gt",
+    "f64.le",
+    "f64.ge",
+    "i32.clz",
+    "i32.ctz",
+    "i32.popcnt",
+    "i32.add",
+    "i32.sub",
+    "i32.mul",
+    "i32.div_s",
+    "i32.div_u",
+    "i32.rem_s",
+    "i32.rem_u",
+    "i32.and",
+    "i32.or",
+    "i32.xor",
+    "i32.shl",
+    "i32.shr_s",
+    "i32.shr_u",
+    "i32.rotl",
+    "i32.rotr",
+    "i64.clz",
+    "i64.ctz",
+    "i64.popcnt",
+    "i64.add",
+    "i64.sub",
+    "i64.mul",
+    "i64.div_s",
+    "i64.div_u",
+    "i64.rem_s",
+    "i64.rem_u",
+    "i64.and",
+    "i64.or",
+    "i64.xor",
+    "i64.shl",
+    "i64.shr_s",
+    "i64.shr_u",
+    "i64.rotl",
+    "i64.rotr",
+    "f32.abs",
+    "f32.neg",
+    "f32.ceil",
+    "f32.floor",
+    "f32.trunc",
+    "f32.nearest",
+    "f32.sqrt",
+    "f32.add",
+    "f32.sub",
+    "f32.mul",
+    "f32.div",
+    "f32.min",
+    "f32.max",
+    "f32.copysign",
+    "f64.abs",
+    "f64.neg",
+    "f64.ceil",
+    "f64.floor",
+    "f64.trunc",
+    "f64.nearest",
+    "f64.sqrt",
+    "f64.add",
+    "f64.sub",
+    "f64.mul",
+    "f64.div",
+    "f64.min",
+    "f64.max",
+    "f64.copysign",
+    "i32.wrap_i64",
+    "i32.trunc_f32_s",
+    "i32.trunc_f32_u",
+    "i32.trunc_f64_s",
+    "i32.trunc_f64_u",
+    "i64.extend_i32_s",
+    "i64.extend_i32_u",
+    "i64.trunc_f32_s",
+    "i64.trunc_f32_u",
+    "i64.trunc_f64_s",
+    "i64.trunc_f64_u",
+    "f32.convert_i32_s",
+    "f32.convert_i32_u",
+    "f32.convert_i64_s",
+    "f32.convert_i64_u",
+    "f32.demote_f64",
+    "f64.convert_i32_s",
+    "f64.convert_i32_u",
+    "f64.convert_i64_s",
+    "f64.convert_i64_u",
+    "f64.promote_f32",
+    "i32.reinterpret_f32",
+    "i64.reinterpret_f64",
+    "f32.reinterpret_i32",
+    "f64.reinterpret_i64",
+    "i32.extend8_s",
+    "i32.extend16_s",
+    "i64.extend8_s",
+    "i64.extend16_s",
+    "i64.extend32_s",
 ];
 
 /// 0xfc sub-opcodes up to 7 take no immediates.
@@ -261,7 +369,9 @@ pub fn decode(
             Err(_) if (0x45..=0xc4).contains(&op) => (ARITH[usize::from(op - 0x45)], Imm::None),
             Err(_) => match op {
                 0xfc => {
-                    let Some(sub) = leb_u32(body, &mut pos) else { break };
+                    let Some(sub) = leb_u32(body, &mut pos) else {
+                        break;
+                    };
                     match decode_fc(sub, body, &mut pos) {
                         Some(name) => (name, Imm::None),
                         None => {
@@ -307,14 +417,18 @@ pub fn decode(
         match imm {
             Imm::None => {}
             Imm::BlockType => {
-                let Some(bt) = block_type(body, &mut pos) else { break };
+                let Some(bt) = block_type(body, &mut pos) else {
+                    break;
+                };
                 let suffix = bt.describe(types);
                 if !suffix.is_empty() {
                     text.push_str(&suffix);
                 }
             }
             Imm::Label => {
-                let Some(depth) = leb_u32(body, &mut pos) else { break };
+                let Some(depth) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 text.push(' ');
                 match frame_at(&stack, depth) {
                     Some(f) => {
@@ -325,7 +439,9 @@ pub fn decode(
                 }
             }
             Imm::BrTable => {
-                let Some(count) = leb_u32(body, &mut pos) else { break };
+                let Some(count) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 let mut depths = Vec::new();
                 let mut ok = true;
                 for _ in 0..count.min(1_000_000) {
@@ -337,7 +453,9 @@ pub fn decode(
                         }
                     }
                 }
-                let Some(default) = leb_u32(body, &mut pos) else { break };
+                let Some(default) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 if !ok {
                     break;
                 }
@@ -371,7 +489,9 @@ pub fn decode(
                     .collect();
             }
             Imm::Func => {
-                let Some(index) = leb_u32(body, &mut pos) else { break };
+                let Some(index) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" {index}"));
                 if let Some(to) = call_target(index) {
                     call_target_at = Some(to.get());
@@ -379,54 +499,80 @@ pub fn decode(
                 }
             }
             Imm::TypeTable => {
-                let Some(ty) = leb_u32(body, &mut pos) else { break };
-                let Some(table) = leb_u32(body, &mut pos) else { break };
+                let Some(ty) = leb_u32(body, &mut pos) else {
+                    break;
+                };
+                let Some(table) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" type {ty}, table {table}"));
             }
             Imm::Var => {
-                let Some(index) = leb_u32(body, &mut pos) else { break };
+                let Some(index) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" {index}"));
             }
             Imm::MemArg => {
-                let Some(align) = leb_u32(body, &mut pos) else { break };
-                let Some(off) = leb_u32(body, &mut pos) else { break };
+                let Some(align) = leb_u32(body, &mut pos) else {
+                    break;
+                };
+                let Some(off) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" align={align} offset={off}"));
             }
             Imm::Mem => {
-                let Some(index) = body.get(pos).copied() else { break };
+                let Some(index) = body.get(pos).copied() else {
+                    break;
+                };
                 pos += 1;
                 text.push_str(&format!(" {index}"));
             }
             Imm::I32 => {
-                let Some(v) = leb_i32(body, &mut pos) else { break };
+                let Some(v) = leb_i32(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" {v}"));
             }
             Imm::I64 => {
-                let Some(v) = leb_i64(body, &mut pos) else { break };
+                let Some(v) = leb_i64(body, &mut pos) else {
+                    break;
+                };
                 text.push_str(&format!(" {v}"));
             }
             Imm::F32 => {
-                let Some(chunk) = body.get(pos..pos + 4) else { break };
+                let Some(chunk) = body.get(pos..pos + 4) else {
+                    break;
+                };
                 pos += 4;
                 let bits = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 text.push_str(&format!(" {}", f32::from_bits(bits)));
             }
             Imm::F64 => {
-                let Some(chunk) = body.get(pos..pos + 8) else { break };
+                let Some(chunk) = body.get(pos..pos + 8) else {
+                    break;
+                };
                 pos += 8;
                 let mut raw = [0u8; 8];
                 raw.copy_from_slice(chunk);
                 text.push_str(&format!(" {}", f64::from_bits(u64::from_le_bytes(raw))));
             }
             Imm::Heap => {
-                let Some(heap) = body.get(pos).copied() else { break };
+                let Some(heap) = body.get(pos).copied() else {
+                    break;
+                };
                 pos += 1;
                 text.push_str(&format!(" {}", heap_name(heap)));
             }
             Imm::SelectTypes => {
-                let Some(count) = leb_u32(body, &mut pos) else { break };
+                let Some(count) = leb_u32(body, &mut pos) else {
+                    break;
+                };
                 for _ in 0..count.min(64) {
-                    let Some(t) = body.get(pos).copied() else { break };
+                    let Some(t) = body.get(pos).copied() else {
+                        break;
+                    };
                     pos += 1;
                     text.push_str(&format!(" {}", heap_name(t)));
                 }
@@ -505,11 +651,7 @@ pub fn decode(
                 .map(|r| r.offset)
                 // An `end` at the very end of the body: the target is one past
                 // the last byte, which is where the caller resumes.
-                .or_else(|| {
-                    frame
-                        .end
-                        .map(|e| raws[e].offset + u64::from(raws[e].len))
-                }),
+                .or_else(|| frame.end.map(|e| raws[e].offset + u64::from(raws[e].len))),
         }
     };
 
@@ -807,7 +949,11 @@ mod tests {
         // block ; br 0 ; nop ; end ; nop ; end
         let body = [0x00, 0x02, 0x40, 0x0c, 0x00, 0x01, 0x0b, 0x01, 0x0b];
         let out = decode(&body, 0, &no_calls, &[]);
-        let br = out.insns.iter().find(|i| i.mnemonic.as_ref() == "br").unwrap();
+        let br = out
+            .insns
+            .iter()
+            .find(|i| i.mnemonic.as_ref() == "br")
+            .unwrap();
         assert_eq!(br.addr, Addr(3));
         match br.target.clone() {
             Some(CallTarget::Direct { to }) => assert_eq!(to, Addr(7)),
@@ -821,7 +967,11 @@ mod tests {
         // loop ; nop ; br 0 ; end ; end
         let body = [0x00, 0x03, 0x40, 0x01, 0x0c, 0x00, 0x0b, 0x0b];
         let out = decode(&body, 0, &no_calls, &[]);
-        let br = out.insns.iter().find(|i| i.mnemonic.as_ref() == "br").unwrap();
+        let br = out
+            .insns
+            .iter()
+            .find(|i| i.mnemonic.as_ref() == "br")
+            .unwrap();
         match br.target.clone() {
             Some(CallTarget::Direct { to }) => assert_eq!(to, Addr(3)),
             other => panic!("expected a direct target, got {other:?}"),

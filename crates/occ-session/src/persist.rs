@@ -14,9 +14,7 @@
 
 use std::path::{Component, Path};
 
-use occ_core::{
-    Addr, CoreError, Evidence, EvidenceKind, EvidenceSource, HypothesisState, Result,
-};
+use occ_core::{Addr, CoreError, Evidence, EvidenceKind, EvidenceSource, HypothesisState, Result};
 use occ_json::{Map, Value};
 
 use crate::session::Session;
@@ -233,8 +231,12 @@ pub fn load(path: &str) -> Result<SavedSession> {
                 .opt_u64("id")
                 .map_err(|e| bad(path, format!("images[{n}]: {e}")))?
                 .ok_or_else(|| bad(path, format!("images[{n}]: missing `id`")))?;
-            let id = u32::try_from(id)
-                .map_err(|_| bad(path, format!("images[{n}]: id {id} does not fit in 32 bits")))?;
+            let id = u32::try_from(id).map_err(|_| {
+                bad(
+                    path,
+                    format!("images[{n}]: id {id} does not fit in 32 bits"),
+                )
+            })?;
             let image_path = o
                 .opt_str("path")
                 .map_err(|e| bad(path, format!("images[{n}]: {e}")))?
@@ -280,7 +282,10 @@ pub fn load(path: &str) -> Result<SavedSession> {
             {
                 None => None,
                 Some(id) => Some(u32::try_from(id).map_err(|_| {
-                    bad(path, format!("hypotheses[{n}]: image {id} does not fit in 32 bits"))
+                    bad(
+                        path,
+                        format!("hypotheses[{n}]: image {id} does not fit in 32 bits"),
+                    )
                 })?),
             };
 
@@ -311,7 +316,9 @@ pub fn load(path: &str) -> Result<SavedSession> {
                     let raw = o
                         .opt_f64("confidence")
                         .map_err(|e| bad(path, format!("hypotheses[{n}]: {e}")))?
-                        .ok_or_else(|| bad(path, format!("hypotheses[{n}]: missing `confidence`")))?;
+                        .ok_or_else(|| {
+                            bad(path, format!("hypotheses[{n}]: missing `confidence`"))
+                        })?;
                     if !raw.is_finite() || !(0.0..=1.0).contains(&raw) {
                         return Err(bad(
                             path,
@@ -341,15 +348,21 @@ pub fn load(path: &str) -> Result<SavedSession> {
                             return Err(bad(
                                 path,
                                 format!("hypotheses[{n}]: `evidence` is not an array"),
-                            ))
+                            ));
                         }
                     }
                     out
                 }
             };
 
-            let created_seq = o.opt_u64("created_seq").map_err(|e| bad(path, e))?.unwrap_or(0);
-            let updated_seq = o.opt_u64("updated_seq").map_err(|e| bad(path, e))?.unwrap_or(0);
+            let created_seq = o
+                .opt_u64("created_seq")
+                .map_err(|e| bad(path, e))?
+                .unwrap_or(0);
+            let updated_seq = o
+                .opt_u64("updated_seq")
+                .map_err(|e| bad(path, e))?
+                .unwrap_or(0);
             hypotheses.push(SavedHypothesis {
                 id,
                 handle: handle.to_string(),
@@ -392,7 +405,10 @@ fn check_image_path(session: &str, n: usize, p: &str) -> Result<()> {
         return Err(bad(session, format!("images[{n}]: `path` is empty")));
     }
     if p.contains('\0') {
-        return Err(bad(session, format!("images[{n}]: `path` carries a NUL byte")));
+        return Err(bad(
+            session,
+            format!("images[{n}]: `path` carries a NUL byte"),
+        ));
     }
     if escapes(Path::new(p)) {
         return Err(bad(
@@ -461,14 +477,19 @@ fn evidence_from_json(session: &str, at: String, value: &Value) -> Result<Eviden
             format!("{at}: `source` is not a known stage: {source_label:?}"),
         )
     })?;
-    let at_addr = match o.opt_str("at").map_err(|e| bad(session, format!("{at}: {e}")))? {
+    let at_addr = match o
+        .opt_str("at")
+        .map_err(|e| bad(session, format!("{at}: {e}")))?
+    {
         None | Some("") => None,
         Some(s) => Some(
             occ_core::addr::parse_addr(s)
                 .ok_or_else(|| bad(session, format!("{at}: `at` is not an address: {s:?}")))?,
         ),
     };
-    let span = o.opt_u64("span").map_err(|e| bad(session, format!("{at}: {e}")))?;
+    let span = o
+        .opt_u64("span")
+        .map_err(|e| bad(session, format!("{at}: {e}")))?;
     let detail = o
         .opt_str("detail")
         .map_err(|e| bad(session, format!("{at}: {e}")))?

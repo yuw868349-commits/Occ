@@ -14,9 +14,9 @@
 //! only reports where each one starts and ends.
 
 use occ_core::{
-    Addr, Arch, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind, Linkage,
-    Perm, Result, Section, SectionKind, Symbol, SymbolBinding, SymbolKind, CoreError,
-    WasmFuncSig, WasmFuncType, WasmValueType,
+    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind,
+    Linkage, Perm, Result, Section, SectionKind, Symbol, SymbolBinding, SymbolKind, WasmFuncSig,
+    WasmFuncType, WasmValueType,
 };
 use std::collections::HashMap;
 
@@ -113,7 +113,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                 // rather than counted.
                 if let Some(count) = leb_u32(data, &mut p) {
                     for _ in 0..count.min(1_000_000) {
-                        let Some(form) = data.get(p).copied() else { break };
+                        let Some(form) = data.get(p).copied() else {
+                            break;
+                        };
                         p += 1;
                         if form != 0x60 {
                             // Not a function type. The rest of the section
@@ -121,11 +123,15 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                             // one is, so the section stops here.
                             break;
                         }
-                        let Some(param_count) = leb_u32(data, &mut p) else { break };
+                        let Some(param_count) = leb_u32(data, &mut p) else {
+                            break;
+                        };
                         let Some(params) = value_types(data, &mut p, param_count) else {
                             break;
                         };
-                        let Some(result_count) = leb_u32(data, &mut p) else { break };
+                        let Some(result_count) = leb_u32(data, &mut p) else {
+                            break;
+                        };
                         let Some(results) = value_types(data, &mut p, result_count) else {
                             break;
                         };
@@ -136,22 +142,36 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
             2 => {
                 if let Some(count) = leb_u32(data, &mut p) {
                     for _ in 0..count.min(100_000) {
-                        let Some(mlen) = leb_u32(data, &mut p) else { break };
-                        let Some(module) = read_str(data, &mut p, mlen as usize) else { break };
-                        let Some(flen) = leb_u32(data, &mut p) else { break };
-                        let Some(field) = read_str(data, &mut p, flen as usize) else { break };
-                        let Some(kind) = data.get(p).copied() else { break };
+                        let Some(mlen) = leb_u32(data, &mut p) else {
+                            break;
+                        };
+                        let Some(module) = read_str(data, &mut p, mlen as usize) else {
+                            break;
+                        };
+                        let Some(flen) = leb_u32(data, &mut p) else {
+                            break;
+                        };
+                        let Some(field) = read_str(data, &mut p, flen as usize) else {
+                            break;
+                        };
+                        let Some(kind) = data.get(p).copied() else {
+                            break;
+                        };
                         p += 1;
                         let imported_kind = match kind {
                             0 => {
-                                let Some(type_idx) = leb_u32(data, &mut p) else { break };
+                                let Some(type_idx) = leb_u32(data, &mut p) else {
+                                    break;
+                                };
                                 imported_funcs += 1;
                                 imported_func_types.push(type_idx);
                                 ImportKind::Normal
                             }
                             1 => ImportKind::Data,
                             2 => {
-                                let Some(_limits) = leb_u32(data, &mut p) else { break };
+                                let Some(_limits) = leb_u32(data, &mut p) else {
+                                    break;
+                                };
                                 memories += 1;
                                 ImportKind::Data
                             }
@@ -176,7 +196,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                 if let Some(count) = leb_u32(data, &mut p) {
                     defined_funcs = count;
                     for _ in 0..count.min(1_000_000) {
-                        let Some(type_idx) = leb_u32(data, &mut p) else { break };
+                        let Some(type_idx) = leb_u32(data, &mut p) else {
+                            break;
+                        };
                         defined_func_types.push(type_idx);
                     }
                 }
@@ -189,11 +211,19 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
             7 => {
                 if let Some(count) = leb_u32(data, &mut p) {
                     for _ in 0..count.min(100_000) {
-                        let Some(nlen) = leb_u32(data, &mut p) else { break };
-                        let Some(name) = read_str(data, &mut p, nlen as usize) else { break };
-                        let Some(kind) = data.get(p).copied() else { break };
+                        let Some(nlen) = leb_u32(data, &mut p) else {
+                            break;
+                        };
+                        let Some(name) = read_str(data, &mut p, nlen as usize) else {
+                            break;
+                        };
+                        let Some(kind) = data.get(p).copied() else {
+                            break;
+                        };
                         p += 1;
-                        let Some(index) = leb_u32(data, &mut p) else { break };
+                        let Some(index) = leb_u32(data, &mut p) else {
+                            break;
+                        };
                         exports_raw.push((name, kind, index));
                     }
                 }
@@ -206,7 +236,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
             10 => {
                 if let Some(count) = leb_u32(data, &mut p) {
                     for i in 0..count.min(1_000_000) {
-                        let Some(body_size) = leb_u32(data, &mut p) else { break };
+                        let Some(body_size) = leb_u32(data, &mut p) else {
+                            break;
+                        };
                         let offset = p as u64;
                         bodies.push((imported_funcs + i, offset, body_size as u64));
                         p = p.saturating_add(body_size as usize);
@@ -259,7 +291,12 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     }
 
     let entry = start_func
-        .and_then(|i| bodies.iter().find(|(idx, _, _)| *idx == i).map(|(_, o, _)| Addr(*o)))
+        .and_then(|i| {
+            bodies
+                .iter()
+                .find(|(idx, _, _)| *idx == i)
+                .map(|(_, o, _)| Addr(*o))
+        })
         .unwrap_or(Addr::NULL);
 
     if bodies.is_empty() {
@@ -278,9 +315,8 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     // first, then the defined ones. This is the index space a `call`
     // names, so it is also what tells a call site how many arguments the
     // callee takes.
-    let mut wasm_funcs: Vec<WasmFuncSig> = Vec::with_capacity(
-        imported_func_types.len() + defined_func_types.len(),
-    );
+    let mut wasm_funcs: Vec<WasmFuncSig> =
+        Vec::with_capacity(imported_func_types.len() + defined_func_types.len());
     for type_index in &imported_func_types {
         wasm_funcs.push(signature_of(*type_index, &func_types, None));
     }
@@ -310,6 +346,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         sha256: crate::sha256::hex_digest(data),
         segments: Vec::new(),
         sections,
+        resources: Vec::new(),
         symbols,
         imports,
         exports,
@@ -329,11 +366,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
 ///
 /// A type index that names nothing is a module this parser could not read;
 /// the counts fall back to zero rather than to a guess.
-fn signature_of(
-    type_index: u32,
-    types: &[WasmFuncType],
-    body: Option<Addr>,
-) -> WasmFuncSig {
+fn signature_of(type_index: u32, types: &[WasmFuncType], body: Option<Addr>) -> WasmFuncSig {
     let ty = types.get(type_index as usize);
     WasmFuncSig {
         type_index,
@@ -344,11 +377,7 @@ fn signature_of(
 }
 
 /// Read a vector of value types.
-fn value_types(
-    data: &[u8],
-    pos: &mut usize,
-    count: u32,
-) -> Option<Vec<WasmValueType>> {
+fn value_types(data: &[u8], pos: &mut usize, count: u32) -> Option<Vec<WasmValueType>> {
     let mut out = Vec::with_capacity(count.min(1024) as usize);
     for _ in 0..count.min(1_000_000) {
         let byte = *data.get(*pos)?;
@@ -406,16 +435,28 @@ fn read_str(data: &[u8], pos: &mut usize, len: usize) -> Option<String> {
 /// Parse the `name` custom section: subsection 1 maps function index to name.
 fn parse_name_section(data: &[u8], pos: &mut usize, end: usize, names: &mut HashMap<u32, String>) {
     while *pos < end {
-        let Some(id) = data.get(*pos).copied() else { return };
+        let Some(id) = data.get(*pos).copied() else {
+            return;
+        };
         *pos += 1;
-        let Some(size) = leb_u32(data, pos) else { return };
+        let Some(size) = leb_u32(data, pos) else {
+            return;
+        };
         let sub_end = (*pos).saturating_add(size as usize).min(end);
         if id == 1 {
-            let Some(count) = leb_u32(data, pos) else { return };
+            let Some(count) = leb_u32(data, pos) else {
+                return;
+            };
             for _ in 0..count.min(1_000_000) {
-                let Some(idx) = leb_u32(data, pos) else { return };
-                let Some(len) = leb_u32(data, pos) else { return };
-                let Some(name) = read_str(data, pos, len as usize) else { return };
+                let Some(idx) = leb_u32(data, pos) else {
+                    return;
+                };
+                let Some(len) = leb_u32(data, pos) else {
+                    return;
+                };
+                let Some(name) = read_str(data, pos, len as usize) else {
+                    return;
+                };
                 names.insert(idx, name);
                 if *pos >= sub_end {
                     break;

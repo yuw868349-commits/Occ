@@ -10,9 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use occ_core::{
-    Addr, Evidence, EvidenceKind, EvidenceSource, Handle, HypothesisState,
-};
+use occ_core::{Addr, Evidence, EvidenceKind, EvidenceSource, Handle, HypothesisState};
 use occ_session::Session;
 
 /// A scratch directory that removes itself, so a passing run leaves `/tmp` as
@@ -59,7 +57,9 @@ fn save_restore_keeps_the_standing_of_a_hypothesis() {
     let id = first
         .hypothesise(Handle::image(0), Some(0), "the loop is memcpy")
         .expect("file hypothesis");
-    let (verdict, confidence) = first.add_evidence(id, sample_evidence()).expect("add evidence");
+    let (verdict, confidence) = first
+        .add_evidence(id, sample_evidence())
+        .expect("add evidence");
     assert_eq!(verdict.label(), "confirmed");
 
     first.save(path_str).expect("save");
@@ -71,7 +71,10 @@ fn save_restore_keeps_the_standing_of_a_hypothesis() {
     assert_eq!(h.state, HypothesisState::Supported);
     assert!((h.confidence - confidence).abs() < 1e-6);
     assert_eq!(h.evidence.len(), 1);
-    assert_eq!(h.evidence[0].detail, "the loop body matches a byte-wise copy");
+    assert_eq!(
+        h.evidence[0].detail,
+        "the loop body matches a byte-wise copy"
+    );
     assert_eq!(h.evidence[0].at, Some(Addr(0x401000)));
     assert_eq!(saved.notes, vec!["opened /bin/ls".to_string()]);
 
@@ -85,7 +88,11 @@ fn save_restore_keeps_the_standing_of_a_hypothesis() {
     assert_eq!(restored[0].evidence.len(), 1);
     assert_eq!(restored[0].statement, "the loop is memcpy");
     assert_eq!(restored[0].handle, Handle::image(0));
-    assert_eq!(restored[0].image, Some(0), "the claim keeps the image it was about");
+    assert_eq!(
+        restored[0].image,
+        Some(0),
+        "the claim keeps the image it was about"
+    );
 }
 
 #[test]
@@ -95,12 +102,18 @@ fn a_new_hypothesis_cannot_reuse_a_restored_id() {
     let path_str = path.to_str().unwrap();
 
     let first = Session::new();
-    let id = first.hypothesise(Handle::image(0), Some(0), "first").unwrap();
+    let id = first
+        .hypothesise(Handle::image(0), Some(0), "first")
+        .unwrap();
     first.save(path_str).unwrap();
 
     let second = Session::new();
-    second.restore(&occ_session::persist::load(path_str).unwrap()).unwrap();
-    let fresh = second.hypothesise(Handle::image(0), Some(0), "second").unwrap();
+    second
+        .restore(&occ_session::persist::load(path_str).unwrap())
+        .unwrap();
+    let fresh = second
+        .hypothesise(Handle::image(0), Some(0), "second")
+        .unwrap();
     assert!(fresh > id, "restored ids must reserve their slot");
     assert_eq!(second.hypotheses().len(), 2);
 }
@@ -120,7 +133,10 @@ fn an_unknown_version_is_refused() {
         r#"{"version":99,"images":[],"hypotheses":[],"notes":[]}"#,
     );
     let err = occ_session::persist::load(&p).expect_err("version 99 must not load");
-    assert!(err.to_string().contains("unsupported session version"), "{err}");
+    assert!(
+        err.to_string().contains("unsupported session version"),
+        "{err}"
+    );
 }
 
 #[test]

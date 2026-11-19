@@ -84,7 +84,10 @@ fn main() {
             format!("{:#x}", call.at.0),
             format!("{:#x}", call.in_function.0),
             call.via,
-            call.targets.iter().map(|t| format!("{:#x}", t.0)).collect::<Vec<_>>(),
+            call.targets
+                .iter()
+                .map(|t| format!("{:#x}", t.0))
+                .collect::<Vec<_>>(),
             call.evidence
         );
     }
@@ -99,10 +102,7 @@ fn main() {
             jump.evidence
         );
         for case in &jump.cases {
-            println!(
-                "        case {:>6} -> {:#x}",
-                case.label, case.target.0
-            );
+            println!("        case {:>6} -> {:#x}", case.label, case.target.0);
         }
     }
 }

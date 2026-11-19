@@ -67,13 +67,8 @@ pub enum Incoming {
 
 /// Parse one message body.
 pub fn parse_message(body: &str) -> Result<Incoming, (Value, i32, String)> {
-    let value = occ_json::parse(body).map_err(|e| {
-        (
-            Value::Null,
-            code::PARSE_ERROR,
-            format!("invalid JSON: {e}"),
-        )
-    })?;
+    let value = occ_json::parse(body)
+        .map_err(|e| (Value::Null, code::PARSE_ERROR, format!("invalid JSON: {e}")))?;
     let obj = match &value {
         Value::Object(o) => o,
         _ => {

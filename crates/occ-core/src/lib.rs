@@ -18,7 +18,6 @@
 //!    combination. A caller that wants to argue with a conclusion can inspect
 //!    the individual weights instead of trusting one opaque number.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used)]
@@ -52,9 +51,9 @@ pub use handle::{Handle, HandleKind};
 pub use hypothesis::{Hypothesis, HypothesisState, Verdict};
 pub use image::{
     Arch, ArmMode, ArmModes, CompilerFamily, Endian, Export, Fingerprint, Format, FunctionBound,
-    Image, ImageId, Import, ImportKind, LangGuess, Linkage, Perm, RelocKind, Relocation, Section,
-    SectionKind, Segment, Symbol, SymbolBinding, SymbolKind, WasmFuncSig, WasmFuncType,
-    WasmValueType,
+    Image, ImageId, Import, ImportKind, LangGuess, Linkage, Perm, RelocKind, Relocation, Resource,
+    ResourceKind, ResourceName, Section, SectionKind, Segment, Symbol, SymbolBinding, SymbolKind,
+    WasmFuncSig, WasmFuncType, WasmValueType,
 };
 
 /// Crate version, surfaced in MCP `serverInfo` so a client can pin behaviour.

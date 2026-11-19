@@ -198,11 +198,7 @@ pub fn analyze(view: &View, analysis: &Analysis, opts: &Options) -> Report {
     let mut walker = Walker::new(view, analysis, opts);
     let mut report = Report::default();
     report.stats.functions = analysis.functions.len();
-    report.stats.syntactic_tables = analysis
-        .functions
-        .iter()
-        .map(|f| f.jump_tables.len())
-        .sum();
+    report.stats.syntactic_tables = analysis.functions.iter().map(|f| f.jump_tables.len()).sum();
     for func in &analysis.functions {
         walker.function(func, &mut report);
     }
@@ -377,7 +373,9 @@ impl<'a> Walker<'a> {
             }
             // A call returns something this pass does not model, except for
             // the allocators, whose result is a heap object named by the call.
-            Stmt::Call { name, ret, addr, .. } => {
+            Stmt::Call {
+                name, ret, addr, ..
+            } => {
                 if let Some(ret) = ret {
                     let value = if is_allocator(name) {
                         Value::Heap {
@@ -433,10 +431,7 @@ impl<'a> Walker<'a> {
                 })
             }),
             Expr::Member {
-                base,
-                offset,
-                size,
-                ..
+                base, offset, size, ..
             } => {
                 let addr = Expr::Bin {
                     op: BinOp::Add,
@@ -827,7 +822,13 @@ impl<'a> Walker<'a> {
     }
 
     /// Walk the blocks a second time and record what the indirect sites reach.
-    fn sites(&self, func: &Function, program: &Program, out: &[Option<State>], report: &mut Report) {
+    fn sites(
+        &self,
+        func: &Function,
+        program: &Program,
+        out: &[Option<State>],
+        report: &mut Report,
+    ) {
         for (id, block) in program.blocks.iter().enumerate() {
             let mut state = self.entry_state(program, id, out);
             for stmt in &block.stmts {
@@ -848,13 +849,7 @@ impl<'a> Walker<'a> {
         }
     }
 
-    fn call_site(
-        &self,
-        func: &Function,
-        at: Addr,
-        state: &State,
-        report: &mut Report,
-    ) {
+    fn call_site(&self, func: &Function, at: Addr, state: &State, report: &mut Report) {
         let Some(insn) = func.insns.iter().find(|i| i.addr == at) else {
             return;
         };
@@ -1095,13 +1090,10 @@ impl<'a> Walker<'a> {
     /// of targets into a list of cases.
     fn label_shift(&self, value: &Value) -> i64 {
         match value {
-            Value::Num(n) => n.symbol().map(|(_, scale, bias)| {
-                if scale == 1 {
-                    bias
-                } else {
-                    0
-                }
-            }).unwrap_or(0),
+            Value::Num(n) => n
+                .symbol()
+                .map(|(_, scale, bias)| if scale == 1 { bias } else { 0 })
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -1163,7 +1155,8 @@ impl<'a> Walker<'a> {
             // readings are tried and the one that lands on a block is kept.
             let unsigned = extend(raw, size, false);
             let signed_value = extend(raw, size, true);
-            let target = |v: i64| self.is_target(v as u64) || self.is_target(base.wrapping_add(v) as u64);
+            let target =
+                |v: i64| self.is_target(v as u64) || self.is_target(base.wrapping_add(v) as u64);
             let entry = if target(unsigned) {
                 unsigned
             } else if signed {
@@ -1280,11 +1273,7 @@ impl<'a> Walker<'a> {
                 Num::Stride { lo, stride, steps } => {
                     format!("a run of {} at {lo:#x} step {stride}", steps + 1)
                 }
-                Num::Sym {
-                    name,
-                    scale,
-                    bias,
-                } => format!(
+                Num::Sym { name, scale, bias } => format!(
                     "the value of {name}{}{}",
                     if *scale == 1 {
                         String::new()
@@ -1425,7 +1414,6 @@ fn stub(program: &Program, id: BlockId) -> Option<(i64, BlockId)> {
     };
     Some((constant?, next))
 }
-
 
 /// Names a statement may write.
 fn written_dests(s: &Stmt, out: &mut Vec<String>) {

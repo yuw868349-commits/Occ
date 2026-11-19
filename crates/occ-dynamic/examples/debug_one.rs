@@ -96,7 +96,11 @@ fn main() {
         };
         println!(
             "{label} eflags = {:#x}",
-            f(Flag::Cf, 1) | f(Flag::Pf, 4) | f(Flag::Zf, 0x40) | f(Flag::Sf, 0x80) | f(Flag::Of, 0x800)
+            f(Flag::Cf, 1)
+                | f(Flag::Pf, 4)
+                | f(Flag::Zf, 0x40)
+                | f(Flag::Sf, 0x80)
+                | f(Flag::Of, 0x800)
         );
     };
     dump(&m, "ir  ");

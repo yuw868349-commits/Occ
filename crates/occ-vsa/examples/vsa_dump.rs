@@ -59,7 +59,13 @@ fn main() {
             "jumptable at {:#x} base {:#x} width {} relative {} count {} index {:?} first {:?}",
             t.at.0, t.base.0, t.entry_bytes, t.relative, t.count, t.index_reg, t.first_case
         );
-        println!("  targets {:?}", t.targets.iter().map(|a| format!("{:#x}", a.0)).collect::<Vec<_>>());
+        println!(
+            "  targets {:?}",
+            t.targets
+                .iter()
+                .map(|a| format!("{:#x}", a.0))
+                .collect::<Vec<_>>()
+        );
     }
     for bb in &func.blocks {
         println!(

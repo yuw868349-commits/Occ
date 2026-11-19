@@ -49,7 +49,8 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     // than C++ Builder.
     let borland_layout = borland_sections(image);
     let borland_marker = borland_product(view);
-    let delphi = delphi_symbols(&symbols) || matches!(borland_marker, Some((CompilerFamily::Delphi, _)));
+    let delphi =
+        delphi_symbols(&symbols) || matches!(borland_marker, Some((CompilerFamily::Delphi, _)));
     // CODE/DATA/BSS is not Borland's alone: TASM and hand-written Win32
     // assembly produce the same section names, and so do a few linkers for
     // other toolchains. The layout is a hint that needs one corroborating
@@ -124,7 +125,8 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.6,
         ));
     }
-    if image.section_by_name(".gopclntab").is_some() || image.section_by_name(".go.buildinfo").is_some()
+    if image.section_by_name(".gopclntab").is_some()
+        || image.section_by_name(".go.buildinfo").is_some()
     {
         claim = claim.with(Evidence::support(
             EvidenceKind::FormatMeta,
@@ -164,7 +166,9 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     let libs = import_libraries(image);
     let mingw = symbols.contains("__register_frame_info")
         || symbols.contains("__deregister_frame_info")
-        || libs.iter().any(|l| l.contains("libgcc") || l.contains("libstdc++"))
+        || libs
+            .iter()
+            .any(|l| l.contains("libgcc") || l.contains("libstdc++"))
         || contains_ascii_ci(view.file(), b"MinGW-w64")
         || contains_ascii_ci(view.file(), b"GCC: (MinGW")
         || comment.as_deref().is_some_and(|c| c.contains("MinGW"));
@@ -226,7 +230,10 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     } else if borland {
         CompilerFamily::Borland
     } else if claim.confidence >= 0.5 {
-        if comment.as_deref().is_some_and(|c| c.contains("clang version")) {
+        if comment
+            .as_deref()
+            .is_some_and(|c| c.contains("clang version"))
+        {
             CompilerFamily::Clang
         } else if comment.as_deref().is_some_and(|c| c.contains("rustc")) {
             CompilerFamily::Rustc
@@ -291,8 +298,8 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     // Stripped: no named symbols at all.
     fp.stripped = !image.symbols.iter().any(|s| !s.name.is_empty());
 
-    fp.has_go_buildinfo =
-        image.section_by_name(".go.buildinfo").is_some() || image.section_by_name(".gopclntab").is_some();
+    fp.has_go_buildinfo = image.section_by_name(".go.buildinfo").is_some()
+        || image.section_by_name(".gopclntab").is_some();
     fp.has_dwarf = image
         .sections
         .iter()
@@ -321,9 +328,25 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
         }
     }
     let packed_names = [
-        "UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".packed", "MPRESS1", "MPRESS2", ".nsp0",
-        ".nsp1", ".petite", ".themida", ".vmp0", ".vmp1", ".winlice", ".perplex", ".kkrunchy",
-        "PEC2", "ASPack",
+        "UPX0",
+        "UPX1",
+        "UPX2",
+        ".aspack",
+        ".adata",
+        ".packed",
+        "MPRESS1",
+        "MPRESS2",
+        ".nsp0",
+        ".nsp1",
+        ".petite",
+        ".themida",
+        ".vmp0",
+        ".vmp1",
+        ".winlice",
+        ".perplex",
+        ".kkrunchy",
+        "PEC2",
+        "ASPack",
     ];
     for n in packed_names {
         if image.section_by_name(n).is_some() {
@@ -409,7 +432,10 @@ fn runtime(image: &Image) -> Option<String> {
     // forwarders too, and answering `glibc` for a Windows binary because
     // those two names appear is a wrong answer, not a weak one.
     let libs = import_libraries(image);
-    if libs.iter().any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase") {
+    if libs
+        .iter()
+        .any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase")
+    {
         return Some("ucrt".into());
     }
     // Name the C runtime rather than whichever of the pair sorts first:
@@ -467,14 +493,18 @@ fn import_libraries(image: &Image) -> Vec<String> {
 /// is not in this match.
 fn msvc_runtime(image: &Image) -> Option<&'static str> {
     let libs = import_libraries(image);
-    if libs.iter().any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase") {
+    if libs
+        .iter()
+        .any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase")
+    {
         return Some("ucrt");
     }
     // `msvcr90`/`msvcr100` are versioned MSVC runtimes; `msvcrt` is the
     // system DLL that MinGW also links, so it must not be matched here.
-    if libs.iter().any(|l| {
-        (l.starts_with("msvcr") || l.starts_with("msvcp")) && !l.starts_with("msvcrt")
-    }) {
+    if libs
+        .iter()
+        .any(|l| (l.starts_with("msvcr") || l.starts_with("msvcp")) && !l.starts_with("msvcrt"))
+    {
         return Some("msvcr");
     }
     None
@@ -768,10 +798,7 @@ mod tests {
     #[test]
     fn borland_layout_with_delphi_mangling_names_delphi() {
         let data = vec![0u8; 16];
-        let mut img = image_with_sections(vec![
-            section("CODE", 0, 8),
-            section("DATA", 8, 8),
-        ]);
+        let mut img = image_with_sections(vec![section("CODE", 0, 8), section("DATA", 8, 8)]);
         img.symbols.push(occ_core::Symbol {
             name: "@System@@HandleFinally$qqrv".into(),
             addr: Addr(0x1000),

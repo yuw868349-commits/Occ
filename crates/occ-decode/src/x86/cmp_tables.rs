@@ -31,13 +31,7 @@ impl CmpOp {
 }
 
 /// `const` constructor, so the table stays readable.
-pub const fn cmp_op(
-    op: u8,
-    map: u8,
-    pp: u8,
-    w: bool,
-    names: [&'static str; 8],
-) -> CmpOp {
+pub const fn cmp_op(op: u8, map: u8, pp: u8, w: bool, names: [&'static str; 8]) -> CmpOp {
     CmpOp {
         op,
         map,
@@ -49,7 +43,8 @@ pub const fn cmp_op(
 
 /// The family for one key, if the table has one.
 pub fn lookup(op: u8, map: u8, pp: u8, w: bool) -> Option<&'static CmpOp> {
-    CMP_OPS.iter()
+    CMP_OPS
+        .iter()
         .find(|row| row.op == op && row.map == map && row.pp == pp && row.w == w)
 }
 

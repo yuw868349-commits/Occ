@@ -34,10 +34,16 @@ const FREGS: [&str; 32] = [
 const BRANCHES: [&str; 8] = ["beq", "bne", "?", "?", "blt", "bge", "bltu", "bgeu"];
 const LOADS: [&str; 8] = ["lb", "lh", "lw", "ld", "lbu", "lhu", "lwu", "?"];
 const STORES: [&str; 8] = ["sb", "sh", "sw", "sd", "?", "?", "?", "?"];
-const OPIMM: [&str; 8] = ["addi", "slli", "slti", "sltiu", "xori", "srli", "ori", "andi"];
+const OPIMM: [&str; 8] = [
+    "addi", "slli", "slti", "sltiu", "xori", "srli", "ori", "andi",
+];
 const OP: [&str; 8] = ["add", "sll", "slt", "sltu", "xor", "srl", "or", "and"];
-const MULDIV: [&str; 8] = ["mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu"];
-const CSR: [&str; 8] = ["?", "csrrw", "csrrs", "csrrc", "?", "csrrwi", "csrrsi", "csrrci"];
+const MULDIV: [&str; 8] = [
+    "mul", "mulh", "mulhsu", "mulhu", "div", "divu", "rem", "remu",
+];
+const CSR: [&str; 8] = [
+    "?", "csrrw", "csrrs", "csrrc", "?", "csrrwi", "csrrsi", "csrrci",
+];
 
 const fn bits(w: u32, hi: u32, lo: u32) -> u32 {
     (w >> lo) & ((1u32 << (hi - lo + 1)) - 1)
@@ -150,8 +156,8 @@ impl Decoder {
                 flow: r.flow,
                 target: r.target,
                 mem_reads: r.reads,
-            mem_addr: Vec::new(),
-            imm_values: Vec::new(),
+                mem_addr: Vec::new(),
+                imm_values: Vec::new(),
                 mem_writes: r.writes,
             },
             rip_target: r.pc,
@@ -173,8 +179,8 @@ impl Decoder {
                 flow: r.flow,
                 target: r.target,
                 mem_reads: r.reads,
-            mem_addr: Vec::new(),
-            imm_values: Vec::new(),
+                mem_addr: Vec::new(),
+                imm_values: Vec::new(),
                 mem_writes: r.writes,
             },
             rip_target: r.pc,
@@ -313,7 +319,13 @@ impl Decoder {
                     }
                     _ => R::new(
                         OPIMM[funct3 as usize],
-                        format!("{} {}, {}, {}", OPIMM[funct3 as usize], reg(rd), reg(rs1), imm),
+                        format!(
+                            "{} {}, {}, {}",
+                            OPIMM[funct3 as usize],
+                            reg(rd),
+                            reg(rs1),
+                            imm
+                        ),
                     ),
                 }
             }
@@ -330,10 +342,7 @@ impl Decoder {
                 } else {
                     OP[funct3 as usize]
                 };
-                R::new(
-                    mn,
-                    format!("{mn} {}, {}, {}", reg(rd), reg(rs1), reg(rs2)),
-                )
+                R::new(mn, format!("{mn} {}, {}, {}", reg(rd), reg(rs1), reg(rs2)))
             }
             0x1b => {
                 let imm = sext(bits(w, 31, 20), 12);
@@ -394,10 +403,7 @@ impl Decoder {
             0x0f => {
                 let pred = bits(w, 27, 24);
                 let succ = bits(w, 23, 20);
-                R::new(
-                    "fence",
-                    format!("fence {:#x}, {:#x}", pred, succ),
-                )
+                R::new("fence", format!("fence {:#x}, {:#x}", pred, succ))
             }
             0x73 => match funct3 {
                 0 => {
@@ -427,17 +433,11 @@ impl Decoder {
                     }
                     let csr = bits(w, 31, 20);
                     if f >= 5 {
-                        R::new(
-                            mn,
-                            format!("{mn} {}, {:#x}, {}", reg(rd), csr, rs1),
-                        )
+                        R::new(mn, format!("{mn} {}, {:#x}, {}", reg(rd), csr, rs1))
                     } else if rd == 0 && f == 2 {
                         R::new("csrr", format!("csrr {}, {:#x}", reg(rd), csr))
                     } else {
-                        R::new(
-                            mn,
-                            format!("{mn} {}, {:#x}, {}", reg(rd), csr, reg(rs1)),
-                        )
+                        R::new(mn, format!("{mn} {}, {:#x}, {}", reg(rd), csr, reg(rs1)))
                     }
                 }
             },
@@ -449,10 +449,7 @@ impl Decoder {
                     3 => "fld",
                     _ => return undefined(origin, w, "reserved fp load"),
                 };
-                R::new(
-                    mn,
-                    format!("{mn} {}, {}({})", freg(rd), imm, reg(rs1)),
-                )
+                R::new(mn, format!("{mn} {}, {}({})", freg(rd), imm, reg(rs1)))
             }
             0x27 => {
                 // Floating-point store.
@@ -462,10 +459,7 @@ impl Decoder {
                     3 => "fsd",
                     _ => return undefined(origin, w, "reserved fp store"),
                 };
-                R::new(
-                    mn,
-                    format!("{mn} {}, {}({})", freg(rs2), imm, reg(rs1)),
-                )
+                R::new(mn, format!("{mn} {}, {}({})", freg(rs2), imm, reg(rs1)))
             }
             0x43 | 0x47 | 0x4b | 0x4f => {
                 // Fused multiply-add family. fmt occupies bits 26:25, and the
@@ -504,11 +498,26 @@ impl Decoder {
                 };
                 let funct5 = funct7 >> 2;
                 match funct5 {
-                    0x00 => R::new("fadd", format!("fadd.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
-                    0x01 => R::new("fsub", format!("fsub.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
-                    0x02 => R::new("fmul", format!("fmul.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
-                    0x03 => R::new("fdiv", format!("fdiv.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2))),
-                    0x0b if rs2 == 0 => R::new("fsqrt", format!("fsqrt.{suffix} {}, {}", freg(rd), freg(rs1))),
+                    0x00 => R::new(
+                        "fadd",
+                        format!("fadd.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                    ),
+                    0x01 => R::new(
+                        "fsub",
+                        format!("fsub.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                    ),
+                    0x02 => R::new(
+                        "fmul",
+                        format!("fmul.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                    ),
+                    0x03 => R::new(
+                        "fdiv",
+                        format!("fdiv.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                    ),
+                    0x0b if rs2 == 0 => R::new(
+                        "fsqrt",
+                        format!("fsqrt.{suffix} {}, {}", freg(rd), freg(rs1)),
+                    ),
                     0x04 => {
                         let mn = match funct3 {
                             0 => "fsgnj",
@@ -516,7 +525,10 @@ impl Decoder {
                             2 => "fsgnjx",
                             _ => return undefined(origin, w, "reserved fsgnj"),
                         };
-                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)))
+                        R::new(
+                            mn,
+                            format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                        )
                     }
                     0x05 => {
                         let mn = match funct3 {
@@ -524,7 +536,10 @@ impl Decoder {
                             1 => "fmax",
                             _ => return undefined(origin, w, "reserved fmin"),
                         };
-                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)))
+                        R::new(
+                            mn,
+                            format!("{mn}.{suffix} {}, {}, {}", freg(rd), freg(rs1), freg(rs2)),
+                        )
                     }
                     0x08 => {
                         // fcvt: rs2 names the source format.
@@ -545,7 +560,10 @@ impl Decoder {
                             2 => "fle",
                             _ => return undefined(origin, w, "reserved fcmp"),
                         };
-                        R::new(mn, format!("{mn}.{suffix} {}, {}, {}", reg(rd), freg(rs1), freg(rs2)))
+                        R::new(
+                            mn,
+                            format!("{mn}.{suffix} {}, {}, {}", reg(rd), freg(rs1), freg(rs2)),
+                        )
                     }
                     0x18 => {
                         // Float to integer.
@@ -583,10 +601,9 @@ impl Decoder {
                         ),
                         _ => undefined(origin, w, "reserved fp move"),
                     },
-                    0x1e if rs2 == 0 => R::new(
-                        "fmv",
-                        format!("fmv.{suffix}.x {}, {}", freg(rd), reg(rs1)),
-                    ),
+                    0x1e if rs2 == 0 => {
+                        R::new("fmv", format!("fmv.{suffix}.x {}, {}", freg(rd), reg(rs1)))
+                    }
                     _ => undefined(origin, w, "reserved op-fp"),
                 }
             }
@@ -643,36 +660,26 @@ impl Decoder {
                         )
                     }
                     2 => {
-                        let imm = ((w >> 10) & 0x7) << 3 | ((w >> 6) & 1) << 2 | ((w >> 5) & 1) << 6;
-                        R::new(
-                            "lw",
-                            format!("lw {}, {}({})", reg(rd_p), imm, reg(rs1_p)),
-                        )
+                        let imm =
+                            ((w >> 10) & 0x7) << 3 | ((w >> 6) & 1) << 2 | ((w >> 5) & 1) << 6;
+                        R::new("lw", format!("lw {}, {}({})", reg(rd_p), imm, reg(rs1_p)))
                     }
                     3 => {
                         if self.bits == 64 {
                             let imm = ((w >> 10) & 0x7) << 3 | ((w >> 5) & 0x3) << 6;
-                            R::new(
-                                "ld",
-                                format!("ld {}, {}({})", reg(rd_p), imm, reg(rs1_p)),
-                            )
+                            R::new("ld", format!("ld {}, {}({})", reg(rd_p), imm, reg(rs1_p)))
                         } else {
                             undefined(origin, w, "c.flw")
                         }
                     }
                     6 => {
-                        let imm = ((w >> 10) & 0x7) << 3 | ((w >> 6) & 1) << 2 | ((w >> 5) & 1) << 6;
-                        R::new(
-                            "sw",
-                            format!("sw {}, {}({})", reg(rd_p), imm, reg(rs1_p)),
-                        )
+                        let imm =
+                            ((w >> 10) & 0x7) << 3 | ((w >> 6) & 1) << 2 | ((w >> 5) & 1) << 6;
+                        R::new("sw", format!("sw {}, {}({})", reg(rd_p), imm, reg(rs1_p)))
                     }
                     7 => {
                         let imm = ((w >> 10) & 0x7) << 3 | ((w >> 5) & 0x3) << 6;
-                        R::new(
-                            "sd",
-                            format!("sd {}, {}({})", reg(rd_p), imm, reg(rs1_p)),
-                        )
+                        R::new("sd", format!("sd {}, {}({})", reg(rd_p), imm, reg(rs1_p)))
                     }
                     _ => undefined(origin, w, "c.reserved"),
                 }
@@ -689,14 +696,17 @@ impl Decoder {
                     }
                     1 => {
                         if self.bits == 32 {
-                            let imm = sext(bits(w, 12, 12) << 11
-                                | bits(w, 8, 8) << 10
-                                | bits(w, 10, 9) << 8
-                                | bits(w, 6, 6) << 7
-                                | bits(w, 7, 7) << 6
-                                | bits(w, 2, 2) << 5
-                                | bits(w, 11, 11) << 4
-                                | bits(w, 5, 3) << 1, 12);
+                            let imm = sext(
+                                bits(w, 12, 12) << 11
+                                    | bits(w, 8, 8) << 10
+                                    | bits(w, 10, 9) << 8
+                                    | bits(w, 6, 6) << 7
+                                    | bits(w, 7, 7) << 6
+                                    | bits(w, 2, 2) << 5
+                                    | bits(w, 11, 11) << 4
+                                    | bits(w, 5, 3) << 1,
+                                12,
+                            );
                             let to = origin.offset(imm);
                             return R::new("jal", format!("jal {to}")).br(to, FlowKind::Call);
                         }
@@ -718,10 +728,7 @@ impl Decoder {
                                     | bits(w, 2, 2) << 5,
                                 10,
                             );
-                            return R::new(
-                                "addi",
-                                format!("addi sp, sp, {}", imm),
-                            );
+                            return R::new("addi", format!("addi sp, sp, {}", imm));
                         }
                         let imm = sext(bits(w, 12, 12) << 5 | bits(w, 6, 2), 6) << 12;
                         R::new("lui", format!("lui {}, {:#x}", reg(rd), imm >> 12))
@@ -732,8 +739,12 @@ impl Decoder {
                         let sub = bits(w, 11, 10);
                         let sh = bits(w, 12, 12) << 5 | bits(w, 6, 2);
                         match sub {
-                            0 => R::new("srli", format!("srli {}, {}, {}", reg(rd_p), reg(rd_p), sh)),
-                            1 => R::new("srai", format!("srai {}, {}, {}", reg(rd_p), reg(rd_p), sh)),
+                            0 => {
+                                R::new("srli", format!("srli {}, {}, {}", reg(rd_p), reg(rd_p), sh))
+                            }
+                            1 => {
+                                R::new("srai", format!("srai {}, {}, {}", reg(rd_p), reg(rd_p), sh))
+                            }
                             2 => {
                                 let imm = sext(bits(w, 12, 12) << 5 | bits(w, 6, 2), 6);
                                 R::new(
@@ -807,8 +818,7 @@ impl Decoder {
                         R::new("slli", format!("slli {}, {}, {}", reg(rd), reg(rd), sh))
                     }
                     2 => {
-                        let imm =
-                            bits(w, 12, 12) << 5 | bits(w, 6, 4) << 2 | bits(w, 3, 2) << 6;
+                        let imm = bits(w, 12, 12) << 5 | bits(w, 6, 4) << 2 | bits(w, 3, 2) << 6;
                         R::new("lw", format!("lw {}, {}(sp)", reg(rd), imm))
                     }
                     3 => {
@@ -835,8 +845,7 @@ impl Decoder {
                                 // rather than report a jump whose target it
                                 // cannot know.
                                 if rd == 1 {
-                                    return R::new("ret", "ret".into())
-                                        .with_flow(FlowKind::Return);
+                                    return R::new("ret", "ret".into()).with_flow(FlowKind::Return);
                                 }
                                 return R::new("jr", format!("jr {}", reg(rd)))
                                     .with_flow(FlowKind::IndirectBranch);

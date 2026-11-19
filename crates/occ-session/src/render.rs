@@ -20,7 +20,8 @@ use occ_analyze::analysis::Analysis;
 use occ_analyze::strings::Found;
 use occ_core::{
     Addr, Alternative, BasicBlock, Claim, Depth, Evidence, EvidenceKind, Function, Hypothesis,
-    Image, Import, Instruction, RelocKind, Relocation, Section, Symbol, Xref,
+    Image, Import, Instruction, RelocKind, Relocation, Resource, ResourceName, Section, Symbol,
+    Xref,
 };
 use occ_json::{Map, Value};
 
@@ -241,10 +242,13 @@ pub fn image_json(image: &Image) -> Value {
     m.insert("format", image.format.label());
     m.insert("arch", image.arch.label());
     m.insert("bits", Value::from(u32::from(image.bits)));
-    m.insert("endian", match image.endian {
-        occ_core::Endian::Little => "little",
-        occ_core::Endian::Big => "big",
-    });
+    m.insert(
+        "endian",
+        match image.endian {
+            occ_core::Endian::Little => "little",
+            occ_core::Endian::Big => "big",
+        },
+    );
     m.insert("entry", addr(image.entry));
     m.insert("image_base", addr(image.image_base));
     m.insert("file_size", Value::from(image.file_size));
@@ -256,10 +260,13 @@ pub fn image_json(image: &Image) -> Value {
     m.insert("imports", Value::from(image.imports.len()));
     m.insert("exports", Value::from(image.exports.len()));
     m.insert("relocations", Value::from(image.relocations.len()));
-    m.insert("interpreter", match &image.interpreter {
-        Some(i) => Value::String(i.clone()),
-        None => Value::Null,
-    });
+    m.insert(
+        "interpreter",
+        match &image.interpreter {
+            Some(i) => Value::String(i.clone()),
+            None => Value::Null,
+        },
+    );
     m.insert("linkage", image.fingerprint.linkage_label());
     m.insert("warnings", strings(&image.warnings));
     Value::Object(m)
@@ -296,6 +303,22 @@ pub fn section_json(s: &Section) -> Value {
         "file_size" => Value::from(s.file_size),
         "kind" => format!("{:?}", s.kind),
         "perm" => s.perm.to_string(),
+    )
+}
+
+/// Resource leaf as JSON.
+pub fn resource_json(r: &Resource) -> Value {
+    obj!(
+        "type" => r.kind.label(),
+        "type_id" => Value::from(r.type_id),
+        "name" => match &r.name {
+            ResourceName::Id(id) => Value::from(*id),
+            ResourceName::String(s) => Value::String(s.clone()),
+        },
+        "language" => Value::from(r.language),
+        "addr" => addr(r.addr),
+        "size" => Value::from(r.size),
+        "code_page" => Value::from(r.code_page),
     )
 }
 
@@ -455,11 +478,23 @@ pub fn function_json(f: &Function, an: &Analysis, depth: Depth, image: &Image) -
     m.insert("confidence", Value::from(f64::from(f.boundary_confidence)));
     m.insert(
         "callers",
-        Value::Array(f.callers.iter().take(limits.max_items).map(|a| addr(*a)).collect()),
+        Value::Array(
+            f.callers
+                .iter()
+                .take(limits.max_items)
+                .map(|a| addr(*a))
+                .collect(),
+        ),
     );
     m.insert(
         "callees",
-        Value::Array(f.callees.iter().take(limits.max_items).map(|a| addr(*a)).collect()),
+        Value::Array(
+            f.callees
+                .iter()
+                .take(limits.max_items)
+                .map(|a| addr(*a))
+                .collect(),
+        ),
     );
     m.insert("import_calls", strings(&f.import_calls));
     m.insert(
@@ -522,7 +557,13 @@ pub fn function_json(f: &Function, an: &Analysis, depth: Depth, image: &Image) -
     if depth == Depth::Raw {
         m.insert(
             "body",
-            Value::Array(f.insns.iter().take(limits.max_insns).map(insn_json).collect()),
+            Value::Array(
+                f.insns
+                    .iter()
+                    .take(limits.max_insns)
+                    .map(insn_json)
+                    .collect(),
+            ),
         );
     }
     let _ = image;
@@ -575,7 +616,11 @@ pub fn hexdump(bytes: &[u8], base: Addr, width: usize) -> String {
         }
         out.push(' ');
         for b in chunk {
-            out.push(if (0x20..0x7f).contains(b) { *b as char } else { '.' });
+            out.push(if (0x20..0x7f).contains(b) {
+                *b as char
+            } else {
+                '.'
+            });
         }
         out.push('\n');
     }

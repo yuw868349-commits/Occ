@@ -13,7 +13,7 @@
 
 use occ_core::Addr;
 
-use crate::{cstr, read_u16, read_u32, read_u64, read_u8, sleb, uleb, Value};
+use crate::{Value, cstr, read_u8, read_u16, read_u32, read_u64, sleb, uleb};
 
 /// Line number table content types (DWARF 5).
 const DW_LNCT_PATH: u64 = 0x1;
@@ -67,8 +67,7 @@ impl LineTable {
 
     /// Source location as `file:line`.
     pub fn location(&self, addr: Addr) -> Option<String> {
-        self.row_for(addr)
-            .map(|r| format!("{}:{}", r.file, r.line))
+        self.row_for(addr).map(|r| format!("{}:{}", r.file, r.line))
     }
 }
 
@@ -102,27 +101,44 @@ pub(crate) fn parse(
         return out;
     };
     let (addr_size, header_len) = if version >= 5 {
-        let Some(a) = read_u8(data, &mut pos) else { return out };
+        let Some(a) = read_u8(data, &mut pos) else {
+            return out;
+        };
         let _seg = read_u8(data, &mut pos);
-        let Some(h) = read_u32(data, &mut pos) else { return out };
+        let Some(h) = read_u32(data, &mut pos) else {
+            return out;
+        };
         (a, h as usize)
     } else {
-        (_addr_size, match read_u32(data, &mut pos) {
-            Some(h) => h as usize,
-            None => return out,
-        })
+        (
+            _addr_size,
+            match read_u32(data, &mut pos) {
+                Some(h) => h as usize,
+                None => return out,
+            },
+        )
     };
     let header_end = pos.saturating_add(header_len).min(unit_end);
-    let Some(min_inst) = read_u8(data, &mut pos) else { return out };
+    let Some(min_inst) = read_u8(data, &mut pos) else {
+        return out;
+    };
     if version >= 4 {
         let _max_ops = read_u8(data, &mut pos);
     }
-    let Some(default_is_stmt) = read_u8(data, &mut pos) else { return out };
+    let Some(default_is_stmt) = read_u8(data, &mut pos) else {
+        return out;
+    };
     // Signed: DWARF stores line_base as an sbyte, and GCC emits -5 whenever
     // line_range is 14.
-    let Some(line_base) = read_u8(data, &mut pos).map(|b| b as i8) else { return out };
-    let Some(line_range) = read_u8(data, &mut pos) else { return out };
-    let Some(opcode_base) = read_u8(data, &mut pos) else { return out };
+    let Some(line_base) = read_u8(data, &mut pos).map(|b| b as i8) else {
+        return out;
+    };
+    let Some(line_range) = read_u8(data, &mut pos) else {
+        return out;
+    };
+    let Some(opcode_base) = read_u8(data, &mut pos) else {
+        return out;
+    };
     let mut std_lengths = Vec::with_capacity(usize::from(opcode_base));
     std_lengths.push(0u8);
     for _ in 1..opcode_base {
@@ -135,14 +151,22 @@ pub(crate) fn parse(
     let mut dirs: Vec<String> = Vec::new();
     if version >= 5 {
         // Directory table.
-        let Some(fmt_count) = read_u8(data, &mut pos) else { return out };
+        let Some(fmt_count) = read_u8(data, &mut pos) else {
+            return out;
+        };
         let mut formats = Vec::new();
         for _ in 0..fmt_count {
-            let Some(ct) = uleb(data, &mut pos) else { return out };
-            let Some(form) = uleb(data, &mut pos) else { return out };
+            let Some(ct) = uleb(data, &mut pos) else {
+                return out;
+            };
+            let Some(form) = uleb(data, &mut pos) else {
+                return out;
+            };
             formats.push((ct, form));
         }
-        let Some(count) = uleb(data, &mut pos) else { return out };
+        let Some(count) = uleb(data, &mut pos) else {
+            return out;
+        };
         for _ in 0..count {
             let mut path = String::new();
             for (ct, form) in &formats {
@@ -166,14 +190,22 @@ pub(crate) fn parse(
             }
         }
         // File table.
-        let Some(fmt_count) = read_u8(data, &mut pos) else { return out };
+        let Some(fmt_count) = read_u8(data, &mut pos) else {
+            return out;
+        };
         let mut formats = Vec::new();
         for _ in 0..fmt_count {
-            let Some(ct) = uleb(data, &mut pos) else { return out };
-            let Some(form) = uleb(data, &mut pos) else { return out };
+            let Some(ct) = uleb(data, &mut pos) else {
+                return out;
+            };
+            let Some(form) = uleb(data, &mut pos) else {
+                return out;
+            };
             formats.push((ct, form));
         }
-        let Some(count) = uleb(data, &mut pos) else { return out };
+        let Some(count) = uleb(data, &mut pos) else {
+            return out;
+        };
         for _ in 0..count {
             let mut name = String::new();
             let mut dir_index = 0usize;
@@ -243,23 +275,40 @@ pub(crate) fn parse(
 
     while pos < unit_end && guard < 5_000_000 {
         guard += 1;
-        let Some(op) = read_u8(data, &mut pos) else { break };
+        let Some(op) = read_u8(data, &mut pos) else {
+            break;
+        };
         if op >= opcode_base {
             let adjusted = u64::from(op - opcode_base);
             let lr = u64::from(line_range.max(1));
             address = address.wrapping_add((adjusted / lr) * u64::from(min_inst.max(1)));
             line += i64::from(line_base) + (adjusted % lr) as i64;
-            emit(&mut out, address, file, line, column, is_stmt, end_sequence, version);
+            emit(
+                &mut out,
+                address,
+                file,
+                line,
+                column,
+                is_stmt,
+                end_sequence,
+                version,
+            );
             continue;
         }
         match op {
             0 => {
-                let Some(len) = uleb(data, &mut pos) else { break };
+                let Some(len) = uleb(data, &mut pos) else {
+                    break;
+                };
                 let sub_end = pos.saturating_add(len as usize);
-                let Some(sub) = read_u8(data, &mut pos) else { break };
+                let Some(sub) = read_u8(data, &mut pos) else {
+                    break;
+                };
                 match sub {
                     1 => {
-                        emit(&mut out, address, file, line, column, is_stmt, true, version);
+                        emit(
+                            &mut out, address, file, line, column, is_stmt, true, version,
+                        );
                         address = 0;
                         line = 1;
                         column = 0;
@@ -269,7 +318,9 @@ pub(crate) fn parse(
                     }
                     2 => {
                         let n = usize::from(addr_size.max(1));
-                        let Some(b) = data.get(pos..pos + n) else { break };
+                        let Some(b) = data.get(pos..pos + n) else {
+                            break;
+                        };
                         let mut v = 0u64;
                         for (i, byte) in b.iter().enumerate() {
                             v |= u64::from(*byte) << (8 * i);
@@ -298,7 +349,16 @@ pub(crate) fn parse(
                 pos = sub_end;
             }
             1 => {
-                emit(&mut out, address, file, line, column, is_stmt, end_sequence, version);
+                emit(
+                    &mut out,
+                    address,
+                    file,
+                    line,
+                    column,
+                    is_stmt,
+                    end_sequence,
+                    version,
+                );
             }
             2 => {
                 let adv = uleb(data, &mut pos).unwrap_or(0);
@@ -321,7 +381,9 @@ pub(crate) fn parse(
                 address = address.wrapping_add((adjusted / lr) * u64::from(min_inst.max(1)));
             }
             9 => {
-                let Some(adv) = read_u16(data, &mut pos) else { break };
+                let Some(adv) = read_u16(data, &mut pos) else {
+                    break;
+                };
                 address = address.wrapping_add(u64::from(adv));
             }
             10 => {}
@@ -330,10 +392,7 @@ pub(crate) fn parse(
                 let _ = uleb(data, &mut pos);
             }
             other => {
-                let n = std_lengths
-                    .get(other as usize)
-                    .copied()
-                    .unwrap_or(0);
+                let n = std_lengths.get(other as usize).copied().unwrap_or(0);
                 for _ in 0..n {
                     let _ = uleb(data, &mut pos);
                 }
@@ -364,7 +423,11 @@ fn emit(
         return;
     }
     // DWARF 4 file indices are 1-based; DWARF 5 made them 0-based.
-    let idx = if version >= 5 { file as usize } else { (file as usize).saturating_sub(1) };
+    let idx = if version >= 5 {
+        file as usize
+    } else {
+        (file as usize).saturating_sub(1)
+    };
     let name = out
         .files
         .get(idx)
@@ -387,7 +450,6 @@ fn join_dir(dir: Option<&String>, name: &str) -> String {
         _ => name.to_string(),
     }
 }
-
 
 fn read_entry_form(data: &[u8], pos: &mut usize, form: u64, line_str: &[u8]) -> Option<Value> {
     Some(match form {
@@ -416,7 +478,6 @@ fn read_entry_form(data: &[u8], pos: &mut usize, form: u64, line_str: &[u8]) -> 
         _ => return None,
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -488,5 +549,4 @@ mod tests {
         assert!(t.row_for(Addr(0x1004)).is_none());
         assert!(t.row_for(Addr(0x2000)).is_none());
     }
-
 }

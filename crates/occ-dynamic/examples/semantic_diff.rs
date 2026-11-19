@@ -82,10 +82,10 @@ impl Rng {
 fn is_arithmetic(mnemonic: &str) -> bool {
     const NAMES: &[&str] = &[
         "add", "sub", "adc", "sbb", "and", "or", "xor", "cmp", "test", "inc", "dec", "neg", "not",
-        "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "imul", "mul", "idiv", "div", "mov",
-        "movzx", "movsx", "movsxd", "lea", "xchg", "xadd", "cmpxchg", "bswap", "bt", "bts", "btr",
-        "btc", "bsf", "bsr", "tzcnt", "lzcnt", "popcnt", "xlat", "cbw", "cwde", "cdqe", "cwd",
-        "cdq", "cqo",
+        "shl", "sal", "shr", "sar", "rol", "ror", "rcl", "rcr", "imul", "mul", "idiv", "div",
+        "mov", "movzx", "movsx", "movsxd", "lea", "xchg", "xadd", "cmpxchg", "bswap", "bt", "bts",
+        "btr", "btc", "bsf", "bsr", "tzcnt", "lzcnt", "popcnt", "xlat", "cbw", "cwde", "cdqe",
+        "cwd", "cdq", "cqo",
     ];
     NAMES.contains(&mnemonic)
 }
@@ -203,8 +203,12 @@ fn main() {
             // A move to or from a segment register is not arithmetic: the
             // selector is not a general-purpose value, and the lifter does not
             // model the segment it names.
-            if text.contains(", es") || text.contains(", cs") || text.contains(", ss")
-                || text.contains(", ds") || text.contains(", fs") || text.contains(", gs")
+            if text.contains(", es")
+                || text.contains(", cs")
+                || text.contains(", ss")
+                || text.contains(", ds")
+                || text.contains(", fs")
+                || text.contains(", gs")
             {
                 *skipped.entry("segment register operand").or_insert(0) += 1;
                 continue;
@@ -295,7 +299,9 @@ fn main() {
             }
             if let Err(e) = m.run_stmts(&lifted.stmts) {
                 let key = format!("interpreter: {e}");
-                let entry = failures.entry(key.clone()).or_insert((0, insn.text.to_string()));
+                let entry = failures
+                    .entry(key.clone())
+                    .or_insert((0, insn.text.to_string()));
                 entry.0 += 1;
                 differ += 1;
                 if examples.len() < 40 {
@@ -447,8 +453,10 @@ fn main() {
 
 /// Whether an instruction is defined by a flag it arrives with.
 fn reads_carry(mnemonic: &str) -> bool {
-    matches!(mnemonic, "adc" | "sbb" | "rcl" | "rcr" | "cmovb" | "cmovae" | "cmove" | "cmovne")
-        || mnemonic.starts_with("cmov")
+    matches!(
+        mnemonic,
+        "adc" | "sbb" | "rcl" | "rcr" | "cmovb" | "cmovae" | "cmove" | "cmovne"
+    ) || mnemonic.starts_with("cmov")
         || mnemonic.starts_with("set")
 }
 

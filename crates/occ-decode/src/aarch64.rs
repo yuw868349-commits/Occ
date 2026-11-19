@@ -58,7 +58,9 @@ const CONDS: [&str; 16] = [
 ];
 
 const SHIFTS: [&str; 4] = ["lsl", "lsr", "asr", "ror"];
-const EXTENDS: [&str; 8] = ["uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx"];
+const EXTENDS: [&str; 8] = [
+    "uxtb", "uxth", "uxtw", "uxtx", "sxtb", "sxth", "sxtw", "sxtx",
+];
 
 /// Extract bits `hi..=lo` inclusive.
 const fn bits(w: u32, hi: u32, lo: u32) -> u32 {
@@ -145,8 +147,8 @@ impl Decoder {
                 flow: r.flow,
                 target: r.target,
                 mem_reads: r.reads,
-            mem_addr: Vec::new(),
-            imm_values: Vec::new(),
+                mem_addr: Vec::new(),
+                imm_values: Vec::new(),
                 mem_writes: r.writes,
             },
             rip_target: r.pc,
@@ -197,12 +199,9 @@ impl R {
 
 /// A word the decoder declines to interpret.
 fn undefined(origin: Addr, word: u32, group: &str) -> R {
-    R::new(
-        ".word",
-        format!(".word {word:#010x}  // {group}"),
-    )
-    .flow(FlowKind::Exception)
-    .with_pc(origin)
+    R::new(".word", format!(".word {word:#010x}  // {group}"))
+        .flow(FlowKind::Exception)
+        .with_pc(origin)
 }
 
 impl R {
@@ -347,12 +346,11 @@ fn branch_group(origin: Addr, word: u32) -> Option<R> {
             _ => "dcps",
         };
         return Some(
-            R::new(mn, format!("{mn} #{imm:#x}"))
-                .flow(if mn == "brk" || mn == "hlt" {
-                    FlowKind::Exception
-                } else {
-                    FlowKind::Interrupt
-                }),
+            R::new(mn, format!("{mn} #{imm:#x}")).flow(if mn == "brk" || mn == "hlt" {
+                FlowKind::Exception
+            } else {
+                FlowKind::Interrupt
+            }),
         );
     }
 
@@ -411,7 +409,10 @@ fn dp_immediate(origin: Addr, word: u32) -> Option<R> {
         let imm = sext((immhi << 2) | immlo, 21);
         let rd = bits(word, 4, 0);
         let (mn, target) = if page {
-            ("adrp", (origin.get() & !0xfff).wrapping_add((imm as u64) << 12))
+            (
+                "adrp",
+                (origin.get() & !0xfff).wrapping_add((imm as u64) << 12),
+            )
         } else {
             ("adr", origin.get().wrapping_add_signed(imm))
         };
@@ -509,10 +510,7 @@ fn dp_immediate(origin: Addr, word: u32) -> Option<R> {
         // it is LSL. SBFM with those shapes is ASR/LSL.
         let width = if sf { 64 } else { 32 };
         if immr == 0 && imms == 0 {
-            return Some(R::new(
-                "mov",
-                format!("mov {}, {}", r(sf, rd), r(sf, rn)),
-            ));
+            return Some(R::new("mov", format!("mov {}, {}", r(sf, rd), r(sf, rn))));
         }
         if opc == 2 && immr == 0 {
             let sh = width - 1 - imms;
@@ -556,12 +554,7 @@ fn dp_immediate(origin: Addr, word: u32) -> Option<R> {
         }
         return Some(R::new(
             "extr",
-            format!(
-                "extr {}, {}, {}, #{lsb}",
-                r(sf, rd),
-                r(sf, rn),
-                r(sf, rm)
-            ),
+            format!("extr {}, {}, {}, #{lsb}", r(sf, rd), r(sf, rn), r(sf, rm)),
         ));
     }
 
@@ -642,10 +635,7 @@ fn dp_register(_origin: Addr, word: u32) -> Option<R> {
             return Some(R::new("mov", format!("mov {}, {}", r(sf, rd), r(sf, rm))));
         }
         if opc == 3 && rd == 31 && imm6 == 0 {
-            return Some(R::new(
-                "tst",
-                format!("tst {}, {}", r(sf, rn), r(sf, rm)),
-            ));
+            return Some(R::new("tst", format!("tst {}, {}", r(sf, rn), r(sf, rm))));
         }
         return Some(R::new(mn, text));
     }
@@ -704,7 +694,11 @@ fn dp_register(_origin: Addr, word: u32) -> Option<R> {
             (true, true) => "cmp",
         };
         let ext = EXTENDS[option as usize];
-        let name = if matches!(option, 3 | 7) { x(rm) } else { w(rm) };
+        let name = if matches!(option, 3 | 7) {
+            x(rm)
+        } else {
+            w(rm)
+        };
         let mut text = if setflags {
             format!("{mn} {}, {name}, {ext}", r(sf, rn))
         } else {
@@ -817,7 +811,11 @@ fn dp_register(_origin: Addr, word: u32) -> Option<R> {
         let cond = bits(word, 15, 12);
         let rn = bits(word, 9, 5);
         let nzcv = bits(word, 3, 0);
-        let mn = if word & 0x0000_0800 != 0 { "ccmp" } else { "ccmn" };
+        let mn = if word & 0x0000_0800 != 0 {
+            "ccmp"
+        } else {
+            "ccmn"
+        };
         return Some(R::new(
             mn,
             format!(
@@ -845,10 +843,7 @@ fn dp_register(_origin: Addr, word: u32) -> Option<R> {
             0b000101 => "cls",
             _ => return None,
         };
-        return Some(R::new(
-            mn,
-            format!("{mn} {}, {}", r(sf, rd), r(sf, rn)),
-        ));
+        return Some(R::new(mn, format!("{mn} {}, {}", r(sf, rd), r(sf, rn))));
     }
 
     None
@@ -928,9 +923,7 @@ fn load_store(origin: Addr, word: u32) -> Option<R> {
     // 0x38/0x39 pair to 0x3c/0x3d.
     let vector = word & 0x0400_0000 != 0;
     let top = (word >> 24) & 0x3f;
-    let known = top == 0x39
-        || top == 0x38
-        || (vector && (top == 0x3d || top == 0x3c));
+    let known = top == 0x39 || top == 0x38 || (vector && (top == 0x3d || top == 0x3c));
     if !known {
         return None;
     }
@@ -1019,10 +1012,7 @@ fn address_form(
 ) -> Option<R> {
     if unsigned {
         let imm = bits(word, 21, 10) << scale;
-        return Some(R::new(
-            mn,
-            format!("{mn} {rt_name}, [{}, #{imm}]", xsp(rn)),
-        ));
+        return Some(R::new(mn, format!("{mn} {rt_name}, [{}, #{imm}]", xsp(rn))));
     }
     match bits(word, 11, 10) {
         0b00 => {
@@ -1034,10 +1024,7 @@ fn address_form(
         }
         0b01 => {
             let imm = sext(bits(word, 20, 12), 9);
-            Some(R::new(
-                mn,
-                format!("{mn} {rt_name}, [{}], #{imm}", xsp(rn)),
-            ))
+            Some(R::new(mn, format!("{mn} {rt_name}, [{}], #{imm}", xsp(rn))))
         }
         0b11 => {
             let imm = sext(bits(word, 20, 12), 9);
@@ -1051,7 +1038,11 @@ fn address_form(
             let option = bits(word, 15, 13);
             let s = word & 0x0000_1000 != 0;
             let ext = EXTENDS[option as usize];
-            let idx = if matches!(option, 3 | 7) { x(rm) } else { w(rm) };
+            let idx = if matches!(option, 3 | 7) {
+                x(rm)
+            } else {
+                w(rm)
+            };
             let mut operand = format!("{idx}, {ext}");
             if s {
                 operand.push_str(&format!(" #{scale}"));
@@ -1203,6 +1194,11 @@ mod tests {
 
     #[test]
     fn short_input_is_not_decoded() {
-        assert!(Decoder::new(64).unwrap().decode(Addr(0), &[0x1f, 0x20]).is_none());
+        assert!(
+            Decoder::new(64)
+                .unwrap()
+                .decode(Addr(0), &[0x1f, 0x20])
+                .is_none()
+        );
     }
 }

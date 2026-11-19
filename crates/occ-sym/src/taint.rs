@@ -99,7 +99,8 @@ impl SinkFilter {
             return true;
         }
         self.forwards.get(name).is_some_and(|next| {
-            next.iter().any(|n| self.calls.iter().any(|c| n.contains(c.as_str())))
+            next.iter()
+                .any(|n| self.calls.iter().any(|c| n.contains(c.as_str())))
         })
     }
 
@@ -348,7 +349,8 @@ impl Calls<'_> {
                 .collect(),
         };
         self.used = true;
-        self.cache.insert((callee.entry, arg), Some(summary.clone()));
+        self.cache
+            .insert((callee.entry, arg), Some(summary.clone()));
         Some(summary)
     }
 }
@@ -525,7 +527,9 @@ fn transfer(
     sink: &mut dyn FnMut(Flow),
 ) {
     for stmt in &block.stmts {
-        transfer_stmt(stmt, block.addr, state, sources, filter, functions, calls, sink);
+        transfer_stmt(
+            stmt, block.addr, state, sources, filter, functions, calls, sink,
+        );
     }
 
     if filter.branches
@@ -615,12 +619,7 @@ fn transfer_stmt(
             if bound.is_empty()
                 && let Some(c) = callee
             {
-                bound = calls
-                    .program(c)
-                    .param_regs
-                    .iter()
-                    .map(Expr::var)
-                    .collect();
+                bound = calls.program(c).param_regs.iter().map(Expr::var).collect();
             }
             for (i, a) in bound.iter().enumerate() {
                 let labels = labels_of(a, state);
@@ -773,9 +772,9 @@ fn collect_into(e: &Expr, state: &Taint, out: &mut Labels) {
 fn successors(term: &Term) -> Vec<BlockId> {
     match term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => {
-            then_bb.iter().chain(else_bb.iter()).copied().collect()
-        }
+        Term::Branch {
+            then_bb, else_bb, ..
+        } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
         _ => Vec::new(),
     }
 }

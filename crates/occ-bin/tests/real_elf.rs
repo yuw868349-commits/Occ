@@ -52,7 +52,9 @@ fn parse_hex(s: &str) -> Option<u64> {
 #[test]
 fn header_fields_match_readelf() {
     let Some(img) = load_ls() else { return };
-    let Some(header) = readelf(&["-h"]) else { return };
+    let Some(header) = readelf(&["-h"]) else {
+        return;
+    };
 
     let class = field(&header, "Class:").unwrap_or("");
     assert_eq!(img.bits, if class.contains("ELF64") { 64 } else { 32 });
@@ -150,7 +152,9 @@ fn plt_relocations_are_bound_to_the_symbol_readelf_names() {
         }
         let t = line.trim_start();
         let mut fields = t.split_whitespace();
-        let Some(off_token) = fields.next() else { continue };
+        let Some(off_token) = fields.next() else {
+            continue;
+        };
         if !off_token.chars().all(|c| c.is_ascii_hexdigit()) {
             continue;
         }
@@ -158,7 +162,13 @@ fn plt_relocations_are_bound_to_the_symbol_readelf_names() {
         // `Offset Info Type Sym.Value Sym.Name + Addend`: the name carries a
         // version suffix (`getenv@GLIBC_2.2.5`), which this parser strips, so
         // compare against the part before the `@`.
-        let name = t.split_whitespace().nth(4).unwrap_or("").split('@').next().unwrap_or("");
+        let name = t
+            .split_whitespace()
+            .nth(4)
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("");
         let Some(r) = img.relocations.iter().find(|r| r.offset.get() == offset) else {
             panic!("parser has no relocation at {offset:#x}");
         };
@@ -264,6 +274,10 @@ fn eh_frame_states_function_extents() {
             .iter()
             .filter(|s| s.perm.exec())
             .find(|s| b.start.0 >= s.addr.0 && b.start.0 < s.addr.0 + s.size);
-        assert!(section.is_some(), "{:#x} is outside every code section", b.start.0);
+        assert!(
+            section.is_some(),
+            "{:#x} is outside every code section",
+            b.start.0
+        );
     }
 }

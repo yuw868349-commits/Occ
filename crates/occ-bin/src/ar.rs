@@ -111,10 +111,7 @@ pub fn members(data: &[u8]) -> Result<Vec<Member<'_>>> {
         }
 
         let (name, member) = resolve_name(raw_name, body, long_names, pos)?;
-        out.push(Member {
-            name,
-            data: member,
-        });
+        out.push(Member { name, data: member });
         pos = align(body_end);
     }
 
@@ -162,7 +159,10 @@ fn resolve_name<'a>(
         if len > body.len() {
             return Err(CoreError::Malformed {
                 offset: (offset + HEADER_LEN) as u64,
-                detail: format!("the member name claims {len} bytes but the member is {} long", body.len()),
+                detail: format!(
+                    "the member name claims {len} bytes but the member is {} long",
+                    body.len()
+                ),
             });
         }
         let name = String::from_utf8_lossy(&body[..len])
@@ -185,7 +185,10 @@ fn resolve_name<'a>(
             if at >= table.len() {
                 return Err(CoreError::Malformed {
                     offset: offset as u64,
-                    detail: format!("the long-name offset {at} is past the {}-byte table", table.len()),
+                    detail: format!(
+                        "the long-name offset {at} is past the {}-byte table",
+                        table.len()
+                    ),
                 });
             }
             let rest = &table[at..];

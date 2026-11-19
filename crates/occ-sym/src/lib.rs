@@ -22,7 +22,6 @@
 //! Both entry points take a function that [`occ_decompile::build_program`]
 //! already lowered, a name resolver for call targets, and the limits above.
 
-
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
@@ -32,7 +31,9 @@ pub mod solve;
 pub mod taint;
 pub mod value;
 
-pub use exec::{CallInfo, Config as ExecConfig, Mode, Outcome, Path, Report as ExecReport, explore};
+pub use exec::{
+    CallInfo, Config as ExecConfig, Mode, Outcome, Path, Report as ExecReport, explore,
+};
 pub use mem::Memory;
 pub use solve::{Constraint, Model, Verdict, solve as solve_constraints};
 pub use taint::{Config as TaintConfig, Flow, Report as TaintReport, SinkFilter, Source, trace};

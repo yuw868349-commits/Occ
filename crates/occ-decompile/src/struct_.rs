@@ -25,7 +25,12 @@ pub struct Graph {
 
 impl Graph {
     /// Compute dominators, post-dominators and natural loops.
-    pub fn new(blocks: &[Block], preds: &[Vec<BlockId>], succs: &[Vec<BlockId>], entry: BlockId) -> Graph {
+    pub fn new(
+        blocks: &[Block],
+        preds: &[Vec<BlockId>],
+        succs: &[Vec<BlockId>],
+        entry: BlockId,
+    ) -> Graph {
         let idom = dominators(blocks.len(), preds, entry);
         let ipdom = post_dominators(blocks, succs);
         let mut loops: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
@@ -51,11 +56,7 @@ impl Graph {
                 }
             }
         }
-        Graph {
-            idom,
-            ipdom,
-            loops,
-        }
+        Graph { idom, ipdom, loops }
     }
 
     /// True when `a` dominates `b`.
@@ -72,9 +73,9 @@ pub fn succs_of(b: &Block) -> Vec<BlockId> {
 fn successors(b: &Block) -> Vec<BlockId> {
     match &b.term {
         Term::Jump(t) => vec![*t],
-        Term::Branch { then_bb, else_bb, .. } => {
-            then_bb.iter().chain(else_bb.iter()).copied().collect()
-        }
+        Term::Branch {
+            then_bb, else_bb, ..
+        } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
         Term::Switch { targets, .. } => targets.clone(),
         _ => Vec::new(),
     }
@@ -344,7 +345,8 @@ impl<'a> Structurer<'a> {
         while let Some(b) = cur {
             guard += 1;
             if guard > 200_000 {
-                self.notes.push("structuring stopped after 200k blocks".into());
+                self.notes
+                    .push("structuring stopped after 200k blocks".into());
                 break;
             }
             if Some(b) == ctx.stop {
@@ -603,32 +605,34 @@ impl<'a> Structurer<'a> {
         let (then_bb, else_bb) = match (then_bb, else_bb) {
             (Some(t), Some(f)) => (t, f),
             (None, Some(f)) => {
-                let body = self.region(f, &Region {
-                    stop: ctx.stop,
-                    loop_header: ctx.loop_header,
-                    loop_exits: ctx.loop_exits.clone(),
-                });
+                let body = self.region(
+                    f,
+                    &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    },
+                );
                 nodes.push(Node::If {
                     cond: negate(cond),
                     then_body: body,
-                    else_body: vec![Node::Comment(
-                        "this path leaves the function".into(),
-                    )],
+                    else_body: vec![Node::Comment("this path leaves the function".into())],
                 });
                 return None;
             }
             (Some(t), None) => {
-                let body = self.region(t, &Region {
-                    stop: ctx.stop,
-                    loop_header: ctx.loop_header,
-                    loop_exits: ctx.loop_exits.clone(),
-                });
+                let body = self.region(
+                    t,
+                    &Region {
+                        stop: ctx.stop,
+                        loop_header: ctx.loop_header,
+                        loop_exits: ctx.loop_exits.clone(),
+                    },
+                );
                 nodes.push(Node::If {
                     cond,
                     then_body: body,
-                    else_body: vec![Node::Comment(
-                        "this path leaves the function".into(),
-                    )],
+                    else_body: vec![Node::Comment("this path leaves the function".into())],
                 });
                 return None;
             }
@@ -747,16 +751,22 @@ impl<'a> Structurer<'a> {
                 // terminate, which is exactly what the machine does.
                 nodes.push(Node::If {
                     cond,
-                    then_body: self.region(then_bb, &Region {
-                        stop: ctx.stop,
-                        loop_header: ctx.loop_header,
-                        loop_exits: ctx.loop_exits.clone(),
-                    }),
-                    else_body: self.region(else_bb, &Region {
-                        stop: ctx.stop,
-                        loop_header: ctx.loop_header,
-                        loop_exits: ctx.loop_exits.clone(),
-                    }),
+                    then_body: self.region(
+                        then_bb,
+                        &Region {
+                            stop: ctx.stop,
+                            loop_header: ctx.loop_header,
+                            loop_exits: ctx.loop_exits.clone(),
+                        },
+                    ),
+                    else_body: self.region(
+                        else_bb,
+                        &Region {
+                            stop: ctx.stop,
+                            loop_header: ctx.loop_header,
+                            loop_exits: ctx.loop_exits.clone(),
+                        },
+                    ),
                 });
                 None
             }
@@ -845,12 +855,7 @@ fn label(b: BlockId) -> String {
 /// Logical negation of a condition, kept readable.
 pub fn negate(e: Expr) -> Expr {
     match e {
-        Expr::Cond {
-            op,
-            lhs,
-            rhs,
-            bits,
-        } => Expr::Cond {
+        Expr::Cond { op, lhs, rhs, bits } => Expr::Cond {
             op: op.negated(),
             lhs,
             rhs,
@@ -876,11 +881,7 @@ pub fn negate(e: Expr) -> Expr {
                 args: args.into_iter().map(negate).collect(),
             },
         },
-        Expr::FlagCond {
-            cond,
-            state,
-            bits,
-        } => Expr::FlagCond {
+        Expr::FlagCond { cond, state, bits } => Expr::FlagCond {
             cond: cond.negated(),
             state,
             bits,
@@ -1040,10 +1041,7 @@ mod tests {
         let mut seen = Vec::new();
         flatten(&body, &mut seen);
 
-        let labels: Vec<&String> = seen
-            .iter()
-            .filter(|n| n.starts_with("label:"))
-            .collect();
+        let labels: Vec<&String> = seen.iter().filter(|n| n.starts_with("label:")).collect();
         for l in &labels {
             assert_eq!(
                 labels.iter().filter(|x| *x == l).count(),

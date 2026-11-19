@@ -274,7 +274,7 @@ impl Trace {
 /// `/proc/<pid>/maps`, and a mismatch shows up as every recorded address falling
 /// outside the image rather than as silent nonsense.
 #[allow(unsafe_code)] // `Command::pre_exec` is unsafe by signature; the closure
-                      // body is two async-signal-safe system calls and nothing else.
+// body is two async-signal-safe system calls and nothing else.
 pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
     let _serial = TRACE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if !cfg!(target_arch = "x86_64") {
@@ -458,10 +458,11 @@ pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
     Ok(Trace {
         path: path.display().to_string(),
         argv: {
-            let mut v = vec![cfg
-                .argv0
-                .clone()
-                .unwrap_or_else(|| path.display().to_string())];
+            let mut v = vec![
+                cfg.argv0
+                    .clone()
+                    .unwrap_or_else(|| path.display().to_string()),
+            ];
             v.extend(cfg.args.iter().cloned());
             v
         },
@@ -763,7 +764,9 @@ impl Tracer<'_> {
                     return Ok(());
                 }
                 if self.live.len() < 64 {
-                    self.threads.entry(new).or_insert(Thread { tid: new, steps: 0 });
+                    self.threads
+                        .entry(new)
+                        .or_insert(Thread { tid: new, steps: 0 });
                     self.live.insert(new);
                     self.newborn.insert(new);
                 } else {
@@ -815,10 +818,12 @@ impl Tracer<'_> {
                 // an edge into a low part of the file.
                 let site_key = site_in.unwrap_or(site);
                 let target_key = target_in.unwrap_or(Addr(regs.rip));
-                let slot = self
-                    .calls
-                    .entry((site_key.0, target_key.0))
-                    .or_insert((0, indirect, site_in.is_some(), target_in.is_some()));
+                let slot = self.calls.entry((site_key.0, target_key.0)).or_insert((
+                    0,
+                    indirect,
+                    site_in.is_some(),
+                    target_in.is_some(),
+                ));
                 slot.0 += 1;
                 slot.1 |= indirect;
                 slot.2 &= site_in.is_some();

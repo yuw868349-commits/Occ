@@ -10,7 +10,7 @@
 
 use occ_core::Addr;
 
-use crate::{describe_expr, read_u16, read_u32, read_u64, read_u8, uleb};
+use crate::{describe_expr, read_u8, read_u16, read_u32, read_u64, uleb};
 
 /// One address range and the expression that holds the variable there.
 #[derive(Clone, Debug)]
@@ -66,12 +66,20 @@ pub fn parse_debug_loc(data: &[u8], off: usize, addr_size: u8, cu_base: u64) -> 
     let mut pos = off;
     let mut base = cu_base;
     let size = addr_size.max(4);
-    let max = if size == 8 { u64::MAX } else { u64::from(u32::MAX) };
+    let max = if size == 8 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
     let mut guard = 0;
     while pos < data.len() && guard < 1_000_000 {
         guard += 1;
-        let Some(begin) = read_addr(data, &mut pos, size) else { break };
-        let Some(end) = read_addr(data, &mut pos, size) else { break };
+        let Some(begin) = read_addr(data, &mut pos, size) else {
+            break;
+        };
+        let Some(end) = read_addr(data, &mut pos, size) else {
+            break;
+        };
         if begin == 0 && end == 0 {
             break;
         }
@@ -79,7 +87,9 @@ pub fn parse_debug_loc(data: &[u8], off: usize, addr_size: u8, cu_base: u64) -> 
             base = end;
             continue;
         }
-        let Some(expr) = read_expr_u16(data, &mut pos) else { break };
+        let Some(expr) = read_expr_u16(data, &mut pos) else {
+            break;
+        };
         let (start, stop) = (base.wrapping_add(begin), base.wrapping_add(end));
         out.push(LocRange {
             start: Addr(start),
@@ -117,7 +127,9 @@ pub fn parse_debug_loclists(
     let mut guard = 0;
     while pos < data.len() && guard < 1_000_000 {
         guard += 1;
-        let Some(kind) = read_u8(data, &mut pos) else { break };
+        let Some(kind) = read_u8(data, &mut pos) else {
+            break;
+        };
         match kind {
             0x00 => break, // end_of_list
             0x01 => {
@@ -130,7 +142,9 @@ pub fn parse_debug_loclists(
                 let (Some(a), Some(b)) = (uleb(data, &mut pos), uleb(data, &mut pos)) else {
                     break;
                 };
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 if let (Some(start), Some(end)) = (addr_of(a), addr_of(b)) {
                     out.push(LocRange {
                         start: Addr(start),
@@ -143,7 +157,9 @@ pub fn parse_debug_loclists(
                 let (Some(a), Some(len)) = (uleb(data, &mut pos), uleb(data, &mut pos)) else {
                     break;
                 };
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 if let Some(start) = addr_of(a) {
                     out.push(LocRange {
                         start: Addr(start),
@@ -156,7 +172,9 @@ pub fn parse_debug_loclists(
                 let (Some(a), Some(b)) = (uleb(data, &mut pos), uleb(data, &mut pos)) else {
                     break;
                 };
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 out.push(LocRange {
                     start: Addr(base.wrapping_add(a)),
                     end: Addr(base.wrapping_add(b)),
@@ -164,7 +182,9 @@ pub fn parse_debug_loclists(
                 });
             }
             0x05 => {
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 out.push(LocRange {
                     start: Addr(0),
                     end: Addr(u64::MAX),
@@ -172,7 +192,9 @@ pub fn parse_debug_loclists(
                 });
             }
             0x06 => {
-                let Some(a) = read_addr(data, &mut pos, addr_size) else { break };
+                let Some(a) = read_addr(data, &mut pos, addr_size) else {
+                    break;
+                };
                 base = a;
             }
             0x07 => {
@@ -182,7 +204,9 @@ pub fn parse_debug_loclists(
                 ) else {
                     break;
                 };
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 out.push(LocRange {
                     start: Addr(a),
                     end: Addr(b),
@@ -190,9 +214,15 @@ pub fn parse_debug_loclists(
                 });
             }
             0x08 => {
-                let Some(a) = read_addr(data, &mut pos, addr_size) else { break };
-                let Some(len) = uleb(data, &mut pos) else { break };
-                let Some(expr) = read_expr_uleb(data, &mut pos) else { break };
+                let Some(a) = read_addr(data, &mut pos, addr_size) else {
+                    break;
+                };
+                let Some(len) = uleb(data, &mut pos) else {
+                    break;
+                };
+                let Some(expr) = read_expr_uleb(data, &mut pos) else {
+                    break;
+                };
                 out.push(LocRange {
                     start: Addr(a),
                     end: Addr(a.wrapping_add(len)),

@@ -4,7 +4,10 @@ use occ_core::{Addr, Arch, CallTarget, FlowKind, ImageId};
 use occ_decode::AnyDecoder;
 
 fn load() -> (Vec<u8>, occ_core::Image) {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/fixture.riscv64.o");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/fixture.riscv64.o"
+    );
     let data = std::fs::read(path).expect("fixture present");
     let img = occ_bin::load(&data, path, ImageId(0)).expect("parses");
     (data, img)
@@ -47,7 +50,11 @@ fn matches_objdump_on_known_instructions() {
     let dec = AnyDecoder::new(img.arch, img.bits).unwrap();
     let text = img.section_by_name(".text").unwrap();
     let base = text.file_offset as usize;
-    let at = |a: u64| dec.decode(Addr(a), &data[base + a as usize..]).unwrap().insn;
+    let at = |a: u64| {
+        dec.decode(Addr(a), &data[base + a as usize..])
+            .unwrap()
+            .insn
+    };
 
     let d = at(0);
     assert_eq!(d.text, "bge zero, a1, 0x2a");
@@ -90,7 +97,10 @@ fn ret_is_recognised() {
     assert_eq!(d.insn.text, "ret");
     assert_eq!(d.insn.flow, FlowKind::Return);
     assert_eq!(
-        dec.decode(Addr(0), &[0x6f, 0x00, 0x80, 0x00]).unwrap().insn.target,
+        dec.decode(Addr(0), &[0x6f, 0x00, 0x80, 0x00])
+            .unwrap()
+            .insn
+            .target,
         Some(CallTarget::Direct { to: Addr(0x8) })
     );
 }

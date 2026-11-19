@@ -20,8 +20,8 @@
 use occ_core::{Addr, FlowKind, Instruction};
 
 use super::{
-    merge_write, slot_name,
-    Core, Lifted, Operand, Parsed, Reg, Target, VecClass, parse_int, split_operands,
+    Core, Lifted, Operand, Parsed, Reg, Target, VecClass, merge_write, parse_int, slot_name,
+    split_operands,
 };
 use crate::ir::{
     BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp, mask,
@@ -132,8 +132,8 @@ const REG_TABLE: &[(&str, u8, u8, u8)] = &[
 
 /// Canonical 64-bit names by index.
 const REG64: [&str; 17] = [
-    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
-    "r13", "r14", "r15", "rip",
+    "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15", "rip",
 ];
 
 /// Canonical 32-bit names by index.
@@ -387,13 +387,7 @@ impl Target for X86Target {
         cond_of_jcc(&format!("j{suffix}"))
     }
 
-    fn float_branch_cond(
-        &self,
-        mnemonic: &str,
-        lhs: &Expr,
-        rhs: &Expr,
-        bits: u8,
-    ) -> Option<Expr> {
+    fn float_branch_cond(&self, mnemonic: &str, lhs: &Expr, rhs: &Expr, bits: u8) -> Option<Expr> {
         float_condition(mnemonic, lhs, rhs, bits)
     }
 
@@ -524,7 +518,8 @@ fn turn_mod(count: Expr, positions: u64, width: u8) -> Expr {
 /// The sign flag of a result.
 ///
 /// The flag is set when the result is negative, which is its top bit.
-fn sign_flag(result: &Expr, bits: u8) -> Expr {    Expr::Cond {
+fn sign_flag(result: &Expr, bits: u8) -> Expr {
+    Expr::Cond {
         op: CondOp::Slt,
         lhs: Box::new(result.clone()),
         rhs: Box::new(Expr::Const(0)),
@@ -689,7 +684,11 @@ fn vector_index(name: &str, prefix: &str) -> Option<u8> {
     }
     let n: u8 = rest.parse().ok()?;
     // `xmm` has sixteen registers, `mm` has eight.
-    if prefix == "mm" { (n < 8).then_some(n) } else { (n < 16).then_some(n) }
+    if prefix == "mm" {
+        (n < 8).then_some(n)
+    } else {
+        (n < 16).then_some(n)
+    }
 }
 
 /// Size keywords the decoder emits before `ptr`.
@@ -1047,9 +1046,7 @@ impl<'a> Lifter<'a> {
             "shr" => self.lift_shift(BinOp::Shr, &p.ops, &mut out.stmts),
             "sar" => self.lift_shift(BinOp::Sar, &p.ops, &mut out.stmts),
             "imul" | "mul" => self.lift_imul(m, &p.ops, &mut out.stmts),
-            "loop" | "loope" | "loopne" | "jrcxz" | "jecxz" => {
-                self.lift_loop(m, &mut out.stmts)
-            }
+            "loop" | "loope" | "loopne" | "jrcxz" | "jecxz" => self.lift_loop(m, &mut out.stmts),
             "cmp" => self.lift_cmp(&p.ops, false),
             "test" => self.lift_cmp(&p.ops, true),
             "sete" | "setz" | "setne" | "setnz" | "setl" | "setle" | "setg" | "setge" | "setb"
@@ -1134,7 +1131,11 @@ impl<'a> Lifter<'a> {
         let from = ops[1].size();
         let to = ops[0].size().max(from);
         let value = Expr::Cast {
-            kind: if signed { CastKind::Sext } else { CastKind::Zext },
+            kind: if signed {
+                CastKind::Sext
+            } else {
+                CastKind::Zext
+            },
             arg: Box::new(src),
             from,
             to,
@@ -1146,7 +1147,10 @@ impl<'a> Lifter<'a> {
         if ops.len() != 2 {
             return;
         }
-        let Operand::Mem { base, index, disp, .. } = &ops[1] else {
+        let Operand::Mem {
+            base, index, disp, ..
+        } = &ops[1]
+        else {
             return;
         };
         // `lea rsp, [rbp-0x8]` restores the stack pointer; keep the frame in
@@ -1337,9 +1341,7 @@ impl<'a> Lifter<'a> {
                 }),
             ),
             // The logical operations clear the carry and the overflow.
-            BinOp::And | BinOp::Or | BinOp::Xor => {
-                (Some(Expr::Const(0)), Some(Expr::Const(0)))
-            }
+            BinOp::And | BinOp::Or | BinOp::Xor => (Some(Expr::Const(0)), Some(Expr::Const(0))),
             // The division operations leave the flags alone, and the
             // multiplication ones set them from a product that does not
             // fit, which the caller works out.
@@ -2599,8 +2601,7 @@ impl<'a> Lifter<'a> {
         } else {
             Reg::view(2, width, 0)
         };
-        self.core
-            .write(&Operand::Reg(rest), remainder, stmts);
+        self.core.write(&Operand::Reg(rest), remainder, stmts);
         // A division leaves every flag undefined.
         self.core.pending_cmp = Some(super::PendingCmp::with_flags(
             Expr::Const(0),
@@ -2811,22 +2812,16 @@ impl<'a> Lifter<'a> {
                     // A complemented carry is neither of those.
                     _ => (Expr::Unknown("carry".into()), Expr::Unknown("carry".into())),
                 };
-                self.core.pending_cmp = Some(super::PendingCmp::with_flags(
-                    lhs,
-                    rhs,
-                    8,
-                    super::FLAG_CF,
-                ));
+                self.core.pending_cmp =
+                    Some(super::PendingCmp::with_flags(lhs, rhs, 8, super::FLAG_CF));
             }
             "cld" | "std" => {
                 self.core.notes.push((
                     addr,
                     if m == "std" {
-                        "the direction flag is set: the string instructions run backwards"
-                            .into()
+                        "the direction flag is set: the string instructions run backwards".into()
                     } else {
-                        "the direction flag is clear: the string instructions run forwards"
-                            .into()
+                        "the direction flag is clear: the string instructions run forwards".into()
                     },
                 ));
             }
@@ -2909,9 +2904,7 @@ impl<'a> Lifter<'a> {
         if let Operand::Reg(r) = op {
             let value = self.core.read_reg(*r);
             let name = self.reg(r.idx);
-            stmts.push(Stmt::Comment(format!(
-                "jmp {name} ; computed jump target"
-            )));
+            stmts.push(Stmt::Comment(format!("jmp {name} ; computed jump target")));
             let _ = value;
         }
     }
@@ -2956,7 +2949,8 @@ impl<'a> Lifter<'a> {
         stmts: &mut Vec<Stmt>,
     ) {
         self.note_vector_write(class, reg, 4);
-        self.core.assign(&vec_element(class, reg, index), value, stmts);
+        self.core
+            .assign(&vec_element(class, reg, index), value, stmts);
     }
 
     /// Write one 64-bit element: split it into the two 32-bit elements.
@@ -2988,8 +2982,10 @@ impl<'a> Lifter<'a> {
             from: 8,
             to: 4,
         };
-        self.core.assign(&vec_element(class, reg, index), low, stmts);
-        self.core.assign(&vec_element(class, reg, index + 1), high, stmts);
+        self.core
+            .assign(&vec_element(class, reg, index), low, stmts);
+        self.core
+            .assign(&vec_element(class, reg, index + 1), high, stmts);
     }
 
     /// Record that the function wrote a vector register.
@@ -3090,7 +3086,8 @@ impl<'a> Lifter<'a> {
             }
             Operand::Mem { .. } => {
                 if let Some(slot) = self.core.stack_slot(dst) {
-                    self.core.assign(&super::slot_name(slot, elem), value, stmts);
+                    self.core
+                        .assign(&super::slot_name(slot, elem), value, stmts);
                     return;
                 }
                 let addr = self.elem_address(dst, u64::from(index) * u64::from(elem), stmts);
@@ -3362,9 +3359,8 @@ impl<'a> Lifter<'a> {
                 self.vec_each_shift(ops, 4, 4, BinOp::Sar, stmts);
                 self.vec_narrow_note();
             }
-            "pminub" | "pmaxub" | "packsswb" | "packuswb" | "packssdw"
-            | "punpcklbw" | "punpcklwd" | "punpckhbw" | "punpckhwd" | "pslldq"
-            | "psrldq" => {
+            "pminub" | "pmaxub" | "packsswb" | "packuswb" | "packssdw" | "punpcklbw"
+            | "punpcklwd" | "punpckhbw" | "punpckhwd" | "pslldq" | "psrldq" => {
                 stmts.push(Stmt::Comment(format!("{m} ; not modelled")));
                 self.vec_narrow_note();
             }
@@ -3528,8 +3524,12 @@ impl<'a> Lifter<'a> {
             return;
         };
         let base = if high { 2 } else { 0 };
-        let source: Vec<Expr> = (0..2).map(|i| self.vec_source(src, base + i, 4, stmts)).collect();
-        let old: Vec<Expr> = (0..2).map(|i| self.vec_old(dst, base + i, 4, stmts)).collect();
+        let source: Vec<Expr> = (0..2)
+            .map(|i| self.vec_source(src, base + i, 4, stmts))
+            .collect();
+        let old: Vec<Expr> = (0..2)
+            .map(|i| self.vec_old(dst, base + i, 4, stmts))
+            .collect();
         let picks = [
             source[0].clone(),
             old[0].clone(),
@@ -3617,13 +3617,7 @@ impl<'a> Lifter<'a> {
     }
 
     /// A conversion from a float element to an integer register.
-    fn vec_cvt_to_int(
-        &mut self,
-        ops: &[Operand],
-        elem: u8,
-        op: BinOp,
-        stmts: &mut Vec<Stmt>,
-    ) {
+    fn vec_cvt_to_int(&mut self, ops: &[Operand], elem: u8, op: BinOp, stmts: &mut Vec<Stmt>) {
         let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
             return;
         };
@@ -3639,14 +3633,7 @@ impl<'a> Lifter<'a> {
 
     /// A conversion that keeps the number of elements and changes their
     /// width.
-    fn vec_cast(
-        &mut self,
-        ops: &[Operand],
-        from: u8,
-        to: u8,
-        op: BinOp,
-        stmts: &mut Vec<Stmt>,
-    ) {
+    fn vec_cast(&mut self, ops: &[Operand], from: u8, to: u8, op: BinOp, stmts: &mut Vec<Stmt>) {
         let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
             return;
         };
@@ -3873,8 +3860,8 @@ impl<'a> Lifter<'a> {
                 self.fpu_assign(self.fpu_top, other, stmts);
                 self.fpu_assign(self.fpu_physical(*slot), Expr::var(held), stmts);
             }
-            "fadd" | "fmul" | "fsub" | "fsubr" | "fdiv" | "fdivr" | "faddp" | "fmulp"
-            | "fsubp" | "fsubrp" | "fdivp" | "fdivrp" => {
+            "fadd" | "fmul" | "fsub" | "fsubr" | "fdiv" | "fdivr" | "faddp" | "fmulp" | "fsubp"
+            | "fsubrp" | "fdivp" | "fdivrp" => {
                 let (Some(Operand::Fpu(first)), Some(Operand::Fpu(second))) =
                     (ops.first(), ops.get(1))
                 else {
@@ -4037,8 +4024,8 @@ impl<'a> Lifter<'a> {
                     self.fpu_pop();
                 }
             }
-            "fnstsw" | "fnstcw" | "fldcw" | "fnstenv" | "fldenv" | "frstor"
-            | "fnsave" | "finit" | "fnclex" => {
+            "fnstsw" | "fnstcw" | "fldcw" | "fnstenv" | "fldenv" | "frstor" | "fnsave"
+            | "finit" | "fnclex" => {
                 // The control and status words have no place in the
                 // decompiler's world; saying so is better than dropping
                 // them.
@@ -4088,8 +4075,7 @@ impl<'a> Lifter<'a> {
                 self.core.write(dst, sum, stmts);
                 self.core.notes.push((
                     Addr::NULL,
-                    "xadd: an atomic read-modify-write; no other thread sees the half state"
-                        .into(),
+                    "xadd: an atomic read-modify-write; no other thread sees the half state".into(),
                 ));
             }
             "cmpxchg" => {
@@ -4149,10 +4135,9 @@ impl<'a> Lifter<'a> {
                     },
                     stmts,
                 );
-                self.core.notes.push((
-                    Addr::NULL,
-                    "cmpxchg: an atomic compare-and-exchange".into(),
-                ));
+                self.core
+                    .notes
+                    .push((Addr::NULL, "cmpxchg: an atomic compare-and-exchange".into()));
             }
             _ => return false,
         }
@@ -4238,9 +4223,7 @@ impl<'a> Lifter<'a> {
                 // The value stored is the accumulator, read at the width the
                 // instruction works on: `al` is the low byte of `rax`, not a
                 // variable of its own.
-                let accumulator =
-                    self.core
-                        .read(&Operand::Reg(Reg::view(0, width, 0)), stmts);
+                let accumulator = self.core.read(&Operand::Reg(Reg::view(0, width, 0)), stmts);
                 if repeated {
                     let count = self.count_times(width);
                     stmts.push(Stmt::Call {
@@ -4275,8 +4258,6 @@ impl<'a> Lifter<'a> {
         true
     }
 }
-
-
 
 /// The name of one element of a vector register.
 ///
@@ -4338,8 +4319,7 @@ impl super::Lifter for Lifter<'_> {
                     None => Expr::Unknown("condition".into()),
                 });
             } else if matches!(insn.flow, FlowKind::IndirectBranch)
-                || (matches!(insn.flow, FlowKind::UnconditionalBranch)
-                    && insn.target.is_none())
+                || (matches!(insn.flow, FlowKind::UnconditionalBranch) && insn.target.is_none())
             {
                 // The operand is the whole point: `jmp *rax` and
                 // `jmp *(%rdx,%rax,8)` both leave through a value the block
@@ -4523,6 +4503,7 @@ mod tests {
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
                 mem_addr: Vec::new(),
+                imm_values: Vec::new(),
             })
             .collect();
         let lifted = LifterTrait::lift_block(&mut lifter, &insns);
@@ -4531,19 +4512,14 @@ mod tests {
             .iter()
             .map(|stmt| match stmt {
                 Stmt::Assign { dest, value } => format!("{dest} = {}", crate::render::expr(value)),
-                Stmt::Store {
-                    addr,
-                    value,
-                    size,
-                } => format!(
+                Stmt::Store { addr, value, size } => format!(
                     "*({}*) {} = {}",
                     type_name(*size, false),
                     crate::render::expr(addr),
                     crate::render::expr(value)
                 ),
                 Stmt::Call { name, args, .. } => {
-                    let args: Vec<String> =
-                        args.iter().map(crate::render::expr).collect();
+                    let args: Vec<String> = args.iter().map(crate::render::expr).collect();
                     format!("{name}({})", args.join(", "))
                 }
                 Stmt::If { cond, .. } => {
@@ -4575,6 +4551,7 @@ mod tests {
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
                 mem_addr: Vec::new(),
+                imm_values: Vec::new(),
             })
             .collect();
         LifterTrait::lift_block(&mut lifter, &insns)
@@ -4582,19 +4559,14 @@ mod tests {
             .iter()
             .map(|stmt| match stmt {
                 Stmt::Assign { dest, value } => format!("{dest} = {}", crate::render::expr(value)),
-                Stmt::Store {
-                    addr,
-                    value,
-                    size,
-                } => format!(
+                Stmt::Store { addr, value, size } => format!(
                     "*({}*) {} = {}",
                     type_name(*size, false),
                     crate::render::expr(addr),
                     crate::render::expr(value)
                 ),
                 Stmt::Call { name, args, .. } => {
-                    let args: Vec<String> =
-                        args.iter().map(crate::render::expr).collect();
+                    let args: Vec<String> = args.iter().map(crate::render::expr).collect();
                     format!("{name}({})", args.join(", "))
                 }
                 Stmt::If { cond, .. } => {
@@ -4622,10 +4594,7 @@ mod tests {
         let p = parse("mov dword ptr [rbp - 0x18], edi").unwrap();
         match &p.ops[0] {
             Operand::Mem {
-                size,
-                base,
-                disp,
-                ..
+                size, base, disp, ..
             } => {
                 assert_eq!(*size, 4);
                 assert_eq!(base.unwrap().idx, RBP);
@@ -4672,28 +4641,13 @@ mod tests {
             println!("{s}");
         }
         // The two arguments are read as ten-byte extended-precision slots.
-        assert!(
-            stmts.iter().any(|s| s.contains("arg_8_f80")),
-            "{stmts:#?}"
-        );
-        assert!(
-            stmts.iter().any(|s| s.contains("arg_18_f80")),
-            "{stmts:#?}"
-        );
+        assert!(stmts.iter().any(|s| s.contains("arg_8_f80")), "{stmts:#?}");
+        assert!(stmts.iter().any(|s| s.contains("arg_18_f80")), "{stmts:#?}");
         // The multiplication is `a * b` and the division is `a / b`, in that
         // order, and the sum is the two of them.
-        assert!(
-            stmts.iter().any(|s| s.contains("f80_mul(")),
-            "{stmts:#?}"
-        );
-        assert!(
-            stmts.iter().any(|s| s.contains("f80_div(")),
-            "{stmts:#?}"
-        );
-        assert!(
-            stmts.iter().any(|s| s.contains("f80_add(")),
-            "{stmts:#?}"
-        );
+        assert!(stmts.iter().any(|s| s.contains("f80_mul(")), "{stmts:#?}");
+        assert!(stmts.iter().any(|s| s.contains("f80_div(")), "{stmts:#?}");
+        assert!(stmts.iter().any(|s| s.contains("f80_add(")), "{stmts:#?}");
     }
 
     /// The condition a branch tests, as it is printed.
@@ -4759,20 +4713,14 @@ mod tests {
     fn the_overflow_of_a_negation_is_the_smallest_value_of_the_width() {
         // The negation of the smallest value is itself, and that is the
         // only value whose negation overflows.
-        assert_eq!(
-            branch_of(&["neg edi", "jo 0x40"]),
-            "(u32)rdi == 0x80000000"
-        );
+        assert_eq!(branch_of(&["neg edi", "jo 0x40"]), "(u32)rdi == 0x80000000");
     }
 
     #[test]
     fn the_zero_flag_of_a_logical_operation_is_the_result() {
         // The logical operations clear the carry and the overflow, and
         // their zero flag is the result.
-        assert_eq!(
-            branch_of(&["and edi, esi", "je 0x40"]),
-            "(u32)rdi == 0"
-        );
+        assert_eq!(branch_of(&["and edi, esi", "je 0x40"]), "(u32)rdi == 0");
         assert_eq!(
             branch_of(&["test edi, esi", "jz 0x40"]),
             "(u32)((u32)rdi & (u32)rsi) == 0"

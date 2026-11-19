@@ -18,10 +18,7 @@ use occ_decode::x86::Decoder;
 fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: slots <file> [slot]");
-    let slot: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+    let slot: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(16);
     let data = std::fs::read(&path).expect("read");
     let decoder = Decoder::new(64).expect("a decoder");
     for (n, chunk) in data.chunks(slot).enumerate() {

@@ -130,19 +130,18 @@ fn a_stripped_static_binary_still_has_a_main() {
         image.symbols.iter().all(|s| s.name != "main"),
         "the stripped file still names main"
     );
-    let found = main_entry(&analysis)
-        .unwrap_or_else(|| {
-            panic!(
-                "main not identified; notes {:?}, functions {:#?}",
-                analysis.notes,
-                analysis
-                    .functions
-                    .iter()
-                    .take(8)
-                    .map(|f| f.display_name())
-                    .collect::<Vec<_>>()
-            )
-        });
+    let found = main_entry(&analysis).unwrap_or_else(|| {
+        panic!(
+            "main not identified; notes {:?}, functions {:#?}",
+            analysis.notes,
+            analysis
+                .functions
+                .iter()
+                .take(8)
+                .map(|f| f.display_name())
+                .collect::<Vec<_>>()
+        )
+    });
     assert_eq!(
         found, expected,
         "the stripped binary's main is at a different address than the named one"
@@ -165,7 +164,11 @@ fn stripping_does_not_halve_the_function_count() {
     };
     let (_d, _i, named) = analyse(&exe);
     let (_d, _i, stripped_analysis) = analyse(&stripped_exe);
-    let named_count = named.functions.iter().filter(|f| !f.insns.is_empty()).count();
+    let named_count = named
+        .functions
+        .iter()
+        .filter(|f| !f.insns.is_empty())
+        .count();
     let stripped_count = stripped_analysis
         .functions
         .iter()

@@ -9,7 +9,10 @@ use occ_core::{Addr, Arch, CallTarget, FlowKind, ImageId};
 use occ_decode::AnyDecoder;
 
 fn fixture() -> (Vec<u8>, occ_core::Image) {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/fixture.aarch64.o");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/fixture.aarch64.o"
+    );
     let data = std::fs::read(path).expect("fixture present");
     let img = occ_bin::load(&data, path, ImageId(0)).expect("parses");
     (data, img)

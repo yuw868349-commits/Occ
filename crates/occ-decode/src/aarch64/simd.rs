@@ -34,13 +34,10 @@
 
 use occ_core::Addr;
 
-use super::{bits, undefined, R};
+use super::{R, bits, undefined};
 
 /// Element arrangements for the two vector lengths, indexed by `size`.
-const ARRANGEMENTS: [[&str; 4]; 2] = [
-    ["8b", "4h", "2s", "2d"],
-    ["16b", "8h", "4s", "2d"],
-];
+const ARRANGEMENTS: [[&str; 4]; 2] = [["8b", "4h", "2s", "2d"], ["16b", "8h", "4s", "2d"]];
 
 /// Element letters used for a lane index.
 const ELEMENTS: [char; 4] = ['b', 'h', 's', 'd'];
@@ -210,7 +207,11 @@ fn scalar_data_processing(word: u32) -> Option<R> {
     // Compares: bits 15:12 = 0010, bits 11:10 = 00. Bit 4 selects the
     // signalling form and bit 3 the comparison against zero.
     if bits(word, 15, 12) == 0b0010 && bits(word, 11, 10) == 0 {
-        let mn = if bits(word, 4, 4) == 1 { "fcmpe" } else { "fcmp" };
+        let mn = if bits(word, 4, 4) == 1 {
+            "fcmpe"
+        } else {
+            "fcmp"
+        };
         if bits(word, 3, 3) == 1 {
             return Some(R::new(mn, format!("{mn} {t}{rn}, #0.0")));
         }
@@ -283,9 +284,7 @@ fn expand_imm(imm8: u32, t: char) -> f64 {
         }
         'd' => {
             let exp = ((1 - b) << 10) | (b * 0b0011_1111_1100) | cd;
-            f64::from_bits(
-                ((sign as u64) << 63) | ((exp as u64) << 52) | ((efgh as u64) << 48),
-            )
+            f64::from_bits(((sign as u64) << 63) | ((exp as u64) << 52) | ((efgh as u64) << 48))
         }
         _ => {
             let exp = ((1 - b) << 4) | (b * 0b0_1100) | cd;
@@ -743,7 +742,14 @@ fn wide_name(mn: &'static str, q: bool) -> &'static str {
 /// Returning `None` means the encoding is not legal for this shape at this
 /// vector length, which is a real answer: `Q = 0` with a `2d` arrangement has no
 /// encoding.
-fn shape_operands(shape: Shape, q: bool, size: u32, rd: u32, rn: u32, extra: &str) -> Option<String> {
+fn shape_operands(
+    shape: Shape,
+    q: bool,
+    size: u32,
+    rd: u32,
+    rn: u32,
+    extra: &str,
+) -> Option<String> {
     let pair = |a: &str| format!("{}, {}{extra}", vreg(rd, a), vreg(rn, a));
     let text = match shape {
         Shape::Same => {
@@ -767,7 +773,11 @@ fn shape_operands(shape: Shape, q: bool, size: u32, rd: u32, rn: u32, extra: &st
             } else {
                 arrangement(q, size + 1)
             };
-            format!("{}, {}{extra}", vreg(rd, dest), vreg(rn, arrangement(q, size)))
+            format!(
+                "{}, {}{extra}",
+                vreg(rd, dest),
+                vreg(rn, arrangement(q, size))
+            )
         }
         Shape::Fp => {
             // Bit 22 is the width here, and a double needs the full vector.
@@ -787,13 +797,31 @@ fn shape_operands(shape: Shape, q: bool, size: u32, rd: u32, rn: u32, extra: &st
         // arrangement while the destination changes length.
         Shape::FcvtN => format!(
             "{}, {}{extra}",
-            vreg(rd, if size == 0 { if q { "8h" } else { "4h" } } else if q { "4s" } else { "2s" }),
+            vreg(
+                rd,
+                if size == 0 {
+                    if q { "8h" } else { "4h" }
+                } else if q {
+                    "4s"
+                } else {
+                    "2s"
+                }
+            ),
             vreg(rn, if size == 0 { "4s" } else { "2d" })
         ),
         Shape::FcvtL => format!(
             "{}, {}{extra}",
             vreg(rd, if size == 0 { "4s" } else { "2d" }),
-            vreg(rn, if size == 0 { if q { "8h" } else { "4h" } } else if q { "4s" } else { "2s" })
+            vreg(
+                rn,
+                if size == 0 {
+                    if q { "8h" } else { "4h" }
+                } else if q {
+                    "4s"
+                } else {
+                    "2s"
+                }
+            )
         ),
         Shape::Shll => format!(
             "{}, {}, #{}",
@@ -817,58 +845,58 @@ const TWO_MISC: &[(u8, bool, u8, &str, Shape, &str)] = &[
     (0b00001, false, 0, "rev16", Shape::Same, ""), // 16b <- 16b
     (0b00010, false, 0, "saddlp", Shape::Wide, ""), // 8h <- 16b
     (0b00011, false, 0, "suqadd", Shape::Same, ""), // 16b <- 16b
-    (0b00100, false, 0, "cls", Shape::Same, ""), // 16b <- 16b
-    (0b00101, false, 0, "cnt", Shape::Same, ""), // 16b <- 16b
+    (0b00100, false, 0, "cls", Shape::Same, ""),   // 16b <- 16b
+    (0b00101, false, 0, "cnt", Shape::Same, ""),   // 16b <- 16b
     (0b00110, false, 0, "sadalp", Shape::Wide, ""), // 8h <- 16b
     (0b00111, false, 0, "sqabs", Shape::Same, ""), // 16b <- 16b
     (0b01000, false, 0, "cmgt", Shape::Same, ", #0"), // 16b <- 16b
     (0b01001, false, 0, "cmeq", Shape::Same, ", #0"), // 16b <- 16b
     (0b01010, false, 0, "cmlt", Shape::Same, ", #0"), // 16b <- 16b
-    (0b01011, false, 0, "abs", Shape::Same, ""), // 16b <- 16b
+    (0b01011, false, 0, "abs", Shape::Same, ""),   // 16b <- 16b
     (0b10010, false, 0, "xtn", Shape::Narrow, ""), // 16b <- 8h
     (0b10100, false, 0, "sqxtn", Shape::Narrow, ""), // 16b <- 8h
     (0b10110, false, 0, "fcvtn", Shape::FcvtN, ""), // 8h <- 4s
     (0b10111, false, 0, "fcvtl", Shape::FcvtL, ""), // 4s <- 8h
-    (0b11000, false, 0, "frintn", Shape::Fp, ""), // 4s
-    (0b11001, false, 0, "frintm", Shape::Fp, ""), // 4s
-    (0b11010, false, 0, "fcvtns", Shape::Fp, ""), // 4s
-    (0b11011, false, 0, "fcvtms", Shape::Fp, ""), // 4s
-    (0b11100, false, 0, "fcvtas", Shape::Fp, ""), // 4s
-    (0b11101, false, 0, "scvtf", Shape::Fp, ""), // 4s
+    (0b11000, false, 0, "frintn", Shape::Fp, ""),  // 4s
+    (0b11001, false, 0, "frintm", Shape::Fp, ""),  // 4s
+    (0b11010, false, 0, "fcvtns", Shape::Fp, ""),  // 4s
+    (0b11011, false, 0, "fcvtms", Shape::Fp, ""),  // 4s
+    (0b11100, false, 0, "fcvtas", Shape::Fp, ""),  // 4s
+    (0b11101, false, 0, "scvtf", Shape::Fp, ""),   // 4s
     (0b00000, false, 1, "rev64", Shape::Same, ""), // 8h <- 8h
     (0b00010, false, 1, "saddlp", Shape::Wide, ""), // 4s <- 8h
     (0b00011, false, 1, "suqadd", Shape::Same, ""), // 8h <- 8h
-    (0b00100, false, 1, "cls", Shape::Same, ""), // 8h <- 8h
+    (0b00100, false, 1, "cls", Shape::Same, ""),   // 8h <- 8h
     (0b00110, false, 1, "sadalp", Shape::Wide, ""), // 4s <- 8h
     (0b00111, false, 1, "sqabs", Shape::Same, ""), // 8h <- 8h
     (0b01000, false, 1, "cmgt", Shape::Same, ", #0"), // 8h <- 8h
     (0b01001, false, 1, "cmeq", Shape::Same, ", #0"), // 8h <- 8h
     (0b01010, false, 1, "cmlt", Shape::Same, ", #0"), // 8h <- 8h
-    (0b01011, false, 1, "abs", Shape::Same, ""), // 8h <- 8h
+    (0b01011, false, 1, "abs", Shape::Same, ""),   // 8h <- 8h
     (0b10010, false, 1, "xtn", Shape::Narrow, ""), // 8h <- 4s
     (0b10100, false, 1, "sqxtn", Shape::Narrow, ""), // 8h <- 4s
     (0b10110, false, 1, "fcvtn", Shape::FcvtN, ""), // 4s <- 2d
     (0b10111, false, 1, "fcvtl", Shape::FcvtL, ""), // 2d <- 4s
-    (0b11000, false, 1, "frintn", Shape::Fp, ""), // 2d
-    (0b11001, false, 1, "frintm", Shape::Fp, ""), // 2d
-    (0b11010, false, 1, "fcvtns", Shape::Fp, ""), // 2d
-    (0b11011, false, 1, "fcvtms", Shape::Fp, ""), // 2d
-    (0b11100, false, 1, "fcvtas", Shape::Fp, ""), // 2d
-    (0b11101, false, 1, "scvtf", Shape::Fp, ""), // 2d
+    (0b11000, false, 1, "frintn", Shape::Fp, ""),  // 2d
+    (0b11001, false, 1, "frintm", Shape::Fp, ""),  // 2d
+    (0b11010, false, 1, "fcvtns", Shape::Fp, ""),  // 2d
+    (0b11011, false, 1, "fcvtms", Shape::Fp, ""),  // 2d
+    (0b11100, false, 1, "fcvtas", Shape::Fp, ""),  // 2d
+    (0b11101, false, 1, "scvtf", Shape::Fp, ""),   // 2d
     (0b00000, false, 2, "rev64", Shape::Same, ""), // 4s <- 4s
     (0b00010, false, 2, "saddlp", Shape::Wide, ""), // 2d <- 4s
     (0b00011, false, 2, "suqadd", Shape::Same, ""), // 4s <- 4s
-    (0b00100, false, 2, "cls", Shape::Same, ""), // 4s <- 4s
+    (0b00100, false, 2, "cls", Shape::Same, ""),   // 4s <- 4s
     (0b00110, false, 2, "sadalp", Shape::Wide, ""), // 2d <- 4s
     (0b00111, false, 2, "sqabs", Shape::Same, ""), // 4s <- 4s
     (0b01000, false, 2, "cmgt", Shape::Same, ", #0"), // 4s <- 4s
     (0b01001, false, 2, "cmeq", Shape::Same, ", #0"), // 4s <- 4s
     (0b01010, false, 2, "cmlt", Shape::Same, ", #0"), // 4s <- 4s
-    (0b01011, false, 2, "abs", Shape::Same, ""), // 4s <- 4s
+    (0b01011, false, 2, "abs", Shape::Same, ""),   // 4s <- 4s
     (0b01100, false, 2, "fcmgt", Shape::Same, ", #0.0"), // 4s <- 4s
     (0b01101, false, 2, "fcmeq", Shape::Same, ", #0.0"), // 4s <- 4s
     (0b01110, false, 2, "fcmlt", Shape::Same, ", #0.0"), // 4s <- 4s
-    (0b01111, false, 2, "fabs", Shape::Same, ""), // 4s <- 4s
+    (0b01111, false, 2, "fabs", Shape::Same, ""),  // 4s <- 4s
     (0b10010, false, 2, "xtn", Shape::Narrow, ""), // 4s <- 2d
     (0b10100, false, 2, "sqxtn", Shape::Narrow, ""), // 4s <- 2d
     (0b11000, false, 2, "frintp", Shape::Same, ""), // 4s <- 4s
@@ -882,88 +910,88 @@ const TWO_MISC: &[(u8, bool, u8, &str, Shape, &str)] = &[
     (0b01000, false, 3, "cmgt", Shape::Same, ", #0"), // 2d <- 2d
     (0b01001, false, 3, "cmeq", Shape::Same, ", #0"), // 2d <- 2d
     (0b01010, false, 3, "cmlt", Shape::Same, ", #0"), // 2d <- 2d
-    (0b01011, false, 3, "abs", Shape::Same, ""), // 2d <- 2d
+    (0b01011, false, 3, "abs", Shape::Same, ""),   // 2d <- 2d
     (0b01100, false, 3, "fcmgt", Shape::Same, ", #0.0"), // 2d <- 2d
     (0b01101, false, 3, "fcmeq", Shape::Same, ", #0.0"), // 2d <- 2d
     (0b01110, false, 3, "fcmlt", Shape::Same, ", #0.0"), // 2d <- 2d
-    (0b01111, false, 3, "fabs", Shape::Same, ""), // 2d <- 2d
+    (0b01111, false, 3, "fabs", Shape::Same, ""),  // 2d <- 2d
     (0b11000, false, 3, "frintp", Shape::Same, ""), // 2d <- 2d
     (0b11001, false, 3, "frintz", Shape::Same, ""), // 2d <- 2d
     (0b11010, false, 3, "fcvtps", Shape::Same, ""), // 2d <- 2d
     (0b11011, false, 3, "fcvtzs", Shape::Same, ""), // 2d <- 2d
     (0b11101, false, 3, "frecpe", Shape::Same, ""), // 2d <- 2d
-    (0b00000, true, 0, "rev32", Shape::Same, ""), // 16b <- 16b
+    (0b00000, true, 0, "rev32", Shape::Same, ""),  // 16b <- 16b
     (0b00010, true, 0, "uaddlp", Shape::Wide, ""), // 8h <- 16b
     (0b00011, true, 0, "usqadd", Shape::Same, ""), // 16b <- 16b
-    (0b00100, true, 0, "clz", Shape::Same, ""), // 16b <- 16b
-    (0b00101, true, 0, "mvn", Shape::Same, ""), // 16b <- 16b
+    (0b00100, true, 0, "clz", Shape::Same, ""),    // 16b <- 16b
+    (0b00101, true, 0, "mvn", Shape::Same, ""),    // 16b <- 16b
     (0b00110, true, 0, "uadalp", Shape::Wide, ""), // 8h <- 16b
-    (0b00111, true, 0, "sqneg", Shape::Same, ""), // 16b <- 16b
+    (0b00111, true, 0, "sqneg", Shape::Same, ""),  // 16b <- 16b
     (0b01000, true, 0, "cmge", Shape::Same, ", #0"), // 16b <- 16b
     (0b01001, true, 0, "cmle", Shape::Same, ", #0"), // 16b <- 16b
-    (0b01011, true, 0, "neg", Shape::Same, ""), // 16b <- 16b
+    (0b01011, true, 0, "neg", Shape::Same, ""),    // 16b <- 16b
     (0b10010, true, 0, "sqxtun", Shape::Narrow, ""), // 16b <- 8h
-    (0b10011, true, 0, "shll", Shape::Shll, ""), // 8h <- 16b, #8
+    (0b10011, true, 0, "shll", Shape::Shll, ""),   // 8h <- 16b, #8
     (0b10100, true, 0, "uqxtn", Shape::Narrow, ""), // 16b <- 8h
-    (0b11000, true, 0, "frinta", Shape::Fp, ""), // 4s
-    (0b11001, true, 0, "frintx", Shape::Fp, ""), // 4s
-    (0b11010, true, 0, "fcvtnu", Shape::Fp, ""), // 4s
-    (0b11011, true, 0, "fcvtmu", Shape::Fp, ""), // 4s
-    (0b11100, true, 0, "fcvtau", Shape::Fp, ""), // 4s
-    (0b11101, true, 0, "ucvtf", Shape::Fp, ""), // 4s
-    (0b00000, true, 1, "rev32", Shape::Same, ""), // 8h <- 8h
+    (0b11000, true, 0, "frinta", Shape::Fp, ""),   // 4s
+    (0b11001, true, 0, "frintx", Shape::Fp, ""),   // 4s
+    (0b11010, true, 0, "fcvtnu", Shape::Fp, ""),   // 4s
+    (0b11011, true, 0, "fcvtmu", Shape::Fp, ""),   // 4s
+    (0b11100, true, 0, "fcvtau", Shape::Fp, ""),   // 4s
+    (0b11101, true, 0, "ucvtf", Shape::Fp, ""),    // 4s
+    (0b00000, true, 1, "rev32", Shape::Same, ""),  // 8h <- 8h
     (0b00010, true, 1, "uaddlp", Shape::Wide, ""), // 4s <- 8h
     (0b00011, true, 1, "usqadd", Shape::Same, ""), // 8h <- 8h
-    (0b00100, true, 1, "clz", Shape::Same, ""), // 8h <- 8h
-    (0b00101, true, 1, "rbit", Shape::Byte, ""), // 16b <- 16b
+    (0b00100, true, 1, "clz", Shape::Same, ""),    // 8h <- 8h
+    (0b00101, true, 1, "rbit", Shape::Byte, ""),   // 16b <- 16b
     (0b00110, true, 1, "uadalp", Shape::Wide, ""), // 4s <- 8h
-    (0b00111, true, 1, "sqneg", Shape::Same, ""), // 8h <- 8h
+    (0b00111, true, 1, "sqneg", Shape::Same, ""),  // 8h <- 8h
     (0b01000, true, 1, "cmge", Shape::Same, ", #0"), // 8h <- 8h
     (0b01001, true, 1, "cmle", Shape::Same, ", #0"), // 8h <- 8h
-    (0b01011, true, 1, "neg", Shape::Same, ""), // 8h <- 8h
+    (0b01011, true, 1, "neg", Shape::Same, ""),    // 8h <- 8h
     (0b10010, true, 1, "sqxtun", Shape::Narrow, ""), // 8h <- 4s
-    (0b10011, true, 1, "shll", Shape::Shll, ""), // 4s <- 8h, #16
+    (0b10011, true, 1, "shll", Shape::Shll, ""),   // 4s <- 8h, #16
     (0b10100, true, 1, "uqxtn", Shape::Narrow, ""), // 8h <- 4s
     (0b10110, true, 1, "fcvtxn", Shape::FcvtN, ""), // 4s <- 2d
-    (0b11000, true, 1, "frinta", Shape::Fp, ""), // 2d
-    (0b11001, true, 1, "frintx", Shape::Fp, ""), // 2d
-    (0b11010, true, 1, "fcvtnu", Shape::Fp, ""), // 2d
-    (0b11011, true, 1, "fcvtmu", Shape::Fp, ""), // 2d
-    (0b11100, true, 1, "fcvtau", Shape::Fp, ""), // 2d
-    (0b11101, true, 1, "ucvtf", Shape::Fp, ""), // 2d
+    (0b11000, true, 1, "frinta", Shape::Fp, ""),   // 2d
+    (0b11001, true, 1, "frintx", Shape::Fp, ""),   // 2d
+    (0b11010, true, 1, "fcvtnu", Shape::Fp, ""),   // 2d
+    (0b11011, true, 1, "fcvtmu", Shape::Fp, ""),   // 2d
+    (0b11100, true, 1, "fcvtau", Shape::Fp, ""),   // 2d
+    (0b11101, true, 1, "ucvtf", Shape::Fp, ""),    // 2d
     (0b00010, true, 2, "uaddlp", Shape::Wide, ""), // 2d <- 4s
     (0b00011, true, 2, "usqadd", Shape::Same, ""), // 4s <- 4s
-    (0b00100, true, 2, "clz", Shape::Same, ""), // 4s <- 4s
+    (0b00100, true, 2, "clz", Shape::Same, ""),    // 4s <- 4s
     (0b00110, true, 2, "uadalp", Shape::Wide, ""), // 2d <- 4s
-    (0b00111, true, 2, "sqneg", Shape::Same, ""), // 4s <- 4s
+    (0b00111, true, 2, "sqneg", Shape::Same, ""),  // 4s <- 4s
     (0b01000, true, 2, "cmge", Shape::Same, ", #0"), // 4s <- 4s
     (0b01001, true, 2, "cmle", Shape::Same, ", #0"), // 4s <- 4s
-    (0b01011, true, 2, "neg", Shape::Same, ""), // 4s <- 4s
+    (0b01011, true, 2, "neg", Shape::Same, ""),    // 4s <- 4s
     (0b01100, true, 2, "fcmge", Shape::Same, ", #0.0"), // 4s <- 4s
     (0b01101, true, 2, "fcmle", Shape::Same, ", #0.0"), // 4s <- 4s
-    (0b01111, true, 2, "fneg", Shape::Same, ""), // 4s <- 4s
+    (0b01111, true, 2, "fneg", Shape::Same, ""),   // 4s <- 4s
     (0b10010, true, 2, "sqxtun", Shape::Narrow, ""), // 4s <- 2d
-    (0b10011, true, 2, "shll", Shape::Shll, ""), // 2d <- 4s, #32
+    (0b10011, true, 2, "shll", Shape::Shll, ""),   // 2d <- 4s, #32
     (0b10100, true, 2, "uqxtn", Shape::Narrow, ""), // 4s <- 2d
     (0b11001, true, 2, "frinti", Shape::Same, ""), // 4s <- 4s
     (0b11010, true, 2, "fcvtpu", Shape::Same, ""), // 4s <- 4s
     (0b11011, true, 2, "fcvtzu", Shape::Same, ""), // 4s <- 4s
     (0b11100, true, 2, "ursqrte", Shape::Same, ""), // 4s <- 4s
     (0b11101, true, 2, "frsqrte", Shape::Same, ""), // 4s <- 4s
-    (0b11111, true, 2, "fsqrt", Shape::Same, ""), // 4s <- 4s
+    (0b11111, true, 2, "fsqrt", Shape::Same, ""),  // 4s <- 4s
     (0b00011, true, 3, "usqadd", Shape::Same, ""), // 2d <- 2d
-    (0b00111, true, 3, "sqneg", Shape::Same, ""), // 2d <- 2d
+    (0b00111, true, 3, "sqneg", Shape::Same, ""),  // 2d <- 2d
     (0b01000, true, 3, "cmge", Shape::Same, ", #0"), // 2d <- 2d
     (0b01001, true, 3, "cmle", Shape::Same, ", #0"), // 2d <- 2d
-    (0b01011, true, 3, "neg", Shape::Same, ""), // 2d <- 2d
+    (0b01011, true, 3, "neg", Shape::Same, ""),    // 2d <- 2d
     (0b01100, true, 3, "fcmge", Shape::Same, ", #0.0"), // 2d <- 2d
     (0b01101, true, 3, "fcmle", Shape::Same, ", #0.0"), // 2d <- 2d
-    (0b01111, true, 3, "fneg", Shape::Same, ""), // 2d <- 2d
+    (0b01111, true, 3, "fneg", Shape::Same, ""),   // 2d <- 2d
     (0b11001, true, 3, "frinti", Shape::Same, ""), // 2d <- 2d
     (0b11010, true, 3, "fcvtpu", Shape::Same, ""), // 2d <- 2d
     (0b11011, true, 3, "fcvtzu", Shape::Same, ""), // 2d <- 2d
     (0b11101, true, 3, "frsqrte", Shape::Same, ""), // 2d <- 2d
-    (0b11111, true, 3, "fsqrt", Shape::Same, ""), // 2d <- 2d
+    (0b11111, true, 3, "fsqrt", Shape::Same, ""),  // 2d <- 2d
 ];
 
 /// The FP16 two-register group: same key, but `bits 21:17 = 11100`. These are
@@ -975,30 +1003,30 @@ const TWO_MISC_HALF: &[(u8, bool, u8, &str, Shape, &str)] = &[
     (0b11010, false, 1, "fcvtns", Shape::Same, ""), // 8h <- 8h
     (0b11011, false, 1, "fcvtms", Shape::Same, ""), // 8h <- 8h
     (0b11100, false, 1, "fcvtas", Shape::Same, ""), // 8h <- 8h
-    (0b11101, false, 1, "scvtf", Shape::Same, ""), // 8h <- 8h
+    (0b11101, false, 1, "scvtf", Shape::Same, ""),  // 8h <- 8h
     (0b01100, false, 3, "fcmgt", Shape::Half, ", #0.0"), // 8h
     (0b01101, false, 3, "fcmeq", Shape::Half, ", #0.0"), // 8h
     (0b01110, false, 3, "fcmlt", Shape::Half, ", #0.0"), // 8h
-    (0b01111, false, 3, "fabs", Shape::Half, ""), // 8h
+    (0b01111, false, 3, "fabs", Shape::Half, ""),   // 8h
     (0b11000, false, 3, "frintp", Shape::Half, ""), // 8h
     (0b11001, false, 3, "frintz", Shape::Half, ""), // 8h
     (0b11010, false, 3, "fcvtps", Shape::Half, ""), // 8h
     (0b11011, false, 3, "fcvtzs", Shape::Half, ""), // 8h
     (0b11101, false, 3, "frecpe", Shape::Half, ""), // 8h
-    (0b11000, true, 1, "frinta", Shape::Same, ""), // 8h <- 8h
-    (0b11001, true, 1, "frintx", Shape::Same, ""), // 8h <- 8h
-    (0b11010, true, 1, "fcvtnu", Shape::Same, ""), // 8h <- 8h
-    (0b11011, true, 1, "fcvtmu", Shape::Same, ""), // 8h <- 8h
-    (0b11100, true, 1, "fcvtau", Shape::Same, ""), // 8h <- 8h
-    (0b11101, true, 1, "ucvtf", Shape::Same, ""), // 8h <- 8h
+    (0b11000, true, 1, "frinta", Shape::Same, ""),  // 8h <- 8h
+    (0b11001, true, 1, "frintx", Shape::Same, ""),  // 8h <- 8h
+    (0b11010, true, 1, "fcvtnu", Shape::Same, ""),  // 8h <- 8h
+    (0b11011, true, 1, "fcvtmu", Shape::Same, ""),  // 8h <- 8h
+    (0b11100, true, 1, "fcvtau", Shape::Same, ""),  // 8h <- 8h
+    (0b11101, true, 1, "ucvtf", Shape::Same, ""),   // 8h <- 8h
     (0b01100, true, 3, "fcmge", Shape::Half, ", #0.0"), // 8h
     (0b01101, true, 3, "fcmle", Shape::Half, ", #0.0"), // 8h
-    (0b01111, true, 3, "fneg", Shape::Half, ""), // 8h
-    (0b11001, true, 3, "frinti", Shape::Half, ""), // 8h
-    (0b11010, true, 3, "fcvtpu", Shape::Half, ""), // 8h
-    (0b11011, true, 3, "fcvtzu", Shape::Half, ""), // 8h
+    (0b01111, true, 3, "fneg", Shape::Half, ""),    // 8h
+    (0b11001, true, 3, "frinti", Shape::Half, ""),  // 8h
+    (0b11010, true, 3, "fcvtpu", Shape::Half, ""),  // 8h
+    (0b11011, true, 3, "fcvtzu", Shape::Half, ""),  // 8h
     (0b11101, true, 3, "frsqrte", Shape::Half, ""), // 8h
-    (0b11111, true, 3, "fsqrt", Shape::Half, ""), // 8h
+    (0b11111, true, 3, "fsqrt", Shape::Half, ""),   // 8h
 ];
 
 fn two_misc(word: u32, q: bool, u: bool, half: bool) -> Option<R> {
@@ -1017,7 +1045,6 @@ fn two_misc(word: u32, q: bool, u: bool, half: bool) -> Option<R> {
     };
     Some(R::new(mn, format!("{mn} {text}")))
 }
-
 
 /// How an across-lanes reduction reports its result.
 #[derive(Clone, Copy, PartialEq)]
@@ -1266,7 +1293,11 @@ fn table_lookup(word: u32, q: bool) -> Option<R> {
         return None;
     }
     let len = bits(word, 14, 13);
-    let mn = if bits(word, 12, 12) == 1 { "tbx" } else { "tbl" };
+    let mn = if bits(word, 12, 12) == 1 {
+        "tbx"
+    } else {
+        "tbl"
+    };
     let (rd, rn, rm) = (bits(word, 4, 0), bits(word, 9, 5), bits(word, 20, 16));
     let a = if q { "16b" } else { "8b" };
     let mut list = String::from("{ ");
@@ -1311,7 +1342,8 @@ const FP16_THREE: &[(bool, u8, u8, u8, &str)] = &[
     (true, 3, 0b0001, 0b01, "fabd"),
     (true, 3, 0b0010, 0b01, "fcmgt"),
     (true, 3, 0b0010, 0b11, "facgt"),
-    (true, 3, 0b0011, 0b01, "fminp"),];
+    (true, 3, 0b0011, 0b01, "fminp"),
+];
 
 fn fp16_three(word: u32, q: bool, u: bool, size: u32) -> Option<R> {
     let hi = bits(word, 15, 12) as u8;
@@ -1369,25 +1401,25 @@ fn vector_imm(word: u32, q: bool) -> Result<R, &'static str> {
 /// the same opcode appears once per combination. `true` in the last column means
 /// the source is narrower than the destination and `Q` picks the `2` spelling.
 const BY_ELEMENT: &[(bool, u8, bool, bool, &str, bool)] = &[
-    (false,  1, false, false, "fmla", false),
-    (false,  1, true, false, "fmla", false),
-    (false,  1, true, true, "fmla", false),
-    (false,  2, false, true, "smlal", true),
-    (false,  2, true, false, "smlal", true),
-    (false,  3, false, true, "sqdmlal", true),
-    (false,  3, true, false, "sqdmlal", true),
-    (false,  5, false, false, "fmls", false),
-    (false,  5, true, false, "fmls", false),
-    (false,  5, true, true, "fmls", false),
-    (false,  6, false, true, "smlsl", true),
-    (false,  6, true, false, "smlsl", true),
-    (false,  7, false, true, "sqdmlsl", true),
-    (false,  7, true, false, "sqdmlsl", true),
-    (false,  8, false, true, "mul", false),
-    (false,  8, true, false, "mul", false),
-    (false,  9, false, false, "fmul", false),
-    (false,  9, true, false, "fmul", false),
-    (false,  9, true, true, "fmul", false),
+    (false, 1, false, false, "fmla", false),
+    (false, 1, true, false, "fmla", false),
+    (false, 1, true, true, "fmla", false),
+    (false, 2, false, true, "smlal", true),
+    (false, 2, true, false, "smlal", true),
+    (false, 3, false, true, "sqdmlal", true),
+    (false, 3, true, false, "sqdmlal", true),
+    (false, 5, false, false, "fmls", false),
+    (false, 5, true, false, "fmls", false),
+    (false, 5, true, true, "fmls", false),
+    (false, 6, false, true, "smlsl", true),
+    (false, 6, true, false, "smlsl", true),
+    (false, 7, false, true, "sqdmlsl", true),
+    (false, 7, true, false, "sqdmlsl", true),
+    (false, 8, false, true, "mul", false),
+    (false, 8, true, false, "mul", false),
+    (false, 9, false, false, "fmul", false),
+    (false, 9, true, false, "fmul", false),
+    (false, 9, true, true, "fmul", false),
     (false, 10, false, true, "smull", true),
     (false, 10, true, false, "smull", true),
     (false, 11, false, true, "sqdmull", true),
@@ -1396,17 +1428,17 @@ const BY_ELEMENT: &[(bool, u8, bool, bool, &str, bool)] = &[
     (false, 12, true, false, "sqdmulh", false),
     (false, 13, false, true, "sqrdmulh", false),
     (false, 13, true, false, "sqrdmulh", false),
-    (true,  0, false, true, "mla", false),
-    (true,  0, true, false, "mla", false),
-    (true,  2, false, true, "umlal", true),
-    (true,  2, true, false, "umlal", true),
-    (true,  4, false, true, "mls", false),
-    (true,  4, true, false, "mls", false),
-    (true,  6, false, true, "umlsl", true),
-    (true,  6, true, false, "umlsl", true),
-    (true,  9, false, false, "fmulx", false),
-    (true,  9, true, false, "fmulx", false),
-    (true,  9, true, true, "fmulx", false),
+    (true, 0, false, true, "mla", false),
+    (true, 0, true, false, "mla", false),
+    (true, 2, false, true, "umlal", true),
+    (true, 2, true, false, "umlal", true),
+    (true, 4, false, true, "mls", false),
+    (true, 4, true, false, "mls", false),
+    (true, 6, false, true, "umlsl", true),
+    (true, 6, true, false, "umlsl", true),
+    (true, 9, false, false, "fmulx", false),
+    (true, 9, true, false, "fmulx", false),
+    (true, 9, true, true, "fmulx", false),
     (true, 10, false, true, "umull", true),
     (true, 10, true, false, "umull", true),
 ];
@@ -1632,15 +1664,8 @@ fn modified_immediate(word: u32, q: bool) -> Option<R> {
                 value |= 0xffu64 << (8 * i);
             }
         }
-        let dest = if q {
-            vreg(rd, "2d")
-        } else {
-            format!("d{rd}")
-        };
-        return Some(R::new(
-            "movi",
-            format!("movi {dest}, #0x{value:016x}"),
-        ));
+        let dest = if q { vreg(rd, "2d") } else { format!("d{rd}") };
+        return Some(R::new("movi", format!("movi {dest}, #0x{value:016x}")));
     }
 
     // The rest name a width, a shift and whether to invert or merge. The masked

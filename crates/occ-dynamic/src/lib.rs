@@ -31,7 +31,6 @@
 //! rather than silently misread.
 
 #![deny(unsafe_code)]
-
 #![deny(missing_docs)]
 
 pub mod maps;
@@ -41,7 +40,5 @@ pub mod run;
 pub mod syscall;
 
 pub use maps::Map;
-pub use report::{
-    BlockHit, CallSite, Correlated, FunctionHit, Orphan, correlate, function_blocks,
-};
+pub use report::{BlockHit, CallSite, Correlated, FunctionHit, Orphan, correlate, function_blocks};
 pub use run::{CallEdge, End, RunConfig, Signal, Syscall, Thread, Trace, run};

@@ -43,9 +43,7 @@ use std::collections::HashSet;
 
 use occ_core::{Addr, FlowKind, Instruction};
 
-use crate::ir::{
-    BinOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp,
-};
+use crate::ir::{BinOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp};
 
 /// One architectural register.
 ///
@@ -898,12 +896,7 @@ impl<'a> Core<'a> {
     /// architectures whose decoder does not print it. A frame slot is still
     /// a named local rather than a memory read, because the frame is the
     /// one piece of memory the tool can name.
-    pub fn read_load(
-        &mut self,
-        op: &Operand,
-        access: Access,
-        stmts: &mut Vec<Stmt>,
-    ) -> Expr {
+    pub fn read_load(&mut self, op: &Operand, access: Access, stmts: &mut Vec<Stmt>) -> Expr {
         let Operand::Mem { .. } = op else {
             return self.read(op, stmts);
         };
@@ -923,13 +916,7 @@ impl<'a> Core<'a> {
     /// A frame slot becomes an assignment to the named local, so a store to
     /// the frame is visible to the analysis as a variable rather than as an
     /// opaque write to an address nobody can name.
-    pub fn store(
-        &mut self,
-        op: &Operand,
-        value: Expr,
-        access: Access,
-        stmts: &mut Vec<Stmt>,
-    ) {
+    pub fn store(&mut self, op: &Operand, value: Expr, access: Access, stmts: &mut Vec<Stmt>) {
         let Operand::Mem { .. } = op else {
             return;
         };
@@ -1125,10 +1112,7 @@ impl<'a> Core<'a> {
     pub fn pending_pair(&self) -> (Expr, Expr) {
         match &self.pending_cmp {
             Some(p) => (p.lhs.clone(), p.rhs.clone()),
-            None => (
-                Expr::Unknown("flags".into()),
-                Expr::Unknown("flags".into()),
-            ),
+            None => (Expr::Unknown("flags".into()), Expr::Unknown("flags".into())),
         }
     }
 
@@ -1147,9 +1131,9 @@ impl<'a> Core<'a> {
     pub fn condition_of(&self, mnemonic: &str, cond: FlagCond) -> Expr {
         if let Some(p) = &self.pending_cmp {
             if p.float
-                && let Some(e) =
-                    self.target
-                        .float_branch_cond(mnemonic, &p.lhs, &p.rhs, p.width)
+                && let Some(e) = self
+                    .target
+                    .float_branch_cond(mnemonic, &p.lhs, &p.rhs, p.width)
             {
                 return e;
             }
@@ -1386,7 +1370,8 @@ pub fn widen_signed(value: Expr, width: u8) -> Expr {
     }
 }
 /// Merge a narrow write into the full register.
-pub fn merge_write(dest: &str, value: Expr, size: u8, offset: u8, width: u8) -> Expr {    let bits = u32::from(size) * 8;
+pub fn merge_write(dest: &str, value: Expr, size: u8, offset: u8, width: u8) -> Expr {
+    let bits = u32::from(size) * 8;
     let field_mask = if bits >= u32::from(width) * 8 {
         u64::MAX
     } else {

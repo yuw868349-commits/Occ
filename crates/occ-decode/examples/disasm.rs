@@ -5,16 +5,15 @@ use occ_decode::Decoder;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: disasm <file> [start] [count] [--tsv]");
+    let path = args
+        .next()
+        .expect("usage: disasm <file> [start] [count] [--tsv]");
     let start = args
         .next()
         .and_then(|s| occ_core::addr::parse_addr(&s))
         .map(|a| a.get())
         .unwrap_or(0);
-    let count: usize = args
-        .next()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(20);
+    let count: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(20);
     // `--tsv` prints one machine-readable row per instruction: the address,
     // the length in bytes, and the text. The cross-check against objdump
     // needs the length as a number, not as a count of printed bytes.

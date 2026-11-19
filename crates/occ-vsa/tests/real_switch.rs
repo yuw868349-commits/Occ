@@ -105,7 +105,11 @@ fn report() -> Option<occ_vsa::Report> {
         .expect("parse binary");
     let view = View::new(&image, &data);
     let analysis = Analysis::build(&view, &AnalysisOptions::default());
-    Some(occ_vsa::analyze(&view, &analysis, &occ_vsa::Options::default()))
+    Some(occ_vsa::analyze(
+        &view,
+        &analysis,
+        &occ_vsa::Options::default(),
+    ))
 }
 
 /// The labels a jump site resolved, in order.
@@ -154,7 +158,9 @@ fn a_switch_whose_cases_start_at_a_hundred_keeps_its_case_values() {
     // it looks the table up, so the table holds positions and the case
     // values are the positions plus a hundred.
     assert!(
-        labels.windows(7).any(|w| w == [100, 101, 102, 103, 104, 105, 106]),
+        labels
+            .windows(7)
+            .any(|w| w == [100, 101, 102, 103, 104, 105, 106]),
         "the biased switch did not keep its case values: {labels:#?}"
     );
 }

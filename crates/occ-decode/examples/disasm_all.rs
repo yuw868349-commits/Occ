@@ -25,7 +25,9 @@ use occ_decode::Decoder;
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let path = args.next().expect("usage: disasm_all <file> [--tsv|--symbols]");
+    let path = args
+        .next()
+        .expect("usage: disasm_all <file> [--tsv|--symbols]");
     let flags: Vec<String> = args.collect();
     let tsv = flags.iter().any(|f| f == "--tsv");
     let symbols = flags.iter().any(|f| f == "--symbols");
@@ -81,9 +83,7 @@ fn linear(
         .symbols
         .iter()
         .filter(|s| {
-            s.defined
-                && s.addr.get() != 0
-                && matches!(s.kind, occ_core::SymbolKind::Function)
+            s.defined && s.addr.get() != 0 && matches!(s.kind, occ_core::SymbolKind::Function)
         })
         .map(|s| s.addr.get())
         .collect();
@@ -116,7 +116,9 @@ fn linear(
                 restart = Some(e);
                 break;
             }
-            let Some(bytes) = bytes_at(img, data, pc) else { break };
+            let Some(bytes) = bytes_at(img, data, pc) else {
+                break;
+            };
             let Some(d) = dec.decode(Addr(pc), bytes) else {
                 break;
             };
@@ -171,8 +173,12 @@ fn entries(
             if !queued.insert(Addr(pc)) {
                 break;
             }
-            let Some(bytes) = bytes_at(img, data, pc) else { break };
-            let Some(d) = dec.decode(Addr(pc), bytes) else { break };
+            let Some(bytes) = bytes_at(img, data, pc) else {
+                break;
+            };
+            let Some(d) = dec.decode(Addr(pc), bytes) else {
+                break;
+            };
             insns
                 .entry(pc)
                 .or_insert_with(|| (d.insn.len, d.insn.mnemonic.to_string()));
@@ -189,11 +195,7 @@ fn entries(
 }
 
 /// The bytes of the section that holds `addr`, starting at `addr`.
-fn bytes_at<'a>(
-    img: &occ_core::Image,
-    data: &'a [u8],
-    addr: u64,
-) -> Option<&'a [u8]> {
+fn bytes_at<'a>(img: &occ_core::Image, data: &'a [u8], addr: u64) -> Option<&'a [u8]> {
     for sec in &img.sections {
         let start = sec.addr.get();
         let end = start + sec.file_size;

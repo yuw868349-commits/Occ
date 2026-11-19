@@ -238,7 +238,11 @@ fn file_of(s: &OccSession, image: i64) -> Result<std::sync::Arc<occ_session::Ima
 }
 
 /// Resolve a name or an address to a recovered function.
-fn find<'a>(image: &'a Image, analysis: &'a occ_analyze::Analysis, target: &str) -> Option<&'a Function> {
+fn find<'a>(
+    image: &'a Image,
+    analysis: &'a occ_analyze::Analysis,
+    target: &str,
+) -> Option<&'a Function> {
     if let Some(addr) = occ_core::addr::parse_addr(target)
         && let Some(f) = analysis.function_covering(addr)
     {
@@ -563,8 +567,16 @@ pub unsafe extern "C" fn occ_function(
                 ])
             })
             .collect();
-        let callers: Vec<Value> = func.callers.iter().map(|a| Value::from(a.to_string())).collect();
-        let callees: Vec<Value> = func.callees.iter().map(|a| Value::from(a.to_string())).collect();
+        let callers: Vec<Value> = func
+            .callers
+            .iter()
+            .map(|a| Value::from(a.to_string()))
+            .collect();
+        let callees: Vec<Value> = func
+            .callees
+            .iter()
+            .map(|a| Value::from(a.to_string()))
+            .collect();
         let tables: Vec<Value> = func
             .jump_tables
             .iter()
@@ -902,9 +914,11 @@ mod tests {
             .unwrap();
         let t = CString::new(name).unwrap();
         let j = unsafe { occ_decompile(s, id, t.as_ptr(), err.as_mut_ptr(), err.len()) };
-        assert!(!j.is_null(), "{}", unsafe {
-            CStr::from_ptr(err.as_ptr())
-        }.to_str().unwrap());
+        assert!(
+            !j.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(err.as_ptr()) }.to_str().unwrap()
+        );
         let text = unsafe { CStr::from_ptr(j) }.to_str().unwrap().to_string();
         unsafe { occ_free(j) };
         assert!(text.contains("\"unstructured\""), "{text}");

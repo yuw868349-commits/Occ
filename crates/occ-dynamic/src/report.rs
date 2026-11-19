@@ -233,7 +233,8 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
         let site = by_site.entry(e.site.0).or_insert_with(|| CallSite {
             site: e.site,
             in_image: e.site_in_image,
-            from: e.site_in_image
+            from: e
+                .site_in_image
                 .then(|| covering(functions, e.site))
                 .flatten()
                 .map(|i| functions[i].display_name()),

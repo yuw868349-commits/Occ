@@ -20,8 +20,8 @@ use std::sync::{Arc, RwLock};
 use occ_analyze::analysis::{Analysis, AnalysisOptions};
 use occ_analyze::view::View;
 use occ_core::{
-    Addr, Evidence, Format, Function, Handle, HandleKind, Hypothesis, Image, ImageId, Result,
-    SymbolKind, Verdict, CoreError,
+    Addr, CoreError, Evidence, Format, Function, Handle, HandleKind, Hypothesis, Image, ImageId,
+    Result, SymbolKind, Verdict,
 };
 
 /// One loaded image and everything derived from it.
@@ -366,14 +366,9 @@ impl Session {
         let id = inner.next_trace;
         inner.next_trace += 1;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        inner.traces.insert(
-            id,
-            Arc::new(TraceRecord {
-                image,
-                trace,
-                seq,
-            }),
-        );
+        inner
+            .traces
+            .insert(id, Arc::new(TraceRecord { image, trace, seq }));
         Ok(id)
     }
 
@@ -403,11 +398,7 @@ impl Session {
     /// blocks the write. That is reported rather than silently skipped,
     /// because a caller who asked for names and got a success would read the
     /// image again and find the old ones.
-    pub fn rename_functions(
-        &self,
-        id: u32,
-        renames: &[(Addr, String)],
-    ) -> Result<usize, String> {
+    pub fn rename_functions(&self, id: u32, renames: &[(Addr, String)]) -> Result<usize, String> {
         let mut inner = self
             .inner
             .write()
@@ -420,7 +411,12 @@ impl Session {
         };
         let mut n = 0;
         for (addr, name) in renames {
-            if let Some(f) = file.analysis.functions.iter_mut().find(|f| f.entry == *addr) {
+            if let Some(f) = file
+                .analysis
+                .functions
+                .iter_mut()
+                .find(|f| f.entry == *addr)
+            {
                 f.name = Some(name.clone());
                 n += 1;
             }
@@ -449,7 +445,9 @@ impl Session {
     /// Resolve a handle string inside `image`.
     pub fn resolve(&self, image: u32, input: &str, default_kind: HandleKind) -> Result<Target> {
         let handle = Handle::lax(input, default_kind)?;
-        let file = self.image(image).ok_or(CoreError::NoSuchImage { id: image })?;
+        let file = self
+            .image(image)
+            .ok_or(CoreError::NoSuchImage { id: image })?;
         self.resolve_in(&file, image, &handle)
     }
 
@@ -512,12 +510,12 @@ impl Session {
             }
             HandleKind::Block => {
                 let addr = parse_or_err(&value)?;
-                let f = file
-                    .analysis
-                    .function_covering(addr)
-                    .ok_or_else(|| CoreError::NotFound {
-                        what: format!("block at {addr}"),
-                    })?;
+                let f =
+                    file.analysis
+                        .function_covering(addr)
+                        .ok_or_else(|| CoreError::NotFound {
+                            what: format!("block at {addr}"),
+                        })?;
                 let b = f.block_at(addr).ok_or_else(|| CoreError::NotFound {
                     what: format!("block at {addr}"),
                 })?;
@@ -530,9 +528,12 @@ impl Session {
             }
             HandleKind::Insn => {
                 let addr = parse_or_err(&value)?;
-                let i = file.analysis.insn_at(addr).ok_or_else(|| CoreError::NotFound {
-                    what: format!("instruction at {addr}"),
-                })?;
+                let i = file
+                    .analysis
+                    .insn_at(addr)
+                    .ok_or_else(|| CoreError::NotFound {
+                        what: format!("instruction at {addr}"),
+                    })?;
                 Ok(Target::Insn {
                     image,
                     addr: i.addr,
@@ -541,9 +542,12 @@ impl Session {
             }
             HandleKind::Str => {
                 let addr = parse_or_err(&value)?;
-                let s = file.analysis.string_at(addr).ok_or_else(|| CoreError::NotFound {
-                    what: format!("string at {addr}"),
-                })?;
+                let s = file
+                    .analysis
+                    .string_at(addr)
+                    .ok_or_else(|| CoreError::NotFound {
+                        what: format!("string at {addr}"),
+                    })?;
                 Ok(Target::Str {
                     image,
                     addr: s.addr,
@@ -633,7 +637,9 @@ impl Session {
     /// exists, because that is the more specific intent; otherwise the text is
     /// parsed as an address.
     pub fn resolve_name_or_addr(&self, image: u32, input: &str) -> Result<Addr> {
-        let file = self.image(image).ok_or(CoreError::NoSuchImage { id: image })?;
+        let file = self
+            .image(image)
+            .ok_or(CoreError::NoSuchImage { id: image })?;
         if let Some(s) = file.image.symbols.iter().find(|s| s.name == input) {
             return Ok(s.addr);
         }
@@ -646,12 +652,7 @@ impl Session {
     }
 
     /// Create a hypothesis about `handle`.
-    pub fn hypothesise(
-        &self,
-        handle: Handle,
-        image: Option<u32>,
-        statement: &str,
-    ) -> Result<u64> {
+    pub fn hypothesise(&self, handle: Handle, image: Option<u32>, statement: &str) -> Result<u64> {
         let mut inner = self.inner.write().map_err(|_| poisoned())?;
         let id = inner.next_hyp;
         inner.next_hyp += 1;
@@ -666,12 +667,9 @@ impl Session {
     pub fn add_evidence(&self, id: u64, evidence: Evidence) -> Result<(Verdict, f32)> {
         let mut inner = self.inner.write().map_err(|_| poisoned())?;
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let h = inner
-            .hypotheses
-            .get_mut(&id)
-            .ok_or(CoreError::NotFound {
-                what: format!("hypothesis {id}"),
-            })?;
+        let h = inner.hypotheses.get_mut(&id).ok_or(CoreError::NotFound {
+            what: format!("hypothesis {id}"),
+        })?;
         h.push(evidence, seq);
         Ok((h.verdict(), h.confidence))
     }

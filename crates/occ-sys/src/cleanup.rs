@@ -109,10 +109,8 @@ mod tests {
     /// A directory under the system temporary directory, named so that two
     /// tests running at the same time do not collide.
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "occ-sys-cleanup-{}-{name}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("occ-sys-cleanup-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create the scratch directory");
         dir
@@ -124,7 +122,10 @@ mod tests {
         let dir = scratch("removed");
         std::fs::write(dir.join("file"), b"x").expect("write a file");
         remove_dir_at_exit(&dir);
-        assert!(dir.exists(), "the directory is still there before the hook runs");
+        assert!(
+            dir.exists(),
+            "the directory is still there before the hook runs"
+        );
         cleanup();
         assert!(
             !dir.exists(),

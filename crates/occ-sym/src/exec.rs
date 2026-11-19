@@ -316,8 +316,7 @@ impl Runner<'_> {
                 self.dropped += work.len() + 1;
                 self.notes.push(format!(
                     "stopped at {} paths; {} state(s) were not finished",
-                    self.cfg.max_paths,
-                    self.dropped
+                    self.cfg.max_paths, self.dropped
                 ));
                 break;
             }
@@ -386,9 +385,7 @@ impl Runner<'_> {
                     return;
                 }
                 Term::Jump(target) => state.block = *target,
-                Term::Switch {
-                    index, targets, ..
-                } => {
+                Term::Switch { index, targets, .. } => {
                     // A dispatch: a known index picks one case, an unknown one
                     // makes every case a possible path.
                     let value = self.eval(index, &mut state);
@@ -643,10 +640,7 @@ impl Runner<'_> {
                 }
             }
             Expr::Member {
-                base,
-                offset,
-                size,
-                ..
+                base, offset, size, ..
             } => {
                 // A member is a load at a fixed offset; the symbolic executor
                 // does not need the name to know what it reads.
@@ -681,18 +675,17 @@ impl Runner<'_> {
                     return v;
                 }
                 if let Some(raw) = (self.read_static)(Addr(at), *size) {
-                    return Value::Const(if *signed {
-                        sign_fit(raw, *size)
-                    } else {
-                        raw
-                    });
+                    return Value::Const(if *signed { sign_fit(raw, *size) } else { raw });
                 }
                 match self.cfg.mode {
                     Mode::Symbolic => {
                         self.note_once(format!(
                             "read of unmapped 0x{at:x} ({size} byte) stayed symbolic"
                         ));
-                        Value::Sym(Expr::Unknown(format!("*(u{}*)0x{at:x}", u32::from(*size) * 8)))
+                        Value::Sym(Expr::Unknown(format!(
+                            "*(u{}*)0x{at:x}",
+                            u32::from(*size) * 8
+                        )))
                     }
                     Mode::Concrete => {
                         push_missing(state, &format!("memory at 0x{at:x} ({size} byte)"));
@@ -715,12 +708,7 @@ impl Runner<'_> {
                 let a = self.eval(arg, state);
                 Value::un(*op, &a, *bits)
             }
-            Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            } => {
+            Expr::Cond { op, lhs, rhs, bits } => {
                 let a = self.eval(lhs, state);
                 let b = self.eval(rhs, state);
                 Value::compare(*op, &a, &b, *bits)
@@ -729,7 +717,9 @@ impl Runner<'_> {
                 let values: Vec<Value> = args.iter().map(|a| self.eval(a, state)).collect();
                 Value::bool_combination(*op, &values)
             }
-            Expr::FlagCond { cond, state: flags, .. } => {
+            Expr::FlagCond {
+                cond, state: flags, ..
+            } => {
                 // The condition on the flags is answered by the flags.
                 match flags.condition(*cond) {
                     Some(e) => self.eval(&e, state),
@@ -847,9 +837,8 @@ impl Runner<'_> {
             Some(Some(p)) => p.clone(),
             Some(None) => return None,
             None => {
-                let lifted = std::rc::Rc::new(build_program(
-                    self.image, callee, self.opts, self.name_of,
-                ));
+                let lifted =
+                    std::rc::Rc::new(build_program(self.image, callee, self.opts, self.name_of));
                 self.callees.insert(target, Some(lifted.clone()));
                 lifted
             }

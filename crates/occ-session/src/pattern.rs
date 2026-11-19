@@ -123,12 +123,7 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, String> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("rule ") {
-            let name = rest
-                .split('{')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+            let name = rest.split('{').next().unwrap_or("").trim().to_string();
             if name.is_empty() {
                 return Err(format!("line {}: rule without a name", i));
             }
@@ -186,7 +181,9 @@ pub fn parse(text: &str) -> Result<Vec<Rule>, String> {
             });
             continue;
         }
-        return Err(format!("line {i}: expected `rule <name> {{`, found {line:?}"));
+        return Err(format!(
+            "line {i}: expected `rule <name> {{`, found {line:?}"
+        ));
     }
     Ok(rules)
 }
@@ -229,10 +226,7 @@ fn parse_string(def: &str) -> Result<PatternString, String> {
         });
     }
     if rest.starts_with('{') {
-        let inner = rest
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim();
+        let inner = rest.trim_start_matches('{').trim_end_matches('}').trim();
         return Ok(PatternString {
             id,
             kind: StringKind::Hex(parse_hex(inner)?),
@@ -271,8 +265,14 @@ fn parse_text(s: &str) -> Result<(Vec<u8>, Vec<&str>), String> {
                 Some('\\') => out.push(b'\\'),
                 Some('"') => out.push(b'"'),
                 Some('x') => {
-                    let hi = it.next().and_then(|c| c.to_digit(16)).ok_or("bad \\x escape")?;
-                    let lo = it.next().and_then(|c| c.to_digit(16)).ok_or("bad \\x escape")?;
+                    let hi = it
+                        .next()
+                        .and_then(|c| c.to_digit(16))
+                        .ok_or("bad \\x escape")?;
+                    let lo = it
+                        .next()
+                        .and_then(|c| c.to_digit(16))
+                        .ok_or("bad \\x escape")?;
                     out.push((hi * 16 + lo) as u8);
                 }
                 Some(other) => return Err(format!("unknown escape \\{other}")),
@@ -300,7 +300,9 @@ fn parse_hex(s: &str) -> Result<Vec<HexToken>, String> {
                     b.parse::<usize>().map_err(|_| format!("bad jump {tok}"))?,
                 ),
                 None => {
-                    let n = inner.parse::<usize>().map_err(|_| format!("bad jump {tok}"))?;
+                    let n = inner
+                        .parse::<usize>()
+                        .map_err(|_| format!("bad jump {tok}"))?;
                     (n, n)
                 }
             };
@@ -516,12 +518,7 @@ pub struct SectionRange {
 }
 
 /// Scan `data` (mapped at `base`) with `rules`.
-pub fn scan(
-    data: &[u8],
-    base: u64,
-    rules: &[Rule],
-    sections: &[SectionRange],
-) -> Vec<RuleMatch> {
+pub fn scan(data: &[u8], base: u64, rules: &[Rule], sections: &[SectionRange]) -> Vec<RuleMatch> {
     let mut out = Vec::new();
     for rule in rules {
         let mut hits: HashMap<&str, Vec<u64>> = HashMap::new();
@@ -535,7 +532,10 @@ pub fn scan(
                 StringKind::Hex(tokens) => find_hex(data, tokens),
             };
             if !found.is_empty() {
-                hits.insert(s.id.as_str(), found.into_iter().map(|o| base + o as u64).collect());
+                hits.insert(
+                    s.id.as_str(),
+                    found.into_iter().map(|o| base + o as u64).collect(),
+                );
             }
         }
         if eval(&rule.condition, &hits, sections, &rule.strings) {
@@ -585,8 +585,12 @@ fn eval(
                 })
                 .unwrap_or(false)
         }
-        Condition::And(a, b) => eval(a, hits, sections, declared) && eval(b, hits, sections, declared),
-        Condition::Or(a, b) => eval(a, hits, sections, declared) || eval(b, hits, sections, declared),
+        Condition::And(a, b) => {
+            eval(a, hits, sections, declared) && eval(b, hits, sections, declared)
+        }
+        Condition::Or(a, b) => {
+            eval(a, hits, sections, declared) || eval(b, hits, sections, declared)
+        }
         Condition::Not(a) => !eval(a, hits, sections, declared),
         Condition::AnyOfThem => declared.iter().any(|s| hits.contains_key(s.id.as_str())),
         Condition::AllOfThem => declared.iter().all(|s| hits.contains_key(s.id.as_str())),

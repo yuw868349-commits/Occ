@@ -121,7 +121,12 @@ pub fn build(
         }
     }
     s.prune_empty_phis();
-    let Builder { blocks, phis, notes, .. } = s;
+    let Builder {
+        blocks,
+        phis,
+        notes,
+        ..
+    } = s;
     for (b, list) in phis.into_iter().enumerate() {
         if list.is_empty() {
             continue;
@@ -171,9 +176,9 @@ impl Builder<'_> {
     fn succs(&self, b: BlockId) -> Vec<BlockId> {
         match &self.blocks[b].term {
             crate::ir::Term::Jump(t) => vec![*t],
-            crate::ir::Term::Branch { then_bb, else_bb, .. } => {
-                then_bb.iter().chain(else_bb.iter()).copied().collect()
-            }
+            crate::ir::Term::Branch {
+                then_bb, else_bb, ..
+            } => then_bb.iter().chain(else_bb.iter()).copied().collect(),
             crate::ir::Term::Switch { targets, .. } => targets.clone(),
             _ => Vec::new(),
         }
@@ -213,8 +218,7 @@ impl Builder<'_> {
                     let version = self.write(b, &r);
                     // The call result itself is filled in by the renderer;
                     // the name records which call produced it.
-                    self.defs
-                        .insert((b, r.clone()), Expr::Var(version.clone()));
+                    self.defs.insert((b, r.clone()), Expr::Var(version.clone()));
                     version
                 });
                 Stmt::Call {
@@ -326,8 +330,8 @@ impl Builder<'_> {
         // Only a name the function defines anywhere is a variable here: the
         // text also holds type names and numbers, and reading those would
         // invent a phi for `u64`.
-        let known = self.defs.contains_key(&(b, token.to_string()))
-            || self.counters.contains_key(token);
+        let known =
+            self.defs.contains_key(&(b, token.to_string())) || self.counters.contains_key(token);
         if !known {
             out.push_str(token);
             return false;
@@ -374,12 +378,7 @@ impl Builder<'_> {
                 arg: Box::new(self.rewrite(arg, b)),
                 bits: *bits,
             },
-            Expr::Cond {
-                op,
-                lhs,
-                rhs,
-                bits,
-            } => Expr::Cond {
+            Expr::Cond { op, lhs, rhs, bits } => Expr::Cond {
                 op: *op,
                 lhs: Box::new(self.rewrite(lhs, b)),
                 rhs: Box::new(self.rewrite(rhs, b)),
@@ -389,11 +388,7 @@ impl Builder<'_> {
                 op: *op,
                 args: args.iter().map(|a| self.rewrite(a, b)).collect(),
             },
-            Expr::FlagCond {
-                cond,
-                state,
-                bits,
-            } => Expr::FlagCond {
+            Expr::FlagCond { cond, state, bits } => Expr::FlagCond {
                 cond: *cond,
                 state: Box::new(crate::ir::FlagState {
                     cf: state.cf.as_ref().map(|e| self.rewrite(e, b)),
@@ -722,9 +717,7 @@ pub fn eliminate_phis(blocks: &mut [Block], preds: &[Vec<BlockId>]) -> HashSet<S
             let tmp = format!("__term{p}");
             let old = match &mut blocks[p].term {
                 Term::Branch { cond, .. } => std::mem::replace(cond, Expr::Var(tmp.clone())),
-                Term::Switch { index, .. } => {
-                    std::mem::replace(index, Expr::Var(tmp.clone()))
-                }
+                Term::Switch { index, .. } => std::mem::replace(index, Expr::Var(tmp.clone())),
                 Term::Ret(Some(v)) => std::mem::replace(v, Expr::Var(tmp.clone())),
                 _ => Expr::Const(0),
             };
@@ -737,10 +730,10 @@ pub fn eliminate_phis(blocks: &mut [Block], preds: &[Vec<BlockId>]) -> HashSet<S
             // hoisted above.
             opaque.insert(tmp);
         }
-        blocks[p].stmts.extend(list.into_iter().map(|(dest, value)| Stmt::Assign {
-            dest,
-            value,
-        }));
+        blocks[p].stmts.extend(
+            list.into_iter()
+                .map(|(dest, value)| Stmt::Assign { dest, value }),
+        );
     }
     let _ = preds;
     opaque
@@ -869,39 +862,39 @@ fn propagate_constants(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
     let mut changed = false;
     for b in blocks.iter_mut() {
         for_each_stmt_mut(&mut b.stmts, &mut |s| match s {
-                Stmt::Assign { value, .. } => {
-                    let n = value.substitute(&consts).simplify();
-                    if n != *value {
-                        *value = n;
+            Stmt::Assign { value, .. } => {
+                let n = value.substitute(&consts).simplify();
+                if n != *value {
+                    *value = n;
+                    changed = true;
+                }
+            }
+            Stmt::Store { addr, value, .. } => {
+                let na = addr.substitute(&consts).simplify();
+                let nv = value.substitute(&consts).simplify();
+                if na != *addr || nv != *value {
+                    *addr = na;
+                    *value = nv;
+                    changed = true;
+                }
+            }
+            Stmt::Call { args, .. } => {
+                for a in args.iter_mut() {
+                    let n = a.substitute(&consts).simplify();
+                    if n != *a {
+                        *a = n;
                         changed = true;
                     }
                 }
-                Stmt::Store { addr, value, .. } => {
-                    let na = addr.substitute(&consts).simplify();
-                    let nv = value.substitute(&consts).simplify();
-                    if na != *addr || nv != *value {
-                        *addr = na;
-                        *value = nv;
-                        changed = true;
-                    }
+            }
+            Stmt::If { cond, .. } => {
+                let n = cond.substitute(&consts).simplify();
+                if n != *cond {
+                    *cond = n;
+                    changed = true;
                 }
-                Stmt::Call { args, .. } => {
-                    for a in args.iter_mut() {
-                        let n = a.substitute(&consts).simplify();
-                        if n != *a {
-                            *a = n;
-                            changed = true;
-                        }
-                    }
-                }
-                Stmt::If { cond, .. } => {
-                    let n = cond.substitute(&consts).simplify();
-                    if n != *cond {
-                        *cond = n;
-                        changed = true;
-                    }
-                }
-                Stmt::Comment(_) => {}
+            }
+            Stmt::Comment(_) => {}
         });
         match &mut b.term {
             Term::Branch { cond, .. } => {
@@ -966,43 +959,43 @@ fn propagate_copies(blocks: &mut [Block], opaque: &HashSet<String>) -> bool {
             continue;
         }
         for_each_stmt_mut(&mut block.stmts, &mut |s| match s {
-                Stmt::Assign { dest, value } => {
-                    // The definition stays; readers are rewritten and the
-                    // dead pass removes it once nothing refers to it.
-                    if !subst.contains_key(dest) {
-                        let new = value.substitute(&subst);
-                        if new != *value {
-                            *value = new;
-                            changed = true;
-                        }
-                    }
-                }
-                Stmt::Store { addr, value, .. } => {
-                    let na = addr.substitute(&subst);
-                    let nv = value.substitute(&subst);
-                    if na != *addr || nv != *value {
-                        *addr = na;
-                        *value = nv;
+            Stmt::Assign { dest, value } => {
+                // The definition stays; readers are rewritten and the
+                // dead pass removes it once nothing refers to it.
+                if !subst.contains_key(dest) {
+                    let new = value.substitute(&subst);
+                    if new != *value {
+                        *value = new;
                         changed = true;
                     }
                 }
-                Stmt::Call { args, .. } => {
-                    for a in args.iter_mut() {
-                        let n = a.substitute(&subst);
-                        if n != *a {
-                            *a = n;
-                            changed = true;
-                        }
-                    }
+            }
+            Stmt::Store { addr, value, .. } => {
+                let na = addr.substitute(&subst);
+                let nv = value.substitute(&subst);
+                if na != *addr || nv != *value {
+                    *addr = na;
+                    *value = nv;
+                    changed = true;
                 }
-                Stmt::If { cond, .. } => {
-                    let n = cond.substitute(&subst);
-                    if n != *cond {
-                        *cond = n;
+            }
+            Stmt::Call { args, .. } => {
+                for a in args.iter_mut() {
+                    let n = a.substitute(&subst);
+                    if n != *a {
+                        *a = n;
                         changed = true;
                     }
                 }
-                Stmt::Comment(_) => {}
+            }
+            Stmt::If { cond, .. } => {
+                let n = cond.substitute(&subst);
+                if n != *cond {
+                    *cond = n;
+                    changed = true;
+                }
+            }
+            Stmt::Comment(_) => {}
         });
         match &mut block.term {
             Term::Branch { cond, .. } => {
@@ -1321,12 +1314,8 @@ fn rename_in_stmt(s: &mut Stmt, from: &str, to: &str) {
         ..
     } = s
     {
-        for_each_stmt_mut(then_body, &mut |s| {
-            rename_in_stmt_body(s, from, to)
-        });
-        for_each_stmt_mut(else_body, &mut |s| {
-            rename_in_stmt_body(s, from, to)
-        });
+        for_each_stmt_mut(then_body, &mut |s| rename_in_stmt_body(s, from, to));
+        for_each_stmt_mut(else_body, &mut |s| rename_in_stmt_body(s, from, to));
     }
 }
 
@@ -1363,10 +1352,7 @@ mod tests {
     /// one predecessor forwards the read to it, so reading a variable in `0`
     /// walks `0 -> 2 -> 1 -> 0` and, before the cycle was noticed, never
     /// came back.
-    fn ring_builder<'a>(
-        blocks: &'a mut Vec<Block>,
-        preds: &'a [Vec<BlockId>],
-    ) -> Builder<'a> {
+    fn ring_builder<'a>(blocks: &'a mut Vec<Block>, preds: &'a [Vec<BlockId>]) -> Builder<'a> {
         let n = blocks.len();
         Builder {
             blocks,
