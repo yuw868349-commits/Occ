@@ -184,6 +184,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         interpreter: None,
         warnings,
         function_bounds,
+        arm_modes: Default::default(),
+        wasm_types: Default::default(),
+        wasm_funcs: Default::default(),
     })
 }
 
@@ -882,5 +885,8 @@ pub fn parse_coff(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         interpreter: None,
         warnings: vec!["COFF object: addresses are section-relative until linked".into()],
         function_bounds: Vec::new(),
+        arm_modes: Default::default(),
+        wasm_types: Default::default(),
+        wasm_funcs: Default::default(),
     })
 }

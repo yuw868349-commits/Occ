@@ -9,8 +9,21 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let path = args.next().expect("usage: decompile <file> <name-or-addr>");
     let want = args.next().unwrap_or_else(|| "main".into());
-    let data = std::fs::read(&path).expect("read");
+    let mut data = std::fs::read(&path).expect("read");
     let img = occ_bin::load(&data, &path, ImageId(0)).expect("parse");
+    // A relocatable object has not been linked: its call targets and its
+    // global addresses are still the assembler's placeholders. Applying the
+    // relocations is what the session does, and without it a call reads as
+    // a branch to wherever the placeholder happened to be.
+    if let Some(applied) = occ_bin::reloc::apply(&mut data, &img) {
+        eprintln!(
+            "applied {} relocation(s), {} deferred, {} out of range",
+            applied.applied, applied.deferred, applied.out_of_range
+        );
+        for note in &applied.notes {
+            eprintln!("reloc: {note}");
+        }
+    }
     let view = View::new(&img, &data);
     let analysis = Analysis::build(&view, &AnalysisOptions::default());
 

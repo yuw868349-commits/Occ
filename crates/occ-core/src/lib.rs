@@ -51,9 +51,10 @@ pub use evidence::{
 pub use handle::{Handle, HandleKind};
 pub use hypothesis::{Hypothesis, HypothesisState, Verdict};
 pub use image::{
-    Arch, CompilerFamily, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
-    Import, ImportKind, LangGuess, Linkage, Perm, RelocKind, Relocation, Section, SectionKind,
-    Segment, Symbol, SymbolBinding, SymbolKind,
+    Arch, ArmMode, ArmModes, CompilerFamily, Endian, Export, Fingerprint, Format, FunctionBound,
+    Image, ImageId, Import, ImportKind, LangGuess, Linkage, Perm, RelocKind, Relocation, Section,
+    SectionKind, Segment, Symbol, SymbolBinding, SymbolKind, WasmFuncSig, WasmFuncType,
+    WasmValueType,
 };
 
 /// Crate version, surfaced in MCP `serverInfo` so a client can pin behaviour.

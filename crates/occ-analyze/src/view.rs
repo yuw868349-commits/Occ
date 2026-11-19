@@ -268,6 +268,9 @@ mod tests {
             interpreter: None,
             warnings: Vec::new(),
             function_bounds: Vec::new(),
+            arm_modes: Default::default(),
+        wasm_types: Default::default(),
+        wasm_funcs: Default::default(),
         }
     }
 

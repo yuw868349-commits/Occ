@@ -161,13 +161,95 @@ fn cond_of_suffix(suffix: &str) -> Option<FlagCond> {
 }
 
 /// The instructions this lifter understands, without condition or `s`.
+///
+/// The instruction set the lifter knows.
+///
+/// The list holds both instruction sets of the architecture. A32 and T32
+/// are two encodings of the same machine, and a compiler picks between
+/// them per function, so a binary holds both and the lifter has to read
+/// both. The names that are Thumb's own — `cbz`, the extends, the
+/// conditional block — are in the list too.
 const BASES: &[&str] = &[
-    "adc", "add", "and", "asr", "b", "bic", "bl", "blx", "blxns", "bx", "bxns", "clz", "cmn", "cmp",
-    "eor", "ldm",
-    "ldr", "ldrb", "ldrd", "ldrh", "ldrsb", "ldrsh", "lsl", "lsr", "mla", "mov", "movw", "movt", "mul",
-    "mvn", "nop", "orr", "pop", "push", "ror", "rrx", "rsb", "sbc", "sdiv", "stm", "str", "strb",
-    "strh", "strd", "sub", "svc", "swi", "teq", "tst", "udiv", "umull", "smull", "umlal", "smlal",
+    "adc", "add", "adr", "and", "asr", "b", "bfc", "bfi", "bic", "bkpt", "bl", "blx", "blxns",
+    "bx", "bxns", "cbz", "cbnz", "clz", "cmn", "cmp", "crc32b", "crc32cb", "crc32ch", "crc32cw",
+    "crc32h", "crc32w", "eor", "ldm", "ldmdb", "ldmia",
+    "ldr", "ldrb", "ldrd", "ldrex", "ldrexb", "ldrexd", "ldrexh", "ldrh", "ldrsb", "ldrsh",
+    "lsl", "lsr", "mla", "mls", "mov", "movw", "movt", "mul", "mvn", "nop", "orr", "pop",
+    "push", "qadd", "qdadd", "qdsub", "qsub", "rbit", "rev", "rev16", "revsh", "ror", "rrx",
+    "rsb", "sbc", "sbfx", "sdiv", "sel", "serv",
+    "smull", "smlal", "stm", "stmdb", "stmia", "str", "strb", "strd", "strex", "strexb",
+    "strexd", "strexh", "strh", "sub", "svc", "swi", "sxtab", "sxtab16", "sxtah", "sxtb",
+    "sxth", "teq", "tst", "ubfx", "udiv", "umaal", "umlal", "umull", "uxtab", "uxtab16",
+    "uxtah", "uxtb", "uxth", "wfe", "wfi", "yield",
 ];
+
+/// The parallel and the exchanged operations, and the intrinsic each one
+/// is.
+///
+/// The name says how the halves are read and how the result is treated:
+/// the `s` prefix reads them as signed numbers and the `u` prefix as
+/// unsigned ones, the `q` prefix holds the result at the ends of the
+/// range and the `sh` and `uh` prefixes halve it. The family says what
+/// is done to them, and the ending says how wide they are.
+///
+/// The exchanged ones take the halves of the two operands the other way
+/// round, which is what the `asx` and `sax` families say.
+fn parallel_intrinsic(base: &str) -> Option<(Intrinsic, u8)> {
+    use Intrinsic::{
+        ExchangeAdd, ExchangeAddHalf, ExchangeAddHalfUns, ExchangeAddSat, ExchangeAddSatUns,
+        ExchangeAddUns, ExchangeSub, ExchangeSubHalf, ExchangeSubHalfUns, ExchangeSubSat,
+        ExchangeSubSatUns, ExchangeSubUns, ParallelAdd, ParallelAddHalf, ParallelAddHalfUns,
+        ParallelAddSat, ParallelAddSatUns, ParallelAddUns, ParallelSub, ParallelSubHalf,
+        ParallelSubHalfUns, ParallelSubSat, ParallelSubSatUns, ParallelSubUns,
+    };
+    // The exchanged families come first, because their names end in the
+    // same letters as the parallel ones.
+    if let Some(rest) = base.strip_suffix("asx") {
+        let lane = 2;
+        return Some(match rest {
+            "s" => (ExchangeAdd, lane),
+            "q" => (ExchangeAddSat, lane),
+            "sh" => (ExchangeAddHalf, lane),
+            "u" => (ExchangeAddUns, lane),
+            "uq" => (ExchangeAddSatUns, lane),
+            "uh" => (ExchangeAddHalfUns, lane),
+            _ => return None,
+        });
+    }
+    if let Some(rest) = base.strip_suffix("sax") {
+        let lane = 2;
+        return Some(match rest {
+            "s" => (ExchangeSub, lane),
+            "q" => (ExchangeSubSat, lane),
+            "sh" => (ExchangeSubHalf, lane),
+            "u" => (ExchangeSubUns, lane),
+            "uq" => (ExchangeSubSatUns, lane),
+            "uh" => (ExchangeSubHalfUns, lane),
+            _ => return None,
+        });
+    }
+    // The parallel ones say how wide the lane is at the end of the name.
+    let (body, lane) = match base.as_bytes().last() {
+        Some(b'8') => (&base[..base.len() - 1], 1),
+        Some(b'6') if base.ends_with("16") => (&base[..base.len() - 2], 2),
+        _ => return None,
+    };
+    Some(match body {
+        "sadd" => (ParallelAdd, lane),
+        "qadd" => (ParallelAddSat, lane),
+        "shadd" => (ParallelAddHalf, lane),
+        "uadd" => (ParallelAddUns, lane),
+        "uqadd" => (ParallelAddSatUns, lane),
+        "uhadd" => (ParallelAddHalfUns, lane),
+        "ssub" => (ParallelSub, lane),
+        "qsub" => (ParallelSubSat, lane),
+        "shsub" => (ParallelSubHalf, lane),
+        "usub" => (ParallelSubUns, lane),
+        "uqsub" => (ParallelSubSatUns, lane),
+        "uhsub" => (ParallelSubHalfUns, lane),
+        _ => return None,
+    })
+}
 
 /// Split a mnemonic into its base, whether it sets the flags, and its
 /// condition.
@@ -176,7 +258,14 @@ const BASES: &[&str] = &[
 /// which is a condition, and `bls` is `b` with `ls` and not `bl` with `s`.
 /// Every candidate is therefore checked against the instruction set before it
 /// is accepted.
+///
+/// The wide forms carry a marker that says how the instruction is encoded
+/// and not what it does, and it goes at the end: `add.w` is an add, and
+/// `beq.w` is a conditional branch whose condition comes before the
+/// marker. The marker is taken off first, so the condition is found where
+/// it is.
 fn split_mnemonic(m: &str) -> (&str, bool, Option<FlagCond>) {
+    let m = m.strip_suffix(".w").unwrap_or(m);
     let known = |s: &str| BASES.contains(&s);
     if let Some((base, sfx)) = m.split_at_checked(m.len().saturating_sub(2))
         && !base.is_empty()
@@ -546,6 +635,13 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_insn(&mut self, insn: &Instruction, out: &mut Lifted) {
+        // The head of an `it` block governs the instructions after it, and
+        // the condition is already written into their own names. The block
+        // itself is not an operation on any value: it is the way Thumb
+        // says that the next few instructions run on one path.
+        if is_it_block(&insn.text) {
+            return;
+        }
         // The block transfers carry a register list, which is not an operand
         // and would make the general parser reject the instruction.
         if self.block_transfer(insn.text.as_str(), &mut out.stmts) {
@@ -599,7 +695,15 @@ impl<'a> Lifter<'a> {
                     }
                     _ => None,
                 };
-                let previous = shift.map(|(reg, _, _)| self.core.read_reg(Reg::full(reg, 4)));
+                let previous = shift.map(|(reg, _, _)| {
+                    // The carry of a shift is the bit that fell off the end,
+                    // and it is read from the value *before* the shift. The
+                    // name is bound to a value of its own so that the flag
+                    // does not end up reading the shifted value: the write
+                    // below is about to replace it.
+                    let value = self.core.read_reg(Reg::full(reg, 4));
+                    self.bind(value, &mut out.stmts)
+                });
                 let value = self.operand_value(&op, ops, 1);
                 self.write_reg(rd, value.clone(), guard, &mut out.stmts);
                 if sets_flags {
@@ -973,6 +1077,33 @@ impl<'a> Lifter<'a> {
                 };
                 self.write_reg(rd, value, guard, &mut out.stmts);
             }
+            "uxtb" | "uxth" | "sxtb" | "sxth" => {
+                // The extension is part of the instruction: a byte that is
+                // loaded and zero-extended is one operation, and reading it
+                // as a plain move loses the half of the value the
+                // instruction threw away.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let Some(rm) = ops.get(1).and_then(reg_of) else {
+                    return;
+                };
+                let signed = base == "sxtb" || base == "sxth";
+                let from = if base == "uxtb" || base == "sxtb" {
+                    1
+                } else {
+                    2
+                };
+                let value = Expr::Cast {
+                    kind: if signed {
+                        crate::ir::CastKind::Sext
+                    } else {
+                        crate::ir::CastKind::Zext
+                    },
+                    arg: Box::new(self.core.read_reg(rm)),
+                    from,
+                    to: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
             "sdiv" | "udiv" => {
                 let Some(rd) = reg_at(ops, 0) else { return };
                 let (Some(rn), Some(rm)) = (
@@ -1005,6 +1136,11 @@ impl<'a> Lifter<'a> {
                 // carries; there is no statement to emit.  `bxns` is the
                 // same exchange with the security state changed as well,
                 // and it is a jump in the same way.
+            }
+            "cbz" | "cbnz" => {
+                // Thumb's compare-and-branch. The condition is the value of
+                // the register against zero rather than a condition code,
+                // and the block terminator carries it.
             }
             "blx" | "blxns" => {
                 let Some(target) = ops.first().and_then(reg_of) else {
@@ -1081,9 +1217,221 @@ impl<'a> Lifter<'a> {
                     .assign("r0", Expr::Unknown("svc".into()), &mut out.stmts);
             }
             "nop" => {}
+            "sxtah" | "uxtah" | "sxtab" | "uxtab" | "sxtab16" | "uxtab16" => {
+                // The extended additions take three registers and add
+                // the extended one to the other, and the extension is
+                // part of the instruction: a half word that is added
+                // after being extended is one operation, and reading it
+                // as a plain addition loses the half of the value the
+                // instruction threw away.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let (Some(rn), Some(rm)) = (
+                    ops.get(1).and_then(reg_of),
+                    ops.get(2).and_then(reg_of),
+                ) else {
+                    return;
+                };
+                // The third operand may carry a rotation, which the
+                // encoder spells out as `ror #8` and the like.
+                let rotated = match ops.get(3) {
+                    Some(Operand::Imm(v)) => self.rotate_right(self.core.read_reg(rm), *v as u32),
+                    _ => self.core.read_reg(rm),
+                };
+                // The `ab` forms add a byte and the `ah` forms add a half
+                // word.  The `16` forms are a different thing again: they
+                // work on both halves of the word at once, each half of
+                // the second operand is extended and added to the
+                // matching half of the first, and the carry of one half
+                // never reaches the other.
+                if base.ends_with("ab16") {
+                    let value = Expr::Intrinsic {
+                        op: if base.starts_with('s') {
+                            Intrinsic::ExtendAddSigned
+                        } else {
+                            Intrinsic::ExtendAdd
+                        },
+                        args: vec![self.core.read_reg(rn), rotated],
+                        bits: 4,
+                    };
+                    self.write_reg(rd, value, guard, &mut out.stmts);
+                    return;
+                }
+                let (from, signed) = match base {
+                    "sxtah" => (2, true),
+                    "uxtah" => (2, false),
+                    "sxtab" => (1, true),
+                    _ => (1, false),
+                };
+                let extended = Expr::Cast {
+                    kind: if signed {
+                        crate::ir::CastKind::Sext
+                    } else {
+                        crate::ir::CastKind::Zext
+                    },
+                    arg: Box::new(rotated),
+                    from,
+                    to: 4,
+                };
+                let value = Expr::Bin {
+                    op: BinOp::Add,
+                    lhs: Box::new(self.core.read_reg(rn)),
+                    rhs: Box::new(extended),
+                    bits: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
+            "rev" | "rev16" | "revsh" | "rbit" => {
+                // The reversals are one operation each: reading them as
+                // a chain of shifts would say the same thing, but the
+                // machine does them in one step and the value they
+                // throw away is part of what they mean.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let Some(rm) = ops.get(1).and_then(reg_of) else {
+                    return;
+                };
+                let op = match base {
+                    "rev" => Intrinsic::RevBytes,
+                    "rev16" => Intrinsic::RevHalves,
+                    "revsh" => Intrinsic::RevHalvesSigned,
+                    _ => Intrinsic::RevBits,
+                };
+                let value = Expr::Intrinsic {
+                    op,
+                    args: vec![self.core.read_reg(rm)],
+                    bits: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
+            "sel" => {
+                // The select picks each bit from one of two values, and
+                // the mask says which one.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let (Some(rn), Some(rm)) = (
+                    ops.get(1).and_then(reg_of),
+                    ops.get(2).and_then(reg_of),
+                ) else {
+                    return;
+                };
+                let value = Expr::Intrinsic {
+                    op: Intrinsic::Select,
+                    args: vec![
+                        self.core.read_reg(rn),
+                        self.core.read_reg(rm),
+                        self.core.read_reg(rn),
+                    ],
+                    bits: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
+            "qadd" | "qsub" | "qdadd" | "qdsub" => {
+                // The saturating additions and subtractions, and their
+                // doubled forms, which add or subtract twice the
+                // second operand.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let (Some(rm), Some(rn)) = (
+                    ops.get(1).and_then(reg_of),
+                    ops.get(2).and_then(reg_of),
+                ) else {
+                    return;
+                };
+                let doubled = matches!(base, "qdadd" | "qdsub");
+                let sub = matches!(base, "qsub" | "qdsub");
+                let second = if doubled {
+                    Expr::Bin {
+                        op: BinOp::Add,
+                        lhs: Box::new(self.core.read_reg(rn)),
+                        rhs: Box::new(self.core.read_reg(rn)),
+                        bits: 4,
+                    }
+                } else {
+                    self.core.read_reg(rn)
+                };
+                let value = Expr::Intrinsic {
+                    op: if sub {
+                        Intrinsic::SatSub
+                    } else {
+                        Intrinsic::SatAdd
+                    },
+                    args: vec![self.core.read_reg(rm), second],
+                    bits: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
+            _ if base.starts_with("crc32") => {
+                // The checksums: a byte, a half word or a word of the
+                // second operand is folded into the running value in
+                // the first.  The two families differ only in the
+                // polynomial they use.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let (Some(rn), Some(rm)) = (
+                    ops.get(1).and_then(reg_of),
+                    ops.get(2).and_then(reg_of),
+                ) else {
+                    return;
+                };
+                let width: u32 = match base {
+                    "crc32b" | "crc32cb" => 8,
+                    "crc32h" | "crc32ch" => 16,
+                    _ => 32,
+                };
+                let folded = Expr::Cast {
+                    kind: crate::ir::CastKind::Zext,
+                    arg: Box::new(self.core.read_reg(rm)),
+                    from: (width / 8) as u8,
+                    to: 4,
+                };
+                let value = Expr::Intrinsic {
+                    op: if base.contains('c') && base.len() > 5 {
+                        Intrinsic::Crc32c
+                    } else {
+                        Intrinsic::Crc32
+                    },
+                    args: vec![
+                        self.core.read_reg(rn),
+                        folded,
+                        Expr::Const(u64::from(width)),
+                    ],
+                    bits: 4,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
+            _ if let Some(op) = parallel_intrinsic(base) => {
+                // The parallel additions and subtractions, and the
+                // exchanged ones that take the halves of the operands
+                // the other way round.
+                let Some(rd) = reg_at(ops, 0) else { return };
+                let (Some(rn), Some(rm)) = (
+                    ops.get(1).and_then(reg_of),
+                    ops.get(2).and_then(reg_of),
+                ) else {
+                    return;
+                };
+                let (op, lane) = op;
+                let value = Expr::Intrinsic {
+                    op,
+                    args: vec![self.core.read_reg(rn), self.core.read_reg(rm)],
+                    bits: lane,
+                };
+                self.write_reg(rd, value, guard, &mut out.stmts);
+            }
             // A helper the decoder emitted for an encoding it does not
             // model: keep the text visible.
             _ => out.stmts.push(Stmt::Comment(insn.text.clone())),
+        }
+    }
+
+    /// Rotate a value to the right by a whole number of places.
+    ///
+    /// The extended additions take a rotation of the value they extend,
+    /// and the encoder writes it out as `ror #8` and the like.
+    fn rotate_right(&mut self, value: Expr, amount: u32) -> Expr {
+        if amount == 0 {
+            return value;
+        }
+        Expr::Intrinsic {
+            op: Intrinsic::Ror,
+            args: vec![value, Expr::Const(u64::from(amount))],
+            bits: 4,
         }
     }
 
@@ -1693,6 +2041,30 @@ impl<'a> Lifter<'a> {
         // guard. It is a branch for the block, and the condition it tests is
         // the same one `bne` would.
         if base != "b" && base != "bx" && base != "bxns" {
+            // `cbz` and `cbnz` are Thumb's own compare-and-branch. The
+            // condition is not a condition code: it is the value of one
+            // register against zero.
+            if base == "cbz" || base == "cbnz" {
+                let rest = insn
+                    .text
+                    .split_once(char::is_whitespace)
+                    .map(|(_, r)| r.trim())
+                    .unwrap_or("");
+                let Some(reg) = rest.split(',').next().and_then(|r| register(r.trim())) else {
+                    return Expr::Unknown("condition".into());
+                };
+                let value = self.core.read_reg(reg);
+                return Expr::Cond {
+                    op: if base == "cbz" {
+                        CondOp::Eq
+                    } else {
+                        CondOp::Ne
+                    },
+                    lhs: Box::new(value),
+                    rhs: Box::new(Expr::Const(0)),
+                    bits: reg.size,
+                };
+            }
             return Expr::Unknown("condition".into());
         }
         match cond {
@@ -1713,6 +2085,21 @@ impl<'a> Lifter<'a> {
     }
 }
 
+/// Whether an instruction is the head of an `it` block.
+///
+/// The name is `it` followed by one letter for every instruction after the
+/// first: `t` for the arm that runs when the condition holds and `e` for
+/// the arm that runs when it does not. The block itself does nothing, so
+/// the lifter skips it and lets the conditions it carries speak for the
+/// instructions that follow.
+fn is_it_block(text: &str) -> bool {
+    let name = text.split_whitespace().next().unwrap_or("");
+    let Some(letters) = name.strip_prefix("it") else {
+        return false;
+    };
+    letters.chars().all(|c| c == 't' || c == 'e')
+}
+
 fn reg_at(ops: &[Operand], i: usize) -> Option<u8> {
     ops.get(i).and_then(reg_of).map(|r| r.idx)
 }
@@ -1723,19 +2110,29 @@ fn reg_at(ops: &[Operand], i: usize) -> Option<u8> {
 /// is the same return on one path only. The text is the only place the
 /// difference shows: the link register is named, and a condition stands
 /// between it and the instruction.
+///
+/// `pop {..., pc}` is the other return, and it carries its condition in the
+/// same place.
 fn is_conditional_return(text: &str) -> bool {
     let text = text.trim();
-    let Some(rest) = text
-        .strip_prefix("bx")
-        .or_else(|| text.strip_prefix("bxns"))
-    else {
+    if let Some(rest) = text.strip_prefix("bx").or_else(|| text.strip_prefix("bxns")) {
+        let rest = rest.trim();
+        let Some(condition) = rest.strip_suffix(" lr") else {
+            return false;
+        };
+        // `bx lr` returns on every path; `bx<cond> lr` returns on one.
+        return !condition.trim().is_empty();
+    }
+    // `pop {..., pc}` loads the program counter, which is a return.
+    let Some((name, list)) = text.split_once('{') else {
         return false;
     };
-    let rest = rest.trim();
-    let Some(condition) = rest.strip_suffix(" lr") else {
+    if !list.contains("pc") {
+        return false;
+    }
+    let Some(condition) = name.trim().strip_prefix("pop") else {
         return false;
     };
-    // `bx lr` returns on every path; `bx<cond> lr` returns on one.
     !condition.trim().is_empty()
 }
 

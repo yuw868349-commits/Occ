@@ -118,6 +118,18 @@ pub enum BinOp {
     /// The width of the source is the operation's width; the result is
     /// eight bytes.
     F2I64,
+    /// Convert a float to a 32-bit integer read as unsigned.
+    ///
+    /// The same truncation as [`BinOp::F2I32`], but the float is read as a
+    /// number rather than as a signed one: a value of two billion is a
+    /// number, not a negative one. The two are different operations and
+    /// the machine has both.
+    F2U32,
+    /// Convert a float to a 64-bit integer read as unsigned.
+    ///
+    /// The same truncation as [`BinOp::F2I64`], with the float read as an
+    /// unsigned number.
+    F2U64,
     /// Convert a float to a single-precision float.
     ///
     /// The width of the source is the operation's width; the result is
@@ -153,6 +165,21 @@ pub enum BinOp {
     /// Masking a machine word would clear a bit that is not the sign, so
     /// this is a call.
     FAbs,
+    /// The smallest whole number not below a floating-point value.
+    ///
+    /// Rounding towards positive infinity is not an operation the
+    /// arithmetic has, and the machine's own instruction is a call rather
+    /// than an operator for the same reason.
+    FCeil,
+    /// The largest whole number not above a floating-point value.
+    ///
+    /// Rounding towards negative infinity.
+    FFloor,
+    /// The whole number nearest a floating-point value.
+    ///
+    /// A tie goes to the even one, which is what the machine's rounding
+    /// instruction does.
+    FRound,
 }
 
 impl BinOp {
@@ -188,12 +215,17 @@ impl BinOp {
             BinOp::I2F64 => "f64",
             BinOp::F2I32 => "i32",
             BinOp::F2I64 => "i64",
+            BinOp::F2U32 => "u32",
+            BinOp::F2U64 => "u64",
             BinOp::F2F32 => "f32",
             BinOp::F2F64 => "f64",
             BinOp::FSqrt => "sqrt",
             BinOp::I2F80 => "f80",
             BinOp::FNeg => "-",
             BinOp::FAbs => "abs",
+            BinOp::FCeil => "ceil",
+            BinOp::FFloor => "floor",
+            BinOp::FRound => "round",
         }
     }
 
@@ -218,12 +250,17 @@ impl BinOp {
                 | BinOp::I2F64
                 | BinOp::F2I32
                 | BinOp::F2I64
+                | BinOp::F2U32
+                | BinOp::F2U64
                 | BinOp::F2F32
                 | BinOp::F2F64
                 | BinOp::FSqrt
                 | BinOp::I2F80
                 | BinOp::FNeg
                 | BinOp::FAbs
+                | BinOp::FCeil
+                | BinOp::FFloor
+                | BinOp::FRound
         )
     }
 
@@ -239,11 +276,16 @@ impl BinOp {
             | BinOp::I2F80
             | BinOp::F2I32
             | BinOp::F2I64
+            | BinOp::F2U32
+            | BinOp::F2U64
             | BinOp::F2F32
             | BinOp::F2F64
             | BinOp::FSqrt
             | BinOp::FNeg
-            | BinOp::FAbs => 1,
+            | BinOp::FAbs
+            | BinOp::FCeil
+            | BinOp::FFloor
+            | BinOp::FRound => 1,
             _ => 2,
         }
     }
@@ -282,12 +324,17 @@ impl BinOp {
             BinOp::FMax => format!("{t}_max"),
             BinOp::FUnordered => format!("{t}_unordered"),
             BinOp::FSqrt => format!("{t}_sqrt"),
+            BinOp::FCeil => format!("{t}_ceil"),
+            BinOp::FFloor => format!("{t}_floor"),
+            BinOp::FRound => format!("{t}_round"),
             // The conversions name their target, not their source.
             BinOp::I2F32 => "f32_from_int".to_string(),
             BinOp::I2F64 => "f64_from_int".to_string(),
             BinOp::I2F80 => "f80_from_int".to_string(),
             BinOp::F2I32 => "i32_trunc".to_string(),
             BinOp::F2I64 => "i64_trunc".to_string(),
+            BinOp::F2U32 => "u32_trunc".to_string(),
+            BinOp::F2U64 => "u64_trunc".to_string(),
             BinOp::F2F32 => "f32_cast".to_string(),
             BinOp::F2F64 => "f64_cast".to_string(),
             BinOp::FNeg => format!("{t}_neg"),
@@ -318,12 +365,17 @@ impl BinOp {
             | BinOp::I2F64
             | BinOp::F2I32
             | BinOp::F2I64
+            | BinOp::F2U32
+            | BinOp::F2U64
             | BinOp::F2F32
             | BinOp::F2F64
             | BinOp::FSqrt
             | BinOp::I2F80
             | BinOp::FNeg
-            | BinOp::FAbs => 9,
+            | BinOp::FAbs
+            | BinOp::FCeil
+            | BinOp::FFloor
+            | BinOp::FRound => 9,
             BinOp::Mul | BinOp::Div | BinOp::UDiv | BinOp::Mod | BinOp::UMod => 5,
             BinOp::Add | BinOp::Sub => 4,
             BinOp::Shl | BinOp::Shr | BinOp::Sar => 3,
@@ -1096,6 +1148,17 @@ pub enum Intrinsic {
     Tzcnt,
     /// Number of leading zero bits.
     Lzcnt,
+    /// Number of set bits.
+    ///
+    /// A count of the bits that are one, which the arithmetic the rest of
+    /// the IR has cannot say: it is a question about a population count
+    /// and not about a relation between two values.
+    Popcnt,
+    /// The magnitude of one value with the sign of another.
+    ///
+    /// The two operands are a magnitude and a sign: the result takes the
+    /// sign bit of the second and every other bit of the first.
+    CopySign,
     /// The sign bits of the lanes, gathered into an integer.
     MovMask,
     /// Divide a two-word dividend.
@@ -1128,6 +1191,138 @@ pub enum Intrinsic {
     IMulLo,
     /// The high half of the product of two signed numbers.
     IMulHi,
+    /// A parallel addition over the lanes of the operands.
+    ///
+    /// The word is cut into lanes of a fixed width and each lane is added
+    /// on its own, so the carries of one lane never reach the next. The
+    /// width of the lane is given by `bits`, and the width of the word by
+    /// the number of operands: two operands are a word wide.
+    ParallelAdd,
+    /// A parallel subtraction over the lanes of the operands.
+    ParallelSub,
+    /// A parallel addition that saturates each lane.
+    ///
+    /// A lane that would carry out of its own width stops at the largest
+    /// value the lane can hold instead of wrapping around.
+    ParallelAddSat,
+    /// A parallel subtraction that saturates each lane.
+    ParallelSubSat,
+    /// A parallel addition that halves each lane's result.
+    ///
+    /// The halved sum is taken after the addition, so a lane whose sum
+    /// overflowed gives the largest value the lane can hold, divided by
+    /// two.
+    ParallelAddHalf,
+    /// A parallel subtraction that halves each lane's result.
+    ParallelSubHalf,
+    /// A parallel addition over the lanes, reading them as unsigned.
+    ParallelAddUns,
+    /// A parallel subtraction over the lanes, reading them as unsigned.
+    ParallelSubUns,
+    /// A parallel addition over the lanes that saturates and reads them as
+    /// unsigned.
+    ParallelAddSatUns,
+    /// A parallel subtraction over the lanes that saturates and reads them
+    /// as unsigned.
+    ParallelSubSatUns,
+    /// A parallel addition over the lanes that halves the result and reads
+    /// them as unsigned.
+    ParallelAddHalfUns,
+    /// A parallel subtraction over the lanes that halves the result and
+    /// reads them as unsigned.
+    ParallelSubHalfUns,
+    /// The bytes of a value in reverse order.
+    ///
+    /// The full byte swap of the word.
+    RevBytes,
+    /// The halves of a value in reverse order.
+    ///
+    /// The sixteen-bit halves are swapped and the bytes inside each half
+    /// are not.
+    RevHalves,
+    /// The halves of a value in reverse order, sign extended.
+    ///
+    /// The sixteen-bit halves are swapped and the lower one is then read as
+    /// a signed number.
+    RevHalvesSigned,
+    /// The bits of a value in reverse order.
+    RevBits,
+    /// A choice between two values, taken bit by bit.
+    ///
+    /// The first operand is the mask: a set bit in it takes the bit of the
+    /// second operand, a clear bit takes the bit of the third.
+    Select,
+    /// A checksum that folds a value into a running one.
+    ///
+    /// The bits are folded in one at a time, from the bottom of the value
+    /// up, and every bit that comes out of the top goes back in through a
+    /// polynomial.  The polynomial is the one that the ordinary checksum of
+    /// a zip file uses, with its bits the other way round.
+    Crc32,
+    /// A checksum that folds a value into a running one, with the other
+    /// polynomial.
+    ///
+    /// This is the polynomial that the network protocols use.
+    Crc32c,
+    /// A saturated addition of two values.
+    ///
+    /// The sum that would not fit stops at the largest value the width can
+    /// hold.
+    SatAdd,
+    /// A saturated subtraction of two values.
+    SatSub,
+    /// A parallel addition of two extended values.
+    ///
+    /// Each half of the second operand is extended and added to the
+    /// matching half of the first, and the carry of one half never
+    /// reaches the other.
+    ExtendAdd,
+    /// A parallel addition of two extended values, read as signed numbers.
+    ExtendAddSigned,
+    /// A parallel addition over the halves of the operands, exchanged.
+    ///
+    /// The high half of the result is the addition of the high half of
+    /// the first operand and the low half of the second, and the low half
+    /// of the result is the addition of the low half of the first operand
+    /// and the high half of the second.
+    ExchangeAdd,
+    /// A parallel subtraction over the halves of the operands, exchanged.
+    ///
+    /// The high half of the result is the subtraction of the high half of
+    /// the first operand and the low half of the second, and the low half
+    /// of the result is the subtraction of the low half of the first
+    /// operand and the high half of the second.
+    ExchangeSub,
+    /// A parallel addition over the halves of the operands, exchanged, that
+    /// halves each half of the result.
+    ExchangeAddHalf,
+    /// A parallel subtraction over the halves of the operands, exchanged,
+    /// that halves each half of the result.
+    ExchangeSubHalf,
+    /// A parallel addition over the halves of the operands, exchanged, that
+    /// saturates each half of the result.
+    ExchangeAddSat,
+    /// A parallel subtraction over the halves of the operands, exchanged,
+    /// that saturates each half of the result.
+    ExchangeSubSat,
+    /// A parallel addition over the halves of the operands, exchanged, that
+    /// reads the halves as unsigned numbers.
+    ExchangeAddUns,
+    /// A parallel subtraction over the halves of the operands, exchanged,
+    /// that reads the halves as unsigned numbers.
+    ExchangeSubUns,
+    /// A parallel addition over the halves of the operands, exchanged, that
+    /// saturates and reads the halves as unsigned numbers.
+    ExchangeAddSatUns,
+    /// A parallel subtraction over the halves of the operands, exchanged,
+    /// that saturates and reads the halves as unsigned numbers.
+    ExchangeSubSatUns,
+    /// A parallel addition over the halves of the operands, exchanged, that
+    /// halves the result and reads the halves as unsigned numbers.
+    ExchangeAddHalfUns,
+    /// A parallel subtraction over the halves of the operands, exchanged,
+    /// that halves the result and reads the halves as unsigned numbers.
+    ExchangeSubHalfUns,
 }
 
 impl Intrinsic {
@@ -1139,6 +1334,25 @@ impl Intrinsic {
     pub fn name_for(self, bits: u8) -> String {
         match self {
             Intrinsic::Bswap => format!("bswap{}", bits * 8),
+            // The sign-copying operation works on a float, and two floats of
+            // different widths are two different operations.
+            Intrinsic::CopySign => format!("copysign{}", bits * 8),
+            // The parallel operations name the width of the lane they work
+            // on, because the lanes are what the operation is about: the
+            // same word read as four bytes and as two halves is two
+            // different operations.
+            Intrinsic::ParallelAdd => format!("padd{}", bits * 8),
+            Intrinsic::ParallelSub => format!("psub{}", bits * 8),
+            Intrinsic::ParallelAddSat => format!("qadd{}", bits * 8),
+            Intrinsic::ParallelSubSat => format!("qsub{}", bits * 8),
+            Intrinsic::ParallelAddHalf => format!("shadd{}", bits * 8),
+            Intrinsic::ParallelSubHalf => format!("shsub{}", bits * 8),
+            Intrinsic::ParallelAddUns => format!("uadd{}", bits * 8),
+            Intrinsic::ParallelSubUns => format!("usub{}", bits * 8),
+            Intrinsic::ParallelAddSatUns => format!("uqadd{}", bits * 8),
+            Intrinsic::ParallelSubSatUns => format!("uqsub{}", bits * 8),
+            Intrinsic::ParallelAddHalfUns => format!("uhadd{}", bits * 8),
+            Intrinsic::ParallelSubHalfUns => format!("uhsub{}", bits * 8),
             other => other.name().to_string(),
         }
     }
@@ -1155,6 +1369,8 @@ impl Intrinsic {
             Intrinsic::Bsr => "bsr",
             Intrinsic::Tzcnt => "tzcnt",
             Intrinsic::Lzcnt => "lzcnt",
+            Intrinsic::Popcnt => "popcnt",
+            Intrinsic::CopySign => "copysign",
             Intrinsic::MovMask => "movmask",
             Intrinsic::ParityEven => "parity_even",
             Intrinsic::Carry => "carry",
@@ -1173,6 +1389,41 @@ impl Intrinsic {
             Intrinsic::AdcCarry => "adc_carry",
             Intrinsic::SbbDiff => "sbb_diff",
             Intrinsic::SbbBorrow => "sbb_borrow",
+            Intrinsic::RevBytes => "rev_bytes",
+            Intrinsic::RevHalves => "rev_halves",
+            Intrinsic::RevHalvesSigned => "rev_halves_signed",
+            Intrinsic::RevBits => "rev_bits",
+            Intrinsic::Select => "select",
+            Intrinsic::Crc32 => "crc32",
+            Intrinsic::Crc32c => "crc32c",
+            Intrinsic::SatAdd => "sat_add",
+            Intrinsic::ExtendAdd => "extend_add",
+            Intrinsic::ExtendAddSigned => "extend_add_signed",
+            Intrinsic::SatSub => "sat_sub",
+            Intrinsic::ExchangeAdd => "exchange_add",
+            Intrinsic::ExchangeSub => "exchange_sub",
+            Intrinsic::ExchangeAddHalf => "exchange_add_half",
+            Intrinsic::ExchangeSubHalf => "exchange_sub_half",
+            Intrinsic::ExchangeAddSat => "exchange_add_sat",
+            Intrinsic::ExchangeSubSat => "exchange_sub_sat",
+            Intrinsic::ExchangeAddUns => "exchange_add_uns",
+            Intrinsic::ExchangeSubUns => "exchange_sub_uns",
+            Intrinsic::ExchangeAddSatUns => "exchange_add_sat_uns",
+            Intrinsic::ExchangeSubSatUns => "exchange_sub_sat_uns",
+            Intrinsic::ExchangeAddHalfUns => "exchange_add_half_uns",
+            Intrinsic::ExchangeSubHalfUns => "exchange_sub_half_uns",
+            Intrinsic::ParallelAdd => "parallel_add",
+            Intrinsic::ParallelSub => "parallel_sub",
+            Intrinsic::ParallelAddSat => "parallel_add_sat",
+            Intrinsic::ParallelSubSat => "parallel_sub_sat",
+            Intrinsic::ParallelAddHalf => "parallel_add_half",
+            Intrinsic::ParallelSubHalf => "parallel_sub_half",
+            Intrinsic::ParallelAddUns => "parallel_add_uns",
+            Intrinsic::ParallelSubUns => "parallel_sub_uns",
+            Intrinsic::ParallelAddSatUns => "parallel_add_sat_uns",
+            Intrinsic::ParallelSubSatUns => "parallel_sub_sat_uns",
+            Intrinsic::ParallelAddHalfUns => "parallel_add_half_uns",
+            Intrinsic::ParallelSubHalfUns => "parallel_sub_half_uns",
         }
     }
 }
@@ -1886,6 +2137,346 @@ impl fmt::Display for Expr {
     }
 }
 
+/// Evaluate the intrinsics that need more than one operand.
+///
+/// These are the operations that work on parts of a word — the parallel
+/// additions, the saturating ones, and the byte reversals — and they are
+/// written once so that the folder and the interpreter cannot drift apart
+/// in what they mean.
+///
+/// `bits` is the width of the operation in bytes.  For the parallel
+/// operations it is also the width of the lane they work on, because that
+/// is what the lane is.
+pub fn eval_special(op: Intrinsic, values: &[u64], bits: u8) -> Option<u64> {
+    let width = usize::from(bits) * 8;
+    let limit = if width >= 64 { 64 } else { width };
+    let value = values.first().copied().unwrap_or(0) & mask(bits);
+    let result = match op {
+        Intrinsic::RevBytes => {
+            // The bytes come back the other way round. A word of four
+            // bytes has them in the order three, two, one, zero.
+            let bytes = value.to_le_bytes();
+            let mut out = [0u8; 8];
+            for (i, b) in bytes.iter().enumerate().take(usize::from(bits)) {
+                out[usize::from(bits) - 1 - i] = *b;
+            }
+            u64::from_le_bytes(out)
+        }
+        Intrinsic::RevHalves => {
+            // The halves are swapped and the bytes inside each half stay
+            // where they are.
+            let lane = u64::from(bits) * 4;
+            let mask = if lane >= 64 { u64::MAX } else { (1u64 << lane) - 1 };
+            let low = value & mask;
+            let high = (value >> lane) & mask;
+            (low << lane) | high
+        }
+        Intrinsic::RevHalvesSigned => {
+            // The halves are swapped and the one that comes down is read as
+            // a signed number.
+            let lane = u64::from(bits) * 4;
+            let mask = if lane >= 64 { u64::MAX } else { (1u64 << lane) - 1 };
+            let low = value & mask;
+            let high = (value >> lane) & mask;
+            let swapped = (low << lane) | high;
+            // The sign is the top bit of the half that came down, and the
+            // result keeps it in every bit above the half.
+            let sign = if lane >= 64 || (swapped >> (lane - 1)) & 1 == 1 {
+                !mask
+            } else {
+                0
+            };
+            (swapped & mask) | sign
+        }
+        Intrinsic::RevBits => {
+            // The bits come back the other way round: the bottom bit
+            // becomes the top one.
+            let mut out = 0u64;
+            for i in 0..limit {
+                if (value >> i) & 1 == 1 {
+                    out |= 1u64 << (limit - 1 - i);
+                }
+            }
+            out
+        }
+        Intrinsic::Select => {
+            // The mask says which of the two values each bit comes from.
+            let (Some(mask_value), Some(then_value), Some(else_value)) = (
+                values.first().copied(),
+                values.get(1).copied(),
+                values.get(2).copied(),
+            ) else {
+                return None;
+            };
+            (mask_value & then_value) | (!mask_value & else_value) & mask(bits)
+        }
+        Intrinsic::Crc32 | Intrinsic::Crc32c => {
+            // The checksum folds the second operand into the first, one
+            // bit at a time.  Every bit that comes out of the bottom
+            // goes back in through the polynomial, and the polynomial
+            // is the one the ordinary checksum of a zip file uses with
+            // its bits the other way round.
+            let acc = values.first().copied().unwrap_or(0);
+            // The width of the data is the width of the operand that is
+            // folded in: a byte, a half word or a word.  It is given as
+            // the third operand, because the width of the result is the
+            // width of the machine's word and not the width of the data.
+            let width = values.get(2).copied().unwrap_or(32).clamp(1, 32) as u32;
+            let data_mask = if width >= 32 {
+                0xffff_ffffu64
+            } else {
+                (1u64 << width) - 1
+            };
+            let data = values.get(1).copied().unwrap_or(0) & data_mask;
+            let poly: u64 = if op == Intrinsic::Crc32c {
+                0x82f6_3b78
+            } else {
+                0xedb8_8320
+            };
+            let mut value = (acc ^ data) & 0xffff_ffff;
+            for _ in 0..width {
+                if value & 1 == 1 {
+                    value = (value >> 1) ^ poly;
+                } else {
+                    value >>= 1;
+                }
+            }
+            value & 0xffff_ffff
+        }
+        Intrinsic::SatAdd => {
+            let a = signed_int(values.first().copied().unwrap_or(0), bits);
+            let b = signed_int(values.get(1).copied().unwrap_or(0), bits);
+            let top = (1i64 << (limit as i32 - 1)) - 1;
+            let bottom = -(1i64 << (limit as i32 - 1));
+            (a.saturating_add(b).clamp(bottom, top) as u64) & mask(bits)
+        }
+        Intrinsic::SatSub => {
+            let a = signed_int(values.first().copied().unwrap_or(0), bits);
+            let b = signed_int(values.get(1).copied().unwrap_or(0), bits);
+            let top = (1i64 << (limit as i32 - 1)) - 1;
+            let bottom = -(1i64 << (limit as i32 - 1));
+            (a.saturating_sub(b).clamp(bottom, top) as u64) & mask(bits)
+        }
+        Intrinsic::ExchangeAdd
+        | Intrinsic::ExchangeSub
+        | Intrinsic::ExchangeAddSat
+        | Intrinsic::ExchangeSubSat
+        | Intrinsic::ExchangeAddHalf
+        | Intrinsic::ExchangeSubHalf
+        | Intrinsic::ExchangeAddUns
+        | Intrinsic::ExchangeSubUns
+        | Intrinsic::ExchangeAddSatUns
+        | Intrinsic::ExchangeSubSatUns
+        | Intrinsic::ExchangeAddHalfUns
+        | Intrinsic::ExchangeSubHalfUns => {
+            // The exchanged operations take the halves of the two
+            // operands in the opposite order: the high half of the result
+            // is the operation on the high half of the first operand and
+            // the low half of the second, and the low half of the result
+            // is the operation the other way round.
+            let lane_bits = usize::from(bits) * 8;
+            if lane_bits == 0 || lane_bits > 16 {
+                return None;
+            }
+            let a = values.first().copied().unwrap_or(0);
+            let b = values.get(1).copied().unwrap_or(0);
+            let lane_mask = (1u64 << lane_bits) - 1;
+            // The high half of the first operand and the low half of the
+            // second make the high half of the result, and the low half of
+            // the first and the high half of the second make the low half
+            // of it.
+            let high_x = (a >> lane_bits) & lane_mask;
+            let low_x = a & lane_mask;
+            let second_low = b & lane_mask;
+            let second_high = (b >> lane_bits) & lane_mask;
+            let is_add = matches!(
+                op,
+                Intrinsic::ExchangeAdd
+                    | Intrinsic::ExchangeAddSat
+                    | Intrinsic::ExchangeAddHalf
+                    | Intrinsic::ExchangeAddUns
+                    | Intrinsic::ExchangeAddSatUns
+                    | Intrinsic::ExchangeAddHalfUns
+            );
+            let saturated = matches!(
+                op,
+                Intrinsic::ExchangeAddSat
+                    | Intrinsic::ExchangeSubSat
+                    | Intrinsic::ExchangeAddSatUns
+                    | Intrinsic::ExchangeSubSatUns
+            );
+            let halved = matches!(
+                op,
+                Intrinsic::ExchangeAddHalf
+                    | Intrinsic::ExchangeSubHalf
+                    | Intrinsic::ExchangeAddHalfUns
+                    | Intrinsic::ExchangeSubHalfUns
+            );
+            let unsigned = matches!(
+                op,
+                Intrinsic::ExchangeAddUns
+                    | Intrinsic::ExchangeSubUns
+                    | Intrinsic::ExchangeAddSatUns
+                    | Intrinsic::ExchangeSubSatUns
+                    | Intrinsic::ExchangeAddHalfUns
+                    | Intrinsic::ExchangeSubHalfUns
+            );
+            // The high half of the result takes the high half of the
+            // first operand and the low half of the second, and the low
+            // half of the result takes them the other way round.
+            let high = parallel_lane(
+                high_x,
+                second_low,
+                lane_bits,
+                is_add,
+                unsigned,
+                saturated,
+                halved,
+            );
+            let low = parallel_lane(
+                low_x,
+                second_high,
+                lane_bits,
+                !is_add,
+                unsigned,
+                saturated,
+                halved,
+            );
+            ((high & lane_mask) << lane_bits) | (low & lane_mask)
+        }
+        Intrinsic::ExtendAdd | Intrinsic::ExtendAddSigned => {
+            // The word is cut into halves and each half of the second
+            // operand is extended and added to the matching half of the
+            // first.  The carry of one half never reaches the other, so
+            // this is not one addition but two.
+            //
+            // The extension takes the low byte of the half, and the
+            // half is sixteen bits wide.
+            let lane_bits = 16usize;
+            let a = values.first().copied().unwrap_or(0);
+            let b = values.get(1).copied().unwrap_or(0);
+            let lane_mask = (1u64 << lane_bits) - 1;
+            let signed = op == Intrinsic::ExtendAddSigned;
+            let mut out = 0u64;
+            for lane in 0..2 {
+                let shift = lane * lane_bits;
+                let x = (a >> shift) & lane_mask;
+                let y = (b >> shift) & lane_mask;
+                // Only the low byte of the half is extended.
+                let extended = if signed {
+                    i128::from(sign_extend_bits(y & 0xff, 8))
+                } else {
+                    i128::from(y & 0xff)
+                };
+                let value = (i128::from(x) + extended) & lane_mask as i128;
+                out |= (value as u64) << shift;
+            }
+            out & 0xffff_ffff
+        }
+        Intrinsic::ParallelAdd
+        | Intrinsic::ParallelSub
+        | Intrinsic::ParallelAddSat
+        | Intrinsic::ParallelSubSat
+        | Intrinsic::ParallelAddHalf
+        | Intrinsic::ParallelSubHalf
+        | Intrinsic::ParallelAddUns
+        | Intrinsic::ParallelSubUns
+        | Intrinsic::ParallelAddSatUns
+        | Intrinsic::ParallelSubSatUns
+        | Intrinsic::ParallelAddHalfUns
+        | Intrinsic::ParallelSubHalfUns => {
+            // The word is cut into lanes and each lane is worked on by
+            // itself, so that the carry of one lane never reaches the
+            // next.
+            //
+            // The width of the lane is the one the operation was given;
+            // the width of the word is the one of the operands, which is
+            // the width of the machine's word.
+            let lane_bits = usize::from(bits) * 8;
+            if lane_bits == 0 || lane_bits > 32 {
+                return None;
+            }
+            let a = values.first().copied().unwrap_or(0);
+            let b = values.get(1).copied().unwrap_or(0);
+            let word_bits = 32;
+            let lanes = word_bits / lane_bits;
+            let lane_mask = (1u64 << lane_bits) - 1;
+            let is_add = matches!(
+                op,
+                Intrinsic::ParallelAdd
+                    | Intrinsic::ParallelAddSat
+                    | Intrinsic::ParallelAddHalf
+                    | Intrinsic::ParallelAddUns
+                    | Intrinsic::ParallelAddSatUns
+                    | Intrinsic::ParallelAddHalfUns
+            );
+            let saturated = matches!(
+                op,
+                Intrinsic::ParallelAddSat
+                    | Intrinsic::ParallelSubSat
+                    | Intrinsic::ParallelAddSatUns
+                    | Intrinsic::ParallelSubSatUns
+            );
+            let halved = matches!(
+                op,
+                Intrinsic::ParallelAddHalf
+                    | Intrinsic::ParallelSubHalf
+                    | Intrinsic::ParallelAddHalfUns
+                    | Intrinsic::ParallelSubHalfUns
+            );
+            let unsigned = matches!(
+                op,
+                Intrinsic::ParallelAddUns
+                    | Intrinsic::ParallelSubUns
+                    | Intrinsic::ParallelAddSatUns
+                    | Intrinsic::ParallelSubSatUns
+                    | Intrinsic::ParallelAddHalfUns
+                    | Intrinsic::ParallelSubHalfUns
+            );
+            let mut out = 0u64;
+            for lane in 0..lanes {
+                let shift = lane * lane_bits;
+                let x = (a >> shift) & lane_mask;
+                let y = (b >> shift) & lane_mask;
+                let v = parallel_lane(x, y, lane_bits, is_add, unsigned, saturated, halved);
+                out |= v << shift;
+            }
+            out & 0xffff_ffff
+        }
+        _ => return None,
+    };
+    // The parallel operations work on the lanes of a word, so their
+    // result is the whole word and not the width of a lane.
+    let result = match op {
+        Intrinsic::ParallelAdd
+        | Intrinsic::ParallelSub
+        | Intrinsic::ParallelAddSat
+        | Intrinsic::ParallelSubSat
+        | Intrinsic::ParallelAddHalf
+        | Intrinsic::ParallelSubHalf
+        | Intrinsic::ParallelAddUns
+        | Intrinsic::ParallelSubUns
+        | Intrinsic::ParallelAddSatUns
+        | Intrinsic::ParallelSubSatUns
+        | Intrinsic::ParallelAddHalfUns
+        | Intrinsic::ParallelSubHalfUns
+        | Intrinsic::ExchangeAdd
+        | Intrinsic::ExchangeSub
+        | Intrinsic::ExchangeAddSat
+        | Intrinsic::ExchangeSubSat
+        | Intrinsic::ExchangeAddHalf
+        | Intrinsic::ExchangeSubHalf
+        | Intrinsic::ExchangeAddUns
+        | Intrinsic::ExchangeSubUns
+        | Intrinsic::ExchangeAddSatUns
+        | Intrinsic::ExchangeSubSatUns
+        | Intrinsic::ExchangeAddHalfUns
+        | Intrinsic::ExchangeSubHalfUns => result & 0xffff_ffff,
+        _ => result & mask(bits),
+    };
+    Some(result)
+}
+
 /// Fold an intrinsic whose operands are all known.
 ///
 /// The semantics are the machine's, not the arithmetic's: a rotate masks
@@ -1998,6 +2589,15 @@ fn fold_intrinsic(op: Intrinsic, args: &[Expr], bits: u8) -> Option<u64> {
         }
         Intrinsic::Tzcnt => value.trailing_zeros() as u64,
         Intrinsic::Lzcnt => (limit as u32 - value.leading_zeros()) as u64,
+        Intrinsic::Popcnt => value.count_ones() as u64,
+        Intrinsic::CopySign => {
+            // The magnitude of the first operand with the sign of the
+            // second: every bit but the top one comes from the first, and
+            // the top one from the second.
+            let top = 1u64 << (limit.saturating_sub(1));
+            let sign = values.get(1).copied().unwrap_or(0) & top;
+            (value & !top) | sign
+        }
         Intrinsic::MovMask => {
             // Each lane contributes its sign bit. The width is the lane's,
             // not the machine's.
@@ -2086,7 +2686,103 @@ fn fold_intrinsic(op: Intrinsic, args: &[Expr], bits: u8) -> Option<u64> {
                 (dividend / u128::from(divisor)) as u64
             }
         }
+        Intrinsic::RevBytes
+        | Intrinsic::RevHalves
+        | Intrinsic::RevHalvesSigned
+        | Intrinsic::RevBits
+        | Intrinsic::Select
+        | Intrinsic::Crc32
+        | Intrinsic::Crc32c
+        | Intrinsic::SatAdd
+        | Intrinsic::SatSub
+        | Intrinsic::ExtendAdd
+        | Intrinsic::ExtendAddSigned
+        | Intrinsic::ParallelAdd
+        | Intrinsic::ParallelSub
+        | Intrinsic::ParallelAddSat
+        | Intrinsic::ParallelSubSat
+        | Intrinsic::ParallelAddHalf
+        | Intrinsic::ParallelSubHalf
+        | Intrinsic::ParallelAddUns
+        | Intrinsic::ParallelSubUns
+        | Intrinsic::ParallelAddSatUns
+        | Intrinsic::ParallelSubSatUns
+        | Intrinsic::ParallelAddHalfUns
+        | Intrinsic::ParallelSubHalfUns
+        | Intrinsic::ExchangeAdd
+        | Intrinsic::ExchangeSub
+        | Intrinsic::ExchangeAddSat
+        | Intrinsic::ExchangeSubSat
+        | Intrinsic::ExchangeAddHalf
+        | Intrinsic::ExchangeSubHalf
+        | Intrinsic::ExchangeAddUns
+        | Intrinsic::ExchangeSubUns
+        | Intrinsic::ExchangeAddSatUns
+        | Intrinsic::ExchangeSubSatUns
+        | Intrinsic::ExchangeAddHalfUns
+        | Intrinsic::ExchangeSubHalfUns => eval_special(op, &values, bits)?,
     })
+}
+
+/// One lane of a parallel operation.
+///
+/// The lane is worked on by itself: the addition or the subtraction does
+/// not carry into the next lane.  Three things can happen to the result
+/// before it goes back into the lane, and the machine applies them in this
+/// order:
+///
+/// * the lanes are read as signed numbers or as unsigned ones;
+/// * the result is held at the ends of the lane's range, or it wraps
+///   around;
+/// * the result is halved, and the halving is an arithmetic one on a
+///   result that is one bit wider than the lane, so that the bit that was
+///   carried out of the lane is kept.
+fn parallel_lane(
+    x: u64,
+    y: u64,
+    lane_bits: usize,
+    add: bool,
+    unsigned: bool,
+    saturated: bool,
+    halved: bool,
+) -> u64 {
+    let mask = (1u64 << lane_bits) - 1;
+    // The lanes are read as signed numbers or as unsigned ones, and the
+    // operation is carried out at one bit more than the lane, because
+    // the halving is done on that wider value: the bit that was
+    // carried out of the lane has to survive it.
+    //
+    // The wider value is signed even when the lanes are read as
+    // unsigned ones.  The machine takes the difference of two
+    // unsigned lanes and then halves it, and a difference that went
+    // below zero is halved as a negative number, so `0 - 1` halved is
+    // `-1` and not `0x7f`.  The two are the same number written
+    // differently, but they are not the same number.
+    let (sx, sy, low, high) = if unsigned {
+        (i128::from(x), i128::from(y), 0, i128::from(mask))
+    } else {
+        (
+            i128::from(sign_extend_bits(x, lane_bits as u32)),
+            i128::from(sign_extend_bits(y, lane_bits as u32)),
+            -(1i128 << (lane_bits - 1)),
+            (1i128 << (lane_bits - 1)) - 1,
+        )
+    };
+    let total = if add { sx + sy } else { sx - sy };
+    let value = if saturated {
+        total.clamp(low, high)
+    } else {
+        total
+    };
+    if halved {
+        // The halving is done on the value of the operation before it
+        // is cut back to the width of the lane, and the shift is an
+        // arithmetic one, so that the bit which was carried out of the
+        // lane is kept and a result that went below the smallest lane
+        // value stays negative.
+        return ((value >> 1) as u64) & mask;
+    }
+    (value as u64) & mask
 }
 
 /// Fold one binary operation at a given width.
@@ -2205,6 +2901,11 @@ fn fold_float(op: BinOp, a: u64, b: u64, bits: u8) -> Option<u64> {
                 BinOp::I2F64 => (signed_int(a, bits) as f64).to_bits(),
                 BinOp::F2I32 => u64::from((x as i32) as u32),
                 BinOp::F2I64 => (x as i64) as u64,
+                BinOp::F2U32 => u64::from(x as u32),
+                BinOp::F2U64 => x as u64,
+                BinOp::FCeil => u64::from(x.ceil().to_bits()),
+                BinOp::FFloor => u64::from(x.floor().to_bits()),
+                BinOp::FRound => u64::from(x.round_ties_even().to_bits()),
                 BinOp::F2F32 => u64::from(x.to_bits()),
                 BinOp::F2F64 => (x as f64).to_bits(),
                 BinOp::FNeg => u64::from((-x).to_bits()),
@@ -2245,6 +2946,11 @@ fn fold_float(op: BinOp, a: u64, b: u64, bits: u8) -> Option<u64> {
                 BinOp::I2F64 => (signed_int(a, bits) as f64).to_bits(),
                 BinOp::F2I32 => u64::from((x as i32) as u32),
                 BinOp::F2I64 => (x as i64) as u64,
+                BinOp::F2U32 => u64::from(x as u32),
+                BinOp::F2U64 => x as u64,
+                BinOp::FCeil => x.ceil().to_bits(),
+                BinOp::FFloor => x.floor().to_bits(),
+                BinOp::FRound => x.round_ties_even().to_bits(),
                 BinOp::F2F32 => u64::from((x as f32).to_bits()),
                 BinOp::F2F64 => x.to_bits(),
                 BinOp::FNeg => (-x).to_bits(),
@@ -2335,6 +3041,21 @@ pub fn sign_extend(v: u64, bits: u8) -> i64 {
     let bits = u32::from(bits.clamp(1, 8)) * 8;
     if bits >= 64 {
         v as i64
+    } else {
+        let shift = 64 - bits;
+        ((v << shift) as i64) >> shift
+    }
+}
+
+/// Sign extend a value whose width is given in bits rather than in bytes.
+///
+/// The parallel operations work on lanes that are narrower than the word
+/// they live in, so the sign of a lane is not the sign of the word.
+fn sign_extend_bits(v: u64, bits: u32) -> i64 {
+    if bits >= 64 {
+        v as i64
+    } else if bits == 0 {
+        0
     } else {
         let shift = 64 - bits;
         ((v << shift) as i64) >> shift
@@ -2683,5 +3404,1187 @@ mod tests {
             bits: 4,
         };
         assert_eq!(e.to_string(), "f32_mul(x, y)");
+    }
+    /// The parallel operations, checked against what the machine does.
+    ///
+    /// The values here were read off a table that the instructions
+    /// themselves produced: every case was run on an emulator and the
+    /// result written down.  The table covers the lanes of a byte and of
+    /// a halfword, the saturated and the halved forms, and the ones that
+    /// exchange the halves of their operands.
+    #[test]
+    fn the_parallel_operations_do_what_the_machine_does() {
+        // (operation, lane width in bytes, a, b, expected)
+        let cases: &[(Intrinsic, u8, u64, u64, u64)] = &[
+            // The signed additions over the bytes.
+            (Intrinsic::ParallelAdd, 1, 0x8080_8080, 0x0101_0101, 0x8181_8181),
+            (Intrinsic::ParallelAdd, 1, 0x7f7f_7f7f, 0x0101_0101, 0x8080_8080),
+            (Intrinsic::ParallelAdd, 1, 0x0102_0304, 0x8080_8080, 0x8182_8384),
+            // The saturating ones hold at the ends of the lane's range:
+            // a lane of 0x80 is -128, and subtracting one from it stays
+            // at -128 rather than wrapping around to 127.
+            (Intrinsic::ParallelAddSat, 1, 0x8080_8080, 0x0101_0101, 0x8181_8181),
+            (Intrinsic::ParallelSubSat, 1, 0x8080_8080, 0x0101_0101, 0x8080_8080),
+            (Intrinsic::ParallelSubSat, 1, 0x7f7f_7f7f, 0x0101_0101, 0x7e7e_7e7e),
+            // The unsigned ones read the lane as a number and not as a
+            // pattern.
+            (Intrinsic::ParallelAddUns, 1, 0x8080_8080, 0x0101_0101, 0x8181_8181),
+            (Intrinsic::ParallelSubUns, 1, 0x8080_8080, 0x0101_0101, 0x7f7f_7f7f),
+            // The halved ones keep the bit that was carried out of the
+            // lane, so the sum is taken a bit wider than the lane and the
+            // shift is an arithmetic one.
+            (Intrinsic::ParallelAddHalf, 1, 0x8080_8080, 0x0101_0101, 0xc0c0_c0c0),
+            (Intrinsic::ParallelAddHalf, 1, 0x7f7f_7f7f, 0x0101_0101, 0x4040_4040),
+            (Intrinsic::ParallelSubHalf, 1, 0x8080_8080, 0x0101_0101, 0xbfbf_bfbf),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x8080_8080, 0x0101_0101, 0x4040_4040),
+            // The same over the halfwords.
+            (Intrinsic::ParallelAdd, 2, 0xfedc_ba98, 0x1234_5678, 0x1110_1110),
+            (Intrinsic::ParallelSub, 2, 0xfedc_ba98, 0x1234_5678, 0xeca8_6420),
+            (Intrinsic::ParallelAddSat, 2, 0xfedc_ba98, 0x1234_5678, 0x1110_1110),
+            (Intrinsic::ParallelSubSat, 2, 0xfedc_ba98, 0x1234_5678, 0xeca8_8000),
+        ];
+        for (op, lane, a, b, want) in cases {
+            let got = eval_special(*op, &[*a, *b], *lane);
+            assert_eq!(
+                got,
+                Some(*want),
+                "{:?} over {} bits of {:#x} and {:#x}",
+                op,
+                lane * 8,
+                a,
+                b
+            );
+        }
+    }
+
+    /// The exchanged operations, checked against what the machine does.
+    ///
+    /// The high half of the result is the operation on the high half of
+    /// the first operand and the low half of the second, and the low half
+    /// of the result is the operation the other way round.
+    #[test]
+    fn the_exchanged_operations_do_what_the_machine_does() {
+        let cases: &[(Intrinsic, u8, u64, u64, u64)] = &[
+            (Intrinsic::ExchangeAdd, 2, 0xfedc_ba98, 0x1234_5678, 0x5554_a864),
+            (Intrinsic::ExchangeSub, 2, 0xfedc_ba98, 0x1234_5678, 0xa864_cccc),
+            (Intrinsic::ExchangeAddSat, 2, 0xfedc_ba98, 0x1234_5678, 0x5554_a864),
+            (Intrinsic::ExchangeSubSat, 2, 0xfedc_ba98, 0x1234_5678, 0xa864_cccc),
+            (Intrinsic::ExchangeAddHalf, 2, 0xfedc_ba98, 0x1234_5678, 0x2aaa_d432),
+            (Intrinsic::ExchangeAddUns, 2, 0xfedc_ba98, 0x1234_5678, 0x5554_a864),
+            (Intrinsic::ExchangeSubUns, 2, 0xfedc_ba98, 0x1234_5678, 0xa864_cccc),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0xfedc_ba98, 0x1234_5678, 0xaaaa_5432),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0xfedc_ba98, 0x1234_5678, 0x5432_6666),
+        ];
+        for (op, lane, a, b, want) in cases {
+            let got = eval_special(*op, &[*a, *b], *lane);
+            assert_eq!(
+                got,
+                Some(*want),
+                "{:?} over {} bits of {:#x} and {:#x}",
+                op,
+                lane * 8,
+                a,
+                b
+            );
+        }
+    }
+    /// Every parallel and exchanged operation, over every case that was
+    /// run on the machine.
+    ///
+    /// The cases come from running the instructions under an emulator
+    /// of the hardware and reading back what it produced, so they say
+    /// what the machine does rather than what the manual says it does.
+    /// There are nine hundred of them, which is enough for a mistake
+    /// in one corner of the arithmetic to show up.
+    #[test]
+    fn every_parallel_and_exchanged_operation_matches_the_machine() {
+        let cases: &[(Intrinsic, u8, u64, u64, u64)] = &[
+            (Intrinsic::ParallelAdd, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddSat, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAdd, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddSat, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSub, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubSat, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSub, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubSat, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSub, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x00000001, 0x00000001),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x00000001, 0x00000001),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x00000001, 0x00000001),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x00000001, 0x00000002),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x00000001, 0x00000001),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x00000001, 0x00010001),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x00000001, 0xffff0001),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x00000001, 0x00010001),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x00000001, 0xffff0001),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x00000001, 0xffff0000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x00000001, 0x00010001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x00000001, 0xffff0001),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x00000001, 0x00010001),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x00000001, 0x00000001),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x00000001, 0xffff0000),
+            (Intrinsic::ParallelAdd, 1, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddSat, 1, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000002, 0x00000003, 0x00000002),
+            (Intrinsic::ParallelAddUns, 1, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000002, 0x00000003, 0x00000002),
+            (Intrinsic::ParallelAdd, 2, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddSat, 2, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000002, 0x00000003, 0x00000002),
+            (Intrinsic::ParallelAddUns, 2, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000002, 0x00000003, 0x00000005),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000002, 0x00000003, 0x00000002),
+            (Intrinsic::ParallelSub, 1, 0x00000002, 0x00000003, 0x000000ff),
+            (Intrinsic::ParallelSubSat, 1, 0x00000002, 0x00000003, 0x000000ff),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000002, 0x00000003, 0x000000ff),
+            (Intrinsic::ParallelSubUns, 1, 0x00000002, 0x00000003, 0x000000ff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000002, 0x00000003, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000002, 0x00000003, 0x000000ff),
+            (Intrinsic::ParallelSub, 2, 0x00000002, 0x00000003, 0x0000ffff),
+            (Intrinsic::ParallelSubSat, 2, 0x00000002, 0x00000003, 0x0000ffff),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000002, 0x00000003, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 2, 0x00000002, 0x00000003, 0x0000ffff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000002, 0x00000003, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000002, 0x00000003, 0x0000ffff),
+            (Intrinsic::ExchangeAdd, 2, 0x00000002, 0x00000003, 0x00030002),
+            (Intrinsic::ExchangeSub, 2, 0x00000002, 0x00000003, 0xfffd0002),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000002, 0x00000003, 0x00030002),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000002, 0x00000003, 0xfffd0002),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000002, 0x00000003, 0x00010001),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000002, 0x00000003, 0xfffe0001),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000002, 0x00000003, 0x00030002),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000002, 0x00000003, 0xfffd0002),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000002, 0x00000003, 0x00030002),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000002, 0x00000003, 0x00000002),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000002, 0x00000003, 0x00010001),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000002, 0x00000003, 0xfffe0001),
+            (Intrinsic::ParallelAdd, 1, 0xffffffff, 0x00000001, 0xffffff00),
+            (Intrinsic::ParallelAddSat, 1, 0xffffffff, 0x00000001, 0xffffff00),
+            (Intrinsic::ParallelAddHalf, 1, 0xffffffff, 0x00000001, 0xffffff00),
+            (Intrinsic::ParallelAddUns, 1, 0xffffffff, 0x00000001, 0xffffff00),
+            (Intrinsic::ParallelAddSatUns, 1, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0xffffffff, 0x00000001, 0x7f7f7f80),
+            (Intrinsic::ParallelAdd, 2, 0xffffffff, 0x00000001, 0xffff0000),
+            (Intrinsic::ParallelAddSat, 2, 0xffffffff, 0x00000001, 0xffff0000),
+            (Intrinsic::ParallelAddHalf, 2, 0xffffffff, 0x00000001, 0xffff0000),
+            (Intrinsic::ParallelAddUns, 2, 0xffffffff, 0x00000001, 0xffff0000),
+            (Intrinsic::ParallelAddSatUns, 2, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0xffffffff, 0x00000001, 0x7fff8000),
+            (Intrinsic::ParallelSub, 1, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubSat, 1, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubHalf, 1, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ParallelSubUns, 1, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubSatUns, 1, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubHalfUns, 1, 0xffffffff, 0x00000001, 0x7f7f7f7f),
+            (Intrinsic::ParallelSub, 2, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubSat, 2, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubHalf, 2, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ParallelSubUns, 2, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubSatUns, 2, 0xffffffff, 0x00000001, 0xfffffffe),
+            (Intrinsic::ParallelSubHalfUns, 2, 0xffffffff, 0x00000001, 0x7fff7fff),
+            (Intrinsic::ExchangeAdd, 2, 0xffffffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeSub, 2, 0xffffffff, 0x00000001, 0xfffeffff),
+            (Intrinsic::ExchangeAddSat, 2, 0xffffffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeSubSat, 2, 0xffffffff, 0x00000001, 0xfffeffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0xffffffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeSubHalf, 2, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeAddUns, 2, 0xffffffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeSubUns, 2, 0xffffffff, 0x00000001, 0xfffeffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0xffffffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0xffffffff, 0x00000001, 0xfffeffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0xffffffff, 0x00000001, 0x80007fff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0xffffffff, 0x00000001, 0x7fff7fff),
+            (Intrinsic::ParallelAdd, 1, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddSat, 1, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 1, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000000, 0xffffffff, 0x7f7f7f7f),
+            (Intrinsic::ParallelAdd, 2, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddSat, 2, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 2, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000000, 0xffffffff, 0x7fff7fff),
+            (Intrinsic::ParallelSub, 1, 0x00000000, 0xffffffff, 0x01010101),
+            (Intrinsic::ParallelSubSat, 1, 0x00000000, 0xffffffff, 0x01010101),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000000, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000000, 0xffffffff, 0x01010101),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000000, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000000, 0xffffffff, 0x80808080),
+            (Intrinsic::ParallelSub, 2, 0x00000000, 0xffffffff, 0x00010001),
+            (Intrinsic::ParallelSubSat, 2, 0x00000000, 0xffffffff, 0x00010001),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000000, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000000, 0xffffffff, 0x00010001),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000000, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000000, 0xffffffff, 0x80008000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000000, 0xffffffff, 0xffff0001),
+            (Intrinsic::ExchangeSub, 2, 0x00000000, 0xffffffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000000, 0xffffffff, 0xffff0001),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000000, 0xffffffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000000, 0xffffffff, 0xffff0000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000000, 0xffffffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000000, 0xffffffff, 0xffff0001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000000, 0xffffffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000000, 0xffffffff, 0xffff0000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000000, 0xffffffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000000, 0xffffffff, 0x7fff8000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000000, 0xffffffff, 0x80007fff),
+            (Intrinsic::ParallelAdd, 1, 0xffffffff, 0xffffffff, 0xfefefefe),
+            (Intrinsic::ParallelAddSat, 1, 0xffffffff, 0xffffffff, 0xfefefefe),
+            (Intrinsic::ParallelAddHalf, 1, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 1, 0xffffffff, 0xffffffff, 0xfefefefe),
+            (Intrinsic::ParallelAddSatUns, 1, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAdd, 2, 0xffffffff, 0xffffffff, 0xfffefffe),
+            (Intrinsic::ParallelAddSat, 2, 0xffffffff, 0xffffffff, 0xfffefffe),
+            (Intrinsic::ParallelAddHalf, 2, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 2, 0xffffffff, 0xffffffff, 0xfffefffe),
+            (Intrinsic::ParallelAddSatUns, 2, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0xffffffff, 0xffffffff, 0xffffffff),
+            (Intrinsic::ParallelSub, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubSat, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSub, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubSat, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0xffffffff, 0xffffffff, 0x00000000),
+            (Intrinsic::ExchangeAdd, 2, 0xffffffff, 0xffffffff, 0xfffe0000),
+            (Intrinsic::ExchangeSub, 2, 0xffffffff, 0xffffffff, 0x0000fffe),
+            (Intrinsic::ExchangeAddSat, 2, 0xffffffff, 0xffffffff, 0xfffe0000),
+            (Intrinsic::ExchangeSubSat, 2, 0xffffffff, 0xffffffff, 0x0000fffe),
+            (Intrinsic::ExchangeAddHalf, 2, 0xffffffff, 0xffffffff, 0xffff0000),
+            (Intrinsic::ExchangeSubHalf, 2, 0xffffffff, 0xffffffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddUns, 2, 0xffffffff, 0xffffffff, 0xfffe0000),
+            (Intrinsic::ExchangeSubUns, 2, 0xffffffff, 0xffffffff, 0x0000fffe),
+            (Intrinsic::ExchangeAddSatUns, 2, 0xffffffff, 0xffffffff, 0xffff0000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0xffffffff, 0xffffffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0xffffffff, 0xffffffff, 0xffff0000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0xffffffff, 0xffffffff, 0x0000ffff),
+            (Intrinsic::ParallelAdd, 1, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddSat, 1, 0x0000007f, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelAddHalf, 1, 0x0000007f, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelAddUns, 1, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddSatUns, 1, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x0000007f, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelAdd, 2, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddSat, 2, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddHalf, 2, 0x0000007f, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelAddUns, 2, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddSatUns, 2, 0x0000007f, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x0000007f, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelSub, 1, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubSat, 1, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubHalf, 1, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ParallelSubUns, 1, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubSatUns, 1, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ParallelSub, 2, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubSat, 2, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubHalf, 2, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ParallelSubUns, 2, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubSatUns, 2, 0x0000007f, 0x00000001, 0x0000007e),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ExchangeAdd, 2, 0x0000007f, 0x00000001, 0x0001007f),
+            (Intrinsic::ExchangeSub, 2, 0x0000007f, 0x00000001, 0xffff007f),
+            (Intrinsic::ExchangeAddSat, 2, 0x0000007f, 0x00000001, 0x0001007f),
+            (Intrinsic::ExchangeSubSat, 2, 0x0000007f, 0x00000001, 0xffff007f),
+            (Intrinsic::ExchangeAddHalf, 2, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ExchangeSubHalf, 2, 0x0000007f, 0x00000001, 0xffff003f),
+            (Intrinsic::ExchangeAddUns, 2, 0x0000007f, 0x00000001, 0x0001007f),
+            (Intrinsic::ExchangeSubUns, 2, 0x0000007f, 0x00000001, 0xffff007f),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x0000007f, 0x00000001, 0x0001007f),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x0000007f, 0x00000001, 0x0000007f),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x0000007f, 0x00000001, 0x0000003f),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x0000007f, 0x00000001, 0xffff003f),
+            (Intrinsic::ParallelAdd, 1, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddSat, 1, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000080, 0x00000001, 0x000000c0),
+            (Intrinsic::ParallelAddUns, 1, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000080, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelAdd, 2, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddSat, 2, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000080, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelAddUns, 2, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000080, 0x00000001, 0x00000081),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000080, 0x00000001, 0x00000040),
+            (Intrinsic::ParallelSub, 1, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubSat, 1, 0x00000080, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000080, 0x00000001, 0x000000bf),
+            (Intrinsic::ParallelSubUns, 1, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000080, 0x00000001, 0x0000003f),
+            (Intrinsic::ParallelSub, 2, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubSat, 2, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000080, 0x00000001, 0x0000003f),
+            (Intrinsic::ParallelSubUns, 2, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000080, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000080, 0x00000001, 0x0000003f),
+            (Intrinsic::ExchangeAdd, 2, 0x00000080, 0x00000001, 0x00010080),
+            (Intrinsic::ExchangeSub, 2, 0x00000080, 0x00000001, 0xffff0080),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000080, 0x00000001, 0x00010080),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000080, 0x00000001, 0xffff0080),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000080, 0x00000001, 0x00000040),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000080, 0x00000001, 0xffff0040),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000080, 0x00000001, 0x00010080),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000080, 0x00000001, 0xffff0080),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000080, 0x00000001, 0x00010080),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000080, 0x00000001, 0x00000080),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000080, 0x00000001, 0x00000040),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000080, 0x00000001, 0xffff0040),
+            (Intrinsic::ParallelAdd, 1, 0x000000ff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddSat, 1, 0x000000ff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 1, 0x000000ff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddUns, 1, 0x000000ff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 1, 0x000000ff, 0x00000001, 0x000000ff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x000000ff, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAdd, 2, 0x000000ff, 0x00000001, 0x00000100),
+            (Intrinsic::ParallelAddSat, 2, 0x000000ff, 0x00000001, 0x00000100),
+            (Intrinsic::ParallelAddHalf, 2, 0x000000ff, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelAddUns, 2, 0x000000ff, 0x00000001, 0x00000100),
+            (Intrinsic::ParallelAddSatUns, 2, 0x000000ff, 0x00000001, 0x00000100),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x000000ff, 0x00000001, 0x00000080),
+            (Intrinsic::ParallelSub, 1, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubSat, 1, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubHalf, 1, 0x000000ff, 0x00000001, 0x000000ff),
+            (Intrinsic::ParallelSubUns, 1, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubSatUns, 1, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x000000ff, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSub, 2, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubSat, 2, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubHalf, 2, 0x000000ff, 0x00000001, 0x0000007f),
+            (Intrinsic::ParallelSubUns, 2, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubSatUns, 2, 0x000000ff, 0x00000001, 0x000000fe),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x000000ff, 0x00000001, 0x0000007f),
+            (Intrinsic::ExchangeAdd, 2, 0x000000ff, 0x00000001, 0x000100ff),
+            (Intrinsic::ExchangeSub, 2, 0x000000ff, 0x00000001, 0xffff00ff),
+            (Intrinsic::ExchangeAddSat, 2, 0x000000ff, 0x00000001, 0x000100ff),
+            (Intrinsic::ExchangeSubSat, 2, 0x000000ff, 0x00000001, 0xffff00ff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x000000ff, 0x00000001, 0x0000007f),
+            (Intrinsic::ExchangeSubHalf, 2, 0x000000ff, 0x00000001, 0xffff007f),
+            (Intrinsic::ExchangeAddUns, 2, 0x000000ff, 0x00000001, 0x000100ff),
+            (Intrinsic::ExchangeSubUns, 2, 0x000000ff, 0x00000001, 0xffff00ff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x000000ff, 0x00000001, 0x000100ff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x000000ff, 0x00000001, 0x000000ff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x000000ff, 0x00000001, 0x0000007f),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x000000ff, 0x00000001, 0xffff007f),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x000000ff, 0x000000ff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x000000ff, 0x00000080),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x000000ff, 0x00000100),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x000000ff, 0x00000100),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x000000ff, 0x00000080),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x000000ff, 0x00000100),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x000000ff, 0x00000100),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x000000ff, 0x00000080),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x000000ff, 0x00000002),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x000000ff, 0x00000002),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x000000ff, 0x00000001),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x000000ff, 0x00000002),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x000000ff, 0x00000081),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x000000ff, 0x0000ff02),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x000000ff, 0x0000ff02),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x000000ff, 0x0000ff81),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x000000ff, 0x0000ff02),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x000000ff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x000000ff, 0x0000ff81),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x000000ff, 0x00ff0001),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x000000ff, 0xff010001),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x000000ff, 0x00ff0001),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x000000ff, 0xff010001),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x000000ff, 0x007f0000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x000000ff, 0xff800000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x000000ff, 0x00ff0001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x000000ff, 0xff010001),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x000000ff, 0x00ff0001),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x000000ff, 0x00000001),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x000000ff, 0x007f0000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x000000ff, 0xff800000),
+            (Intrinsic::ParallelAdd, 1, 0x0000ffff, 0x00000001, 0x0000ff00),
+            (Intrinsic::ParallelAddSat, 1, 0x0000ffff, 0x00000001, 0x0000ff00),
+            (Intrinsic::ParallelAddHalf, 1, 0x0000ffff, 0x00000001, 0x0000ff00),
+            (Intrinsic::ParallelAddUns, 1, 0x0000ffff, 0x00000001, 0x0000ff00),
+            (Intrinsic::ParallelAddSatUns, 1, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x0000ffff, 0x00000001, 0x00007f80),
+            (Intrinsic::ParallelAdd, 2, 0x0000ffff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddSat, 2, 0x0000ffff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 2, 0x0000ffff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddUns, 2, 0x0000ffff, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 2, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x0000ffff, 0x00000001, 0x00008000),
+            (Intrinsic::ParallelSub, 1, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubSat, 1, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubHalf, 1, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 1, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubSatUns, 1, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x0000ffff, 0x00000001, 0x00007f7f),
+            (Intrinsic::ParallelSub, 2, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubSat, 2, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubHalf, 2, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 2, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubSatUns, 2, 0x0000ffff, 0x00000001, 0x0000fffe),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x0000ffff, 0x00000001, 0x00007fff),
+            (Intrinsic::ExchangeAdd, 2, 0x0000ffff, 0x00000001, 0x0001ffff),
+            (Intrinsic::ExchangeSub, 2, 0x0000ffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x0000ffff, 0x00000001, 0x0001ffff),
+            (Intrinsic::ExchangeSubSat, 2, 0x0000ffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeSubHalf, 2, 0x0000ffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x0000ffff, 0x00000001, 0x0001ffff),
+            (Intrinsic::ExchangeSubUns, 2, 0x0000ffff, 0x00000001, 0xffffffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x0000ffff, 0x00000001, 0x0001ffff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x0000ffff, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x0000ffff, 0x00000001, 0x00007fff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x0000ffff, 0x00000001, 0xffff7fff),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x0000ffff, 0x0000ff00),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x0000ffff, 0x0000ff00),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x0000ffff, 0x0000ff00),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x0000ffff, 0x0000ff00),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x0000ffff, 0x00007f80),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x0000ffff, 0x00008000),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x0000ffff, 0x00000102),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x0000ffff, 0x00000102),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x0000ffff, 0x00000001),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x0000ffff, 0x00000102),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x0000ffff, 0x00008081),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x0000ffff, 0x00000002),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x0000ffff, 0x00000002),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x0000ffff, 0x00000001),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x0000ffff, 0x00000002),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x0000ffff, 0x00008001),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x0000ffff, 0xffff0001),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x0000ffff, 0x00010001),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x0000ffff, 0xffff0001),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x0000ffff, 0x00010001),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x0000ffff, 0xffff0000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x0000ffff, 0x00000000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x0000ffff, 0xffff0001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x0000ffff, 0x00010001),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x0000ffff, 0xffff0001),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x0000ffff, 0x00000001),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x0000ffff, 0x7fff0000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x0000ffff, 0x80000000),
+            (Intrinsic::ParallelAdd, 1, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddSat, 1, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddHalf, 1, 0x00008000, 0x00000001, 0x0000c000),
+            (Intrinsic::ParallelAddUns, 1, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00008000, 0x00000001, 0x00004000),
+            (Intrinsic::ParallelAdd, 2, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddSat, 2, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddHalf, 2, 0x00008000, 0x00000001, 0x0000c000),
+            (Intrinsic::ParallelAddUns, 2, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00008000, 0x00000001, 0x00008001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00008000, 0x00000001, 0x00004000),
+            (Intrinsic::ParallelSub, 1, 0x00008000, 0x00000001, 0x000080ff),
+            (Intrinsic::ParallelSubSat, 1, 0x00008000, 0x00000001, 0x000080ff),
+            (Intrinsic::ParallelSubHalf, 1, 0x00008000, 0x00000001, 0x0000c0ff),
+            (Intrinsic::ParallelSubUns, 1, 0x00008000, 0x00000001, 0x000080ff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00008000, 0x00000001, 0x00008000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00008000, 0x00000001, 0x000040ff),
+            (Intrinsic::ParallelSub, 2, 0x00008000, 0x00000001, 0x00007fff),
+            (Intrinsic::ParallelSubSat, 2, 0x00008000, 0x00000001, 0x00008000),
+            (Intrinsic::ParallelSubHalf, 2, 0x00008000, 0x00000001, 0x0000bfff),
+            (Intrinsic::ParallelSubUns, 2, 0x00008000, 0x00000001, 0x00007fff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00008000, 0x00000001, 0x00007fff),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00008000, 0x00000001, 0x00003fff),
+            (Intrinsic::ExchangeAdd, 2, 0x00008000, 0x00000001, 0x00018000),
+            (Intrinsic::ExchangeSub, 2, 0x00008000, 0x00000001, 0xffff8000),
+            (Intrinsic::ExchangeAddSat, 2, 0x00008000, 0x00000001, 0x00018000),
+            (Intrinsic::ExchangeSubSat, 2, 0x00008000, 0x00000001, 0xffff8000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00008000, 0x00000001, 0x0000c000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00008000, 0x00000001, 0xffffc000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00008000, 0x00000001, 0x00018000),
+            (Intrinsic::ExchangeSubUns, 2, 0x00008000, 0x00000001, 0xffff8000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00008000, 0x00000001, 0x00018000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00008000, 0x00000001, 0x00008000),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00008000, 0x00000001, 0x00004000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00008000, 0x00000001, 0xffff4000),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x00008000, 0x0000c000),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x00008000, 0x00004000),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x00008000, 0x0000c000),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x00008000, 0x00004000),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x00008000, 0x00007f01),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x00008000, 0x00004000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x00008000, 0x00000001),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x00008000, 0x0000c000),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x00008000, 0x00007fff),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x00008000, 0x00004000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x00008000, 0x00008001),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x00008000, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x00008000, 0x0000c000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x00008000, 0x7fff0001),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x00008000, 0xc0000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x00008000, 0x40000000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x00008000, 0x80000001),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x00008000, 0x00000001),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x00008000, 0x40000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x00008000, 0xc0000000),
+            (Intrinsic::ParallelAdd, 1, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddSat, 1, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddHalf, 1, 0x80000000, 0x00000001, 0xc0000000),
+            (Intrinsic::ParallelAddUns, 1, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x80000000, 0x00000001, 0x40000000),
+            (Intrinsic::ParallelAdd, 2, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddSat, 2, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddHalf, 2, 0x80000000, 0x00000001, 0xc0000000),
+            (Intrinsic::ParallelAddUns, 2, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x80000000, 0x00000001, 0x80000001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x80000000, 0x00000001, 0x40000000),
+            (Intrinsic::ParallelSub, 1, 0x80000000, 0x00000001, 0x800000ff),
+            (Intrinsic::ParallelSubSat, 1, 0x80000000, 0x00000001, 0x800000ff),
+            (Intrinsic::ParallelSubHalf, 1, 0x80000000, 0x00000001, 0xc00000ff),
+            (Intrinsic::ParallelSubUns, 1, 0x80000000, 0x00000001, 0x800000ff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x80000000, 0x00000001, 0x80000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x80000000, 0x00000001, 0x400000ff),
+            (Intrinsic::ParallelSub, 2, 0x80000000, 0x00000001, 0x8000ffff),
+            (Intrinsic::ParallelSubSat, 2, 0x80000000, 0x00000001, 0x8000ffff),
+            (Intrinsic::ParallelSubHalf, 2, 0x80000000, 0x00000001, 0xc000ffff),
+            (Intrinsic::ParallelSubUns, 2, 0x80000000, 0x00000001, 0x8000ffff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x80000000, 0x00000001, 0x80000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x80000000, 0x00000001, 0x4000ffff),
+            (Intrinsic::ExchangeAdd, 2, 0x80000000, 0x00000001, 0x80010000),
+            (Intrinsic::ExchangeSub, 2, 0x80000000, 0x00000001, 0x7fff0000),
+            (Intrinsic::ExchangeAddSat, 2, 0x80000000, 0x00000001, 0x80010000),
+            (Intrinsic::ExchangeSubSat, 2, 0x80000000, 0x00000001, 0x80000000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x80000000, 0x00000001, 0xc0000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x80000000, 0x00000001, 0xbfff0000),
+            (Intrinsic::ExchangeAddUns, 2, 0x80000000, 0x00000001, 0x80010000),
+            (Intrinsic::ExchangeSubUns, 2, 0x80000000, 0x00000001, 0x7fff0000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x80000000, 0x00000001, 0x80010000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x80000000, 0x00000001, 0x7fff0000),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x80000000, 0x00000001, 0x40000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x80000000, 0x00000001, 0x3fff0000),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x80000000, 0xc0000000),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x80000000, 0x40000000),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x80000000, 0xc0000000),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x80000000, 0x40000000),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x80000000, 0x7f000001),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x80000000, 0x40000000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x80000000, 0x00000001),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x80000000, 0xc0000000),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x80000000, 0x7fff0001),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x80000000, 0x40000000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x80000000, 0x80000001),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x80000000, 0x00000001),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x80000000, 0xc0000000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x80000000, 0x00007fff),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x80000000, 0x00004000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x80000000, 0x0000c000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x80000000, 0x00000000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x80000000, 0x00008001),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x80000000, 0x0000c000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x80000000, 0x00004000),
+            (Intrinsic::ParallelAdd, 1, 0x7fffffff, 0x00000001, 0x7fffff00),
+            (Intrinsic::ParallelAddSat, 1, 0x7fffffff, 0x00000001, 0x7fffff00),
+            (Intrinsic::ParallelAddHalf, 1, 0x7fffffff, 0x00000001, 0x3fffff00),
+            (Intrinsic::ParallelAddUns, 1, 0x7fffffff, 0x00000001, 0x7fffff00),
+            (Intrinsic::ParallelAddSatUns, 1, 0x7fffffff, 0x00000001, 0x7fffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x7fffffff, 0x00000001, 0x3f7f7f80),
+            (Intrinsic::ParallelAdd, 2, 0x7fffffff, 0x00000001, 0x7fff0000),
+            (Intrinsic::ParallelAddSat, 2, 0x7fffffff, 0x00000001, 0x7fff0000),
+            (Intrinsic::ParallelAddHalf, 2, 0x7fffffff, 0x00000001, 0x3fff0000),
+            (Intrinsic::ParallelAddUns, 2, 0x7fffffff, 0x00000001, 0x7fff0000),
+            (Intrinsic::ParallelAddSatUns, 2, 0x7fffffff, 0x00000001, 0x7fffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x7fffffff, 0x00000001, 0x3fff8000),
+            (Intrinsic::ParallelSub, 1, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubSat, 1, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubHalf, 1, 0x7fffffff, 0x00000001, 0x3fffffff),
+            (Intrinsic::ParallelSubUns, 1, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubSatUns, 1, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x7fffffff, 0x00000001, 0x3f7f7f7f),
+            (Intrinsic::ParallelSub, 2, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubSat, 2, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubHalf, 2, 0x7fffffff, 0x00000001, 0x3fffffff),
+            (Intrinsic::ParallelSubUns, 2, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubSatUns, 2, 0x7fffffff, 0x00000001, 0x7ffffffe),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x7fffffff, 0x00000001, 0x3fff7fff),
+            (Intrinsic::ExchangeAdd, 2, 0x7fffffff, 0x00000001, 0x8000ffff),
+            (Intrinsic::ExchangeSub, 2, 0x7fffffff, 0x00000001, 0x7ffeffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x7fffffff, 0x00000001, 0x7fffffff),
+            (Intrinsic::ExchangeSubSat, 2, 0x7fffffff, 0x00000001, 0x7ffeffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x7fffffff, 0x00000001, 0x4000ffff),
+            (Intrinsic::ExchangeSubHalf, 2, 0x7fffffff, 0x00000001, 0x3fffffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x7fffffff, 0x00000001, 0x8000ffff),
+            (Intrinsic::ExchangeSubUns, 2, 0x7fffffff, 0x00000001, 0x7ffeffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x7fffffff, 0x00000001, 0x8000ffff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x7fffffff, 0x00000001, 0x7ffeffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x7fffffff, 0x00000001, 0x40007fff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x7fffffff, 0x00000001, 0x3fff7fff),
+            (Intrinsic::ParallelAdd, 1, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddSat, 1, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddHalf, 1, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddUns, 1, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAdd, 2, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddSat, 2, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddHalf, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAddUns, 2, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelSub, 1, 0x00010000, 0x00000001, 0x000100ff),
+            (Intrinsic::ParallelSubSat, 1, 0x00010000, 0x00000001, 0x000100ff),
+            (Intrinsic::ParallelSubHalf, 1, 0x00010000, 0x00000001, 0x000000ff),
+            (Intrinsic::ParallelSubUns, 1, 0x00010000, 0x00000001, 0x000100ff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00010000, 0x00000001, 0x00010000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00010000, 0x00000001, 0x000000ff),
+            (Intrinsic::ParallelSub, 2, 0x00010000, 0x00000001, 0x0001ffff),
+            (Intrinsic::ParallelSubSat, 2, 0x00010000, 0x00000001, 0x0001ffff),
+            (Intrinsic::ParallelSubHalf, 2, 0x00010000, 0x00000001, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 2, 0x00010000, 0x00000001, 0x0001ffff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00010000, 0x00000001, 0x00010000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00010000, 0x00000001, 0x0000ffff),
+            (Intrinsic::ExchangeAdd, 2, 0x00010000, 0x00000001, 0x00020000),
+            (Intrinsic::ExchangeSub, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAddSat, 2, 0x00010000, 0x00000001, 0x00020000),
+            (Intrinsic::ExchangeSubSat, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00010000, 0x00000001, 0x00010000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAddUns, 2, 0x00010000, 0x00000001, 0x00020000),
+            (Intrinsic::ExchangeSubUns, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00010000, 0x00000001, 0x00020000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00010000, 0x00000001, 0x00010000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00010000, 0x00000001, 0x00000000),
+            (Intrinsic::ParallelAdd, 1, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddSat, 1, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddHalf, 1, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ParallelAddUns, 1, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ParallelAdd, 2, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddSat, 2, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddHalf, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ParallelAddUns, 2, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00000001, 0x00010000, 0x00010001),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ParallelSub, 1, 0x00000001, 0x00010000, 0x00ff0001),
+            (Intrinsic::ParallelSubSat, 1, 0x00000001, 0x00010000, 0x00ff0001),
+            (Intrinsic::ParallelSubHalf, 1, 0x00000001, 0x00010000, 0x00ff0000),
+            (Intrinsic::ParallelSubUns, 1, 0x00000001, 0x00010000, 0x00ff0001),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00000001, 0x00010000, 0x00000001),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00000001, 0x00010000, 0x00ff0000),
+            (Intrinsic::ParallelSub, 2, 0x00000001, 0x00010000, 0xffff0001),
+            (Intrinsic::ParallelSubSat, 2, 0x00000001, 0x00010000, 0xffff0001),
+            (Intrinsic::ParallelSubHalf, 2, 0x00000001, 0x00010000, 0xffff0000),
+            (Intrinsic::ParallelSubUns, 2, 0x00000001, 0x00010000, 0xffff0001),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00000001, 0x00010000, 0x00000001),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00000001, 0x00010000, 0xffff0000),
+            (Intrinsic::ExchangeAdd, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSub, 2, 0x00000001, 0x00010000, 0x00000002),
+            (Intrinsic::ExchangeAddSat, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSubSat, 2, 0x00000001, 0x00010000, 0x00000002),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00000001, 0x00010000, 0x00000001),
+            (Intrinsic::ExchangeAddUns, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSubUns, 2, 0x00000001, 0x00010000, 0x00000002),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00000001, 0x00010000, 0x00000002),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00000001, 0x00010000, 0x00000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00000001, 0x00010000, 0x00000001),
+            (Intrinsic::ParallelAdd, 1, 0xfedcba98, 0x12345678, 0x10101010),
+            (Intrinsic::ParallelAddSat, 1, 0xfedcba98, 0x12345678, 0x10101010),
+            (Intrinsic::ParallelAddHalf, 1, 0xfedcba98, 0x12345678, 0x08080808),
+            (Intrinsic::ParallelAddUns, 1, 0xfedcba98, 0x12345678, 0x10101010),
+            (Intrinsic::ParallelAddSatUns, 1, 0xfedcba98, 0x12345678, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0xfedcba98, 0x12345678, 0x88888888),
+            (Intrinsic::ParallelAdd, 2, 0xfedcba98, 0x12345678, 0x11101110),
+            (Intrinsic::ParallelAddSat, 2, 0xfedcba98, 0x12345678, 0x11101110),
+            (Intrinsic::ParallelAddHalf, 2, 0xfedcba98, 0x12345678, 0x08880888),
+            (Intrinsic::ParallelAddUns, 2, 0xfedcba98, 0x12345678, 0x11101110),
+            (Intrinsic::ParallelAddSatUns, 2, 0xfedcba98, 0x12345678, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0xfedcba98, 0x12345678, 0x88888888),
+            (Intrinsic::ParallelSub, 1, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubSat, 1, 0xfedcba98, 0x12345678, 0xeca88080),
+            (Intrinsic::ParallelSubHalf, 1, 0xfedcba98, 0x12345678, 0xf6d4b290),
+            (Intrinsic::ParallelSubUns, 1, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubSatUns, 1, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubHalfUns, 1, 0xfedcba98, 0x12345678, 0x76543210),
+            (Intrinsic::ParallelSub, 2, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubSat, 2, 0xfedcba98, 0x12345678, 0xeca88000),
+            (Intrinsic::ParallelSubHalf, 2, 0xfedcba98, 0x12345678, 0xf654b210),
+            (Intrinsic::ParallelSubUns, 2, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubSatUns, 2, 0xfedcba98, 0x12345678, 0xeca86420),
+            (Intrinsic::ParallelSubHalfUns, 2, 0xfedcba98, 0x12345678, 0x76543210),
+            (Intrinsic::ExchangeAdd, 2, 0xfedcba98, 0x12345678, 0x5554a864),
+            (Intrinsic::ExchangeSub, 2, 0xfedcba98, 0x12345678, 0xa864cccc),
+            (Intrinsic::ExchangeAddSat, 2, 0xfedcba98, 0x12345678, 0x5554a864),
+            (Intrinsic::ExchangeSubSat, 2, 0xfedcba98, 0x12345678, 0xa864cccc),
+            (Intrinsic::ExchangeAddHalf, 2, 0xfedcba98, 0x12345678, 0x2aaad432),
+            (Intrinsic::ExchangeSubHalf, 2, 0xfedcba98, 0x12345678, 0xd432e666),
+            (Intrinsic::ExchangeAddUns, 2, 0xfedcba98, 0x12345678, 0x5554a864),
+            (Intrinsic::ExchangeSubUns, 2, 0xfedcba98, 0x12345678, 0xa864cccc),
+            (Intrinsic::ExchangeAddSatUns, 2, 0xfedcba98, 0x12345678, 0xffffa864),
+            (Intrinsic::ExchangeSubSatUns, 2, 0xfedcba98, 0x12345678, 0xa864cccc),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0xfedcba98, 0x12345678, 0xaaaa5432),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0xfedcba98, 0x12345678, 0x54326666),
+            (Intrinsic::ParallelAdd, 1, 0x0000ffff, 0x0000ffff, 0x0000fefe),
+            (Intrinsic::ParallelAddSat, 1, 0x0000ffff, 0x0000ffff, 0x0000fefe),
+            (Intrinsic::ParallelAddHalf, 1, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 1, 0x0000ffff, 0x0000ffff, 0x0000fefe),
+            (Intrinsic::ParallelAddSatUns, 1, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAdd, 2, 0x0000ffff, 0x0000ffff, 0x0000fffe),
+            (Intrinsic::ParallelAddSat, 2, 0x0000ffff, 0x0000ffff, 0x0000fffe),
+            (Intrinsic::ParallelAddHalf, 2, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 2, 0x0000ffff, 0x0000ffff, 0x0000fffe),
+            (Intrinsic::ParallelAddSatUns, 2, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ParallelSub, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubSat, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSub, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubSat, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x0000ffff, 0x0000ffff, 0x00000000),
+            (Intrinsic::ExchangeAdd, 2, 0x0000ffff, 0x0000ffff, 0xffffffff),
+            (Intrinsic::ExchangeSub, 2, 0x0000ffff, 0x0000ffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x0000ffff, 0x0000ffff, 0xffffffff),
+            (Intrinsic::ExchangeSubSat, 2, 0x0000ffff, 0x0000ffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x0000ffff, 0x0000ffff, 0xffffffff),
+            (Intrinsic::ExchangeSubHalf, 2, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x0000ffff, 0x0000ffff, 0xffffffff),
+            (Intrinsic::ExchangeSubUns, 2, 0x0000ffff, 0x0000ffff, 0x0001ffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x0000ffff, 0x0000ffff, 0xffffffff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x0000ffff, 0x0000ffff, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x0000ffff, 0x0000ffff, 0x7fff7fff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x0000ffff, 0x0000ffff, 0x80007fff),
+            (Intrinsic::ParallelAdd, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelAddSat, 1, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelAddHalf, 1, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelAddUns, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 1, 0x80008000, 0x80008000, 0xff00ff00),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelAdd, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelAddSat, 2, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelAddHalf, 2, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelAddUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelAddSatUns, 2, 0x80008000, 0x80008000, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ParallelSub, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubSat, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubUns, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSub, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubSat, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubHalf, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubSatUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ExchangeAdd, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ExchangeSub, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ExchangeAddSat, 2, 0x80008000, 0x80008000, 0x80000000),
+            (Intrinsic::ExchangeSubSat, 2, 0x80008000, 0x80008000, 0x00008000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x80008000, 0x80008000, 0x80000000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x80008000, 0x80008000, 0x00008000),
+            (Intrinsic::ExchangeAddUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ExchangeSubUns, 2, 0x80008000, 0x80008000, 0x00000000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x80008000, 0x80008000, 0xffff0000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x80008000, 0x80008000, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x80008000, 0x80008000, 0x80000000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x80008000, 0x80008000, 0x00008000),
+            (Intrinsic::ParallelAdd, 1, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddSat, 1, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddHalf, 1, 0x7fff0000, 0x0000ffff, 0x3fffffff),
+            (Intrinsic::ParallelAddUns, 1, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddSatUns, 1, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x7fff0000, 0x0000ffff, 0x3f7f7f7f),
+            (Intrinsic::ParallelAdd, 2, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddSat, 2, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddHalf, 2, 0x7fff0000, 0x0000ffff, 0x3fffffff),
+            (Intrinsic::ParallelAddUns, 2, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddSatUns, 2, 0x7fff0000, 0x0000ffff, 0x7fffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x7fff0000, 0x0000ffff, 0x3fff7fff),
+            (Intrinsic::ParallelSub, 1, 0x7fff0000, 0x0000ffff, 0x7fff0101),
+            (Intrinsic::ParallelSubSat, 1, 0x7fff0000, 0x0000ffff, 0x7fff0101),
+            (Intrinsic::ParallelSubHalf, 1, 0x7fff0000, 0x0000ffff, 0x3fff0000),
+            (Intrinsic::ParallelSubUns, 1, 0x7fff0000, 0x0000ffff, 0x7fff0101),
+            (Intrinsic::ParallelSubSatUns, 1, 0x7fff0000, 0x0000ffff, 0x7fff0000),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x7fff0000, 0x0000ffff, 0x3f7f8080),
+            (Intrinsic::ParallelSub, 2, 0x7fff0000, 0x0000ffff, 0x7fff0001),
+            (Intrinsic::ParallelSubSat, 2, 0x7fff0000, 0x0000ffff, 0x7fff0001),
+            (Intrinsic::ParallelSubHalf, 2, 0x7fff0000, 0x0000ffff, 0x3fff0000),
+            (Intrinsic::ParallelSubUns, 2, 0x7fff0000, 0x0000ffff, 0x7fff0001),
+            (Intrinsic::ParallelSubSatUns, 2, 0x7fff0000, 0x0000ffff, 0x7fff0000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x7fff0000, 0x0000ffff, 0x3fff8000),
+            (Intrinsic::ExchangeAdd, 2, 0x7fff0000, 0x0000ffff, 0x7ffe0000),
+            (Intrinsic::ExchangeSub, 2, 0x7fff0000, 0x0000ffff, 0x80000000),
+            (Intrinsic::ExchangeAddSat, 2, 0x7fff0000, 0x0000ffff, 0x7ffe0000),
+            (Intrinsic::ExchangeSubSat, 2, 0x7fff0000, 0x0000ffff, 0x7fff0000),
+            (Intrinsic::ExchangeAddHalf, 2, 0x7fff0000, 0x0000ffff, 0x3fff0000),
+            (Intrinsic::ExchangeSubHalf, 2, 0x7fff0000, 0x0000ffff, 0x40000000),
+            (Intrinsic::ExchangeAddUns, 2, 0x7fff0000, 0x0000ffff, 0x7ffe0000),
+            (Intrinsic::ExchangeSubUns, 2, 0x7fff0000, 0x0000ffff, 0x80000000),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x7fff0000, 0x0000ffff, 0xffff0000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x7fff0000, 0x0000ffff, 0x00000000),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x7fff0000, 0x0000ffff, 0xbfff0000),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x7fff0000, 0x0000ffff, 0xc0000000),
+            (Intrinsic::ParallelAdd, 1, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddSat, 1, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalf, 1, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 1, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddSatUns, 1, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x0000ff00, 0x000000ff, 0x00007f7f),
+            (Intrinsic::ParallelAdd, 2, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddSat, 2, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalf, 2, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 2, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddSatUns, 2, 0x0000ff00, 0x000000ff, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x0000ff00, 0x000000ff, 0x00007fff),
+            (Intrinsic::ParallelSub, 1, 0x0000ff00, 0x000000ff, 0x0000ff01),
+            (Intrinsic::ParallelSubSat, 1, 0x0000ff00, 0x000000ff, 0x0000ff01),
+            (Intrinsic::ParallelSubHalf, 1, 0x0000ff00, 0x000000ff, 0x0000ff00),
+            (Intrinsic::ParallelSubUns, 1, 0x0000ff00, 0x000000ff, 0x0000ff01),
+            (Intrinsic::ParallelSubSatUns, 1, 0x0000ff00, 0x000000ff, 0x0000ff00),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x0000ff00, 0x000000ff, 0x00007f80),
+            (Intrinsic::ParallelSub, 2, 0x0000ff00, 0x000000ff, 0x0000fe01),
+            (Intrinsic::ParallelSubSat, 2, 0x0000ff00, 0x000000ff, 0x0000fe01),
+            (Intrinsic::ParallelSubHalf, 2, 0x0000ff00, 0x000000ff, 0x0000ff00),
+            (Intrinsic::ParallelSubUns, 2, 0x0000ff00, 0x000000ff, 0x0000fe01),
+            (Intrinsic::ParallelSubSatUns, 2, 0x0000ff00, 0x000000ff, 0x0000fe01),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x0000ff00, 0x000000ff, 0x00007f00),
+            (Intrinsic::ExchangeAdd, 2, 0x0000ff00, 0x000000ff, 0x00ffff00),
+            (Intrinsic::ExchangeSub, 2, 0x0000ff00, 0x000000ff, 0xff01ff00),
+            (Intrinsic::ExchangeAddSat, 2, 0x0000ff00, 0x000000ff, 0x00ffff00),
+            (Intrinsic::ExchangeSubSat, 2, 0x0000ff00, 0x000000ff, 0xff01ff00),
+            (Intrinsic::ExchangeAddHalf, 2, 0x0000ff00, 0x000000ff, 0x007fff80),
+            (Intrinsic::ExchangeSubHalf, 2, 0x0000ff00, 0x000000ff, 0xff80ff80),
+            (Intrinsic::ExchangeAddUns, 2, 0x0000ff00, 0x000000ff, 0x00ffff00),
+            (Intrinsic::ExchangeSubUns, 2, 0x0000ff00, 0x000000ff, 0xff01ff00),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x0000ff00, 0x000000ff, 0x00ffff00),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x0000ff00, 0x000000ff, 0x0000ff00),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x0000ff00, 0x000000ff, 0x007f7f80),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x0000ff00, 0x000000ff, 0xff807f80),
+            (Intrinsic::ParallelAdd, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddSat, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddHalf, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddSatUns, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x0000ffff, 0x00000000, 0x00007f7f),
+            (Intrinsic::ParallelAdd, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddSat, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddHalf, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddSatUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x0000ffff, 0x00000000, 0x00007fff),
+            (Intrinsic::ParallelSub, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubSat, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubHalf, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x0000ffff, 0x00000000, 0x00007f7f),
+            (Intrinsic::ParallelSub, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubSat, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubHalf, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x0000ffff, 0x00000000, 0x00007fff),
+            (Intrinsic::ExchangeAdd, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeSub, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeSubSat, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeSubHalf, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeSubUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x0000ffff, 0x00000000, 0x00007fff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x0000ffff, 0x00000000, 0x00007fff),
+            (Intrinsic::ParallelAdd, 1, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddSat, 1, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddHalf, 1, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 1, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddSatUns, 1, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 1, 0x00ff00ff, 0xff00ff00, 0x7f7f7f7f),
+            (Intrinsic::ParallelAdd, 2, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddSat, 2, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddHalf, 2, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddUns, 2, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddSatUns, 2, 0x00ff00ff, 0xff00ff00, 0xffffffff),
+            (Intrinsic::ParallelAddHalfUns, 2, 0x00ff00ff, 0xff00ff00, 0x7fff7fff),
+            (Intrinsic::ParallelSub, 1, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubSat, 1, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubHalf, 1, 0x00ff00ff, 0xff00ff00, 0x00ff00ff),
+            (Intrinsic::ParallelSubUns, 1, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubSatUns, 1, 0x00ff00ff, 0xff00ff00, 0x00ff00ff),
+            (Intrinsic::ParallelSubHalfUns, 1, 0x00ff00ff, 0xff00ff00, 0x807f807f),
+            (Intrinsic::ParallelSub, 2, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubSat, 2, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubHalf, 2, 0x00ff00ff, 0xff00ff00, 0x00ff00ff),
+            (Intrinsic::ParallelSubUns, 2, 0x00ff00ff, 0xff00ff00, 0x01ff01ff),
+            (Intrinsic::ParallelSubSatUns, 2, 0x00ff00ff, 0xff00ff00, 0x00000000),
+            (Intrinsic::ParallelSubHalfUns, 2, 0x00ff00ff, 0xff00ff00, 0x80ff80ff),
+            (Intrinsic::ExchangeAdd, 2, 0x00ff00ff, 0xff00ff00, 0xffff01ff),
+            (Intrinsic::ExchangeSub, 2, 0x00ff00ff, 0xff00ff00, 0x01ffffff),
+            (Intrinsic::ExchangeAddSat, 2, 0x00ff00ff, 0xff00ff00, 0xffff01ff),
+            (Intrinsic::ExchangeSubSat, 2, 0x00ff00ff, 0xff00ff00, 0x01ffffff),
+            (Intrinsic::ExchangeAddHalf, 2, 0x00ff00ff, 0xff00ff00, 0xffff00ff),
+            (Intrinsic::ExchangeSubHalf, 2, 0x00ff00ff, 0xff00ff00, 0x00ffffff),
+            (Intrinsic::ExchangeAddUns, 2, 0x00ff00ff, 0xff00ff00, 0xffff01ff),
+            (Intrinsic::ExchangeSubUns, 2, 0x00ff00ff, 0xff00ff00, 0x01ffffff),
+            (Intrinsic::ExchangeAddSatUns, 2, 0x00ff00ff, 0xff00ff00, 0xffff0000),
+            (Intrinsic::ExchangeSubSatUns, 2, 0x00ff00ff, 0xff00ff00, 0x0000ffff),
+            (Intrinsic::ExchangeAddHalfUns, 2, 0x00ff00ff, 0xff00ff00, 0x7fff80ff),
+            (Intrinsic::ExchangeSubHalfUns, 2, 0x00ff00ff, 0xff00ff00, 0x80ff7fff),
+        ];
+        for (op, lane, a, b, want) in cases {
+            let got = eval_special(*op, &[*a, *b], *lane);
+            assert_eq!(
+                got,
+                Some(*want),
+                "{:?} over {} bits of {:#010x} and {:#010x}",
+                op,
+                lane * 8,
+                a,
+                b
+            );
+        }
+    }
+    /// The checksums, over every case that was run on the machine.
+    ///
+    /// The two families differ only in the polynomial they use, and the
+    /// width says how much of the second operand is folded in.
+    #[test]
+    fn every_checksum_matches_the_machine() {
+        let cases: &[(Intrinsic, u64, u64, u32, u64)] = &[
+            (Intrinsic::Crc32, 0x00000000, 0x00000000, 8, 0x00000000),
+            (Intrinsic::Crc32, 0x00000000, 0x00000000, 16, 0x00000000),
+            (Intrinsic::Crc32, 0x00000000, 0x00000000, 32, 0x00000000),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000000, 8, 0x00000000),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000000, 16, 0x00000000),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000000, 32, 0x00000000),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000000, 8, 0x2dfd1072),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000000, 16, 0xbe26ed00),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000000, 32, 0xdebb20e3),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000000, 8, 0xad82acae),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000000, 16, 0x0e9e882d),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000000, 32, 0xb798b438),
+            (Intrinsic::Crc32, 0x00000000, 0x00000001, 8, 0x77073096),
+            (Intrinsic::Crc32, 0x00000000, 0x00000001, 16, 0x191b3141),
+            (Intrinsic::Crc32, 0x00000000, 0x00000001, 32, 0xb8bc6765),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000001, 8, 0xf26b8303),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000001, 16, 0x13a29877),
+            (Intrinsic::Crc32c, 0x00000000, 0x00000001, 32, 0xdd45aab8),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000001, 8, 0x5afa20e4),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000001, 16, 0xa73ddc41),
+            (Intrinsic::Crc32, 0xffffffff, 0x00000001, 32, 0x66074786),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000001, 8, 0x5fe92fad),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000001, 16, 0x1d3c105a),
+            (Intrinsic::Crc32c, 0xffffffff, 0x00000001, 32, 0x6add1e80),
+            (Intrinsic::Crc32, 0x12345678, 0x00000000, 8, 0x5ecccd58),
+            (Intrinsic::Crc32, 0x12345678, 0x00000000, 16, 0x65ee150b),
+            (Intrinsic::Crc32, 0x12345678, 0x00000000, 32, 0x8e2958ce),
+            (Intrinsic::Crc32c, 0x12345678, 0x00000000, 8, 0xfb533894),
+            (Intrinsic::Crc32c, 0x12345678, 0x00000000, 16, 0x55c93830),
+            (Intrinsic::Crc32c, 0x12345678, 0x00000000, 32, 0xfa745634),
+            (Intrinsic::Crc32, 0x12345678, 0x000000ff, 8, 0x73ce22d5),
+            (Intrinsic::Crc32, 0x12345678, 0x000000ff, 16, 0xf6cae879),
+            (Intrinsic::Crc32, 0x12345678, 0x000000ff, 32, 0x502c5e3f),
+            (Intrinsic::Crc32c, 0x12345678, 0x000000ff, 8, 0x562e6bc5),
+            (Intrinsic::Crc32c, 0x12345678, 0x000000ff, 16, 0xf62a1cb3),
+            (Intrinsic::Crc32c, 0x12345678, 0x000000ff, 32, 0xd277be76),
+            (Intrinsic::Crc32, 0x12345678, 0x0000ffff, 8, 0x73ce22d5),
+            (Intrinsic::Crc32, 0x12345678, 0x0000ffff, 16, 0xdbc807f4),
+            (Intrinsic::Crc32, 0x12345678, 0x0000ffff, 32, 0xeeb46ad2),
+            (Intrinsic::Crc32c, 0x12345678, 0x0000ffff, 8, 0x562e6bc5),
+            (Intrinsic::Crc32c, 0x12345678, 0x0000ffff, 16, 0x5b574fe2),
+            (Intrinsic::Crc32c, 0x12345678, 0x0000ffff, 32, 0x437295de),
+            (Intrinsic::Crc32, 0x12345678, 0xffffffff, 8, 0x73ce22d5),
+            (Intrinsic::Crc32, 0x12345678, 0xffffffff, 16, 0xdbc807f4),
+            (Intrinsic::Crc32, 0x12345678, 0xffffffff, 32, 0x5092782d),
+            (Intrinsic::Crc32c, 0x12345678, 0xffffffff, 8, 0x562e6bc5),
+            (Intrinsic::Crc32c, 0x12345678, 0xffffffff, 16, 0x5b574fe2),
+            (Intrinsic::Crc32c, 0x12345678, 0xffffffff, 32, 0x4dece20c),
+            (Intrinsic::Crc32, 0xdeadbeef, 0x00000000, 8, 0x306b5257),
+            (Intrinsic::Crc32, 0xdeadbeef, 0x00000000, 16, 0xf53faf05),
+            (Intrinsic::Crc32, 0xdeadbeef, 0x00000000, 32, 0x3b1ebf03),
+            (Intrinsic::Crc32c, 0xdeadbeef, 0x00000000, 8, 0xbdfd3980),
+            (Intrinsic::Crc32c, 0xdeadbeef, 0x00000000, 16, 0x824bc641),
+            (Intrinsic::Crc32c, 0xdeadbeef, 0x00000000, 32, 0x09991d14),
+            (Intrinsic::Crc32, 0x00000000, 0xffffffff, 8, 0x2d02ef8d),
+            (Intrinsic::Crc32, 0x00000000, 0xffffffff, 16, 0xbe2612ff),
+            (Intrinsic::Crc32, 0x00000000, 0xffffffff, 32, 0xdebb20e3),
+            (Intrinsic::Crc32c, 0x00000000, 0xffffffff, 8, 0xad7d5351),
+            (Intrinsic::Crc32c, 0x00000000, 0xffffffff, 16, 0x0e9e77d2),
+            (Intrinsic::Crc32c, 0x00000000, 0xffffffff, 32, 0xb798b438),
+            (Intrinsic::Crc32, 0x00000001, 0xffffffff, 8, 0x5a05df1b),
+            (Intrinsic::Crc32, 0x00000001, 0xffffffff, 16, 0xa73d23be),
+            (Intrinsic::Crc32, 0x00000001, 0xffffffff, 32, 0x66074786),
+            (Intrinsic::Crc32c, 0x00000001, 0xffffffff, 8, 0x5f16d052),
+            (Intrinsic::Crc32c, 0x00000001, 0xffffffff, 16, 0x1d3cefa5),
+            (Intrinsic::Crc32c, 0x00000001, 0xffffffff, 32, 0x6add1e80),
+            (Intrinsic::Crc32, 0x89abcdef, 0x00000000, 8, 0x303c5424),
+            (Intrinsic::Crc32, 0x89abcdef, 0x00000000, 16, 0x3c33d885),
+            (Intrinsic::Crc32, 0x89abcdef, 0x00000000, 32, 0xcefc0adb),
+            (Intrinsic::Crc32c, 0x89abcdef, 0x00000000, 8, 0xbdaa3ff3),
+            (Intrinsic::Crc32c, 0x89abcdef, 0x00000000, 16, 0xe08336be),
+            (Intrinsic::Crc32c, 0x89abcdef, 0x00000000, 32, 0x5914342a),
+        ];
+        for (op, a, b, width, want) in cases {
+            let got = eval_special(*op, &[*a, *b, u64::from(*width)], 4);
+            assert_eq!(
+                got,
+                Some(*want),
+                "{:?} over {} bits of {:#010x} and {:#010x}",
+                op,
+                width,
+                a,
+                b
+            );
+        }
+    }
+    /// The extended additions, over every case that was run on the machine.
+    ///
+    /// The `16` forms work on both halves of the word at once, and they
+    /// are a parallel operation: the carry of one half never reaches the
+    /// other.
+    #[test]
+    fn every_extended_addition_matches_the_machine() {
+        let cases: &[(Intrinsic, u64, u64, u64)] = &[
+            (Intrinsic::ExtendAddSigned, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExtendAdd, 0x00000000, 0x00000000, 0x00000000),
+            (Intrinsic::ExtendAddSigned, 0xffffffff, 0x00000000, 0xffffffff),
+            (Intrinsic::ExtendAdd, 0xffffffff, 0x00000000, 0xffffffff),
+            (Intrinsic::ExtendAddSigned, 0x00000000, 0xffffffff, 0xffffffff),
+            (Intrinsic::ExtendAdd, 0x00000000, 0xffffffff, 0x00ff00ff),
+            (Intrinsic::ExtendAddSigned, 0xffffffff, 0xffffffff, 0xfffefffe),
+            (Intrinsic::ExtendAdd, 0xffffffff, 0xffffffff, 0x00fe00fe),
+            (Intrinsic::ExtendAddSigned, 0x12345678, 0x00000000, 0x12345678),
+            (Intrinsic::ExtendAdd, 0x12345678, 0x00000000, 0x12345678),
+            (Intrinsic::ExtendAddSigned, 0x12345678, 0x000000ff, 0x12345677),
+            (Intrinsic::ExtendAdd, 0x12345678, 0x000000ff, 0x12345777),
+            (Intrinsic::ExtendAddSigned, 0x12345678, 0x0000ffff, 0x12345677),
+            (Intrinsic::ExtendAdd, 0x12345678, 0x0000ffff, 0x12345777),
+            (Intrinsic::ExtendAddSigned, 0x12345678, 0xffffffff, 0x12335677),
+            (Intrinsic::ExtendAdd, 0x12345678, 0xffffffff, 0x13335777),
+            (Intrinsic::ExtendAddSigned, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ExtendAdd, 0x00010000, 0x00000001, 0x00010001),
+            (Intrinsic::ExtendAddSigned, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ExtendAdd, 0x80008000, 0x80008000, 0x80008000),
+            (Intrinsic::ExtendAddSigned, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExtendAdd, 0x0000ffff, 0x00000000, 0x0000ffff),
+            (Intrinsic::ExtendAddSigned, 0x00007fff, 0x00000000, 0x00007fff),
+            (Intrinsic::ExtendAdd, 0x00007fff, 0x00000000, 0x00007fff),
+        ];
+        for (op, a, b, want) in cases {
+            let got = eval_special(*op, &[*a, *b], 4);
+            assert_eq!(
+                got,
+                Some(*want),
+                "{:?} of {:#010x} and {:#010x}",
+                op,
+                a,
+                b
+            );
+        }
     }
 }

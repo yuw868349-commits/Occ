@@ -26,8 +26,10 @@ pub mod exec;
 pub mod ir;
 pub mod lift;
 pub mod render;
+pub mod reshape;
 pub mod ssa;
 pub mod struct_;
+pub mod wasm;
 
 use std::collections::HashMap;
 
@@ -94,6 +96,12 @@ pub fn decompile(
     if !is_liftable(image.arch) {
         return outline(func, name_of, image.arch);
     }
+    // WebAssembly is a stack machine whose control flow is structured, and
+    // the generic pipeline would have to re-derive what the module states.
+    // It has a path of its own.
+    if image.arch == occ_core::Arch::Wasm {
+        return wasm::decompile(image, func, opts, name_of);
+    }
     let program = build_program(image, func, opts, name_of);
     let dbg = opts.debug.as_ref();
     // The signature is the one the source declared, when debug info carries
@@ -146,7 +154,18 @@ pub fn decompile(
 /// One list, used by both the gate and the message that names what is
 /// missing: two copies of it drift, and a note that lists the wrong
 /// architectures is worse than no note.
-const LIFTABLE: &str = "x86-64, x86-32, ARM32, AArch64 and RISC-V";
+const LIFTABLE: &str = "x86-64, x86-32, ARM32, AArch64, RISC-V and WebAssembly";
+
+/// The architectures whose instructions lift into an executable program.
+///
+/// This is a shorter list than `LIFTABLE`, and the difference is not an
+/// oversight. WebAssembly is decompiled by walking its structured
+/// regions — `block`, `loop`, `if` — which yields a body, but a body is
+/// not the register-level program the symbolic executor explores: there
+/// is no register file to fork and no condition flags to read. The two
+/// lists are kept apart so that the message names the architectures that
+/// can actually be executed, rather than the ones that can be read.
+const EXECUTABLE: &str = "x86-64, x86-32, ARM32, AArch64 and RISC-V";
 
 /// The name the machine's general-purpose word has in the output.
 ///
@@ -198,6 +217,7 @@ pub fn is_liftable(arch: occ_core::Arch) -> bool {
             | occ_core::Arch::Aarch64
             | occ_core::Arch::RiscV32
             | occ_core::Arch::RiscV64
+            | occ_core::Arch::Wasm
     )
 }
 
@@ -379,7 +399,7 @@ pub fn build_program(
     let symbols = symbol_lookup(image);
     let Some(mut lifter) = lifter_for(image.arch, image.format, name_of, &symbols) else {
         notes.push(format!(
-            "lifting is implemented for {LIFTABLE}, this is {}",
+            "path exploration is implemented for {EXECUTABLE}, this is {}",
             image.arch.label()
         ));
         return Program {

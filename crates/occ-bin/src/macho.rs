@@ -495,6 +495,9 @@ fn parse_slice(data: &[u8], base: usize, path: &str, id: ImageId) -> Result<Imag
         interpreter: None,
         warnings,
         function_bounds,
+        arm_modes: Default::default(),
+        wasm_types: Default::default(),
+        wasm_funcs: Default::default(),
     })
 }
 

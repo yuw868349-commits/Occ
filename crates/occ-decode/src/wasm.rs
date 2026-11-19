@@ -14,7 +14,7 @@
 //! are signalled at the exact offset they occur rather than guessed at, because
 //! a wrong length would silently misalign every instruction after it.
 
-use occ_core::{Addr, CallTarget, FlowKind, Instruction, MAX_INSN_LEN};
+use occ_core::{Addr, CallTarget, FlowKind, Instruction, MAX_INSN_LEN, WasmFuncType};
 
 /// One decoded function body.
 pub struct Body {
@@ -24,6 +24,18 @@ pub struct Body {
     pub targets: Vec<(Addr, Vec<Addr>)>,
     /// Where decoding stopped and why, when it did.
     pub truncated: Option<(Addr, String)>,
+    /// The number of local variables the function declares.
+    ///
+    /// The declarations are not instructions, but they say how many slots
+    /// the function has, and a local that is read before it is written is
+    /// uninitialised only if there is a slot for it at all.
+    pub locals: u32,
+    /// The label each `br_table` names, one per case, with the default last.
+    ///
+    /// The order is the order of the cases, which is what makes a `br_table`
+    /// a switch: the index the instruction pops selects one of them. The
+    /// default comes last because the module writes it last.
+    pub br_tables: Vec<(Addr, Vec<u32>)>,
 }
 
 /// How an instruction's immediates are encoded.
@@ -183,6 +195,8 @@ struct Raw {
     call_target: Option<u64>,
     /// `br_table` frames, including the default.
     table_frames: Vec<usize>,
+    /// `br_table` label depths, one per case, with the default last.
+    table_labels: Vec<u32>,
     /// Offset of the `else`/`end` an `if` jumps to when false.
     if_false_frame: Option<usize>,
 }
@@ -191,8 +205,14 @@ struct Raw {
 ///
 /// `body` must be exactly the function body — the leading local declarations
 /// included — and `start` is its file offset, which is what every instruction
-/// address is measured from.
-pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>) -> Body {
+/// address is measured from. `types` is the module's type section, which is
+/// what says what a block with a type index takes and leaves.
+pub fn decode(
+    body: &[u8],
+    start: u64,
+    call_target: &dyn Fn(u32) -> Option<Addr>,
+    types: &[WasmFuncType],
+) -> Body {
     let mut raws: Vec<Raw> = Vec::new();
     let mut frames: Vec<Frame> = Vec::new();
     let mut stack: Vec<usize> = Vec::new();
@@ -201,13 +221,23 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
 
     // Local declarations: a count, then (count, type) pairs. They are not
     // instructions, but they are part of the body's byte range.
+    //
+    // The count of them is the number of slots the function has. The
+    // parameters come before the locals, so the number of slots is the
+    // number of parameters plus the number of local groups, each of
+    // which may declare more than one slot.
+    let mut locals = 0u32;
     match leb_u32(body, &mut pos) {
         Some(groups) => {
             for _ in 0..groups.min(1_000_000) {
-                if leb_u32(body, &mut pos).is_none() || body.get(pos).is_none() {
+                let Some(count) = leb_u32(body, &mut pos) else {
+                    break;
+                };
+                if body.get(pos).is_none() {
                     break;
                 }
                 pos += 1;
+                locals = locals.saturating_add(count);
             }
         }
         None => {
@@ -215,6 +245,8 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
                 insns: Vec::new(),
                 targets: Vec::new(),
                 truncated: Some((Addr(start), "local declarations are malformed".into())),
+                locals: 0,
+                br_tables: Vec::new(),
             };
         }
     }
@@ -268,6 +300,7 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
         let mut text = name.to_string();
         let mut branch_frame = None;
         let mut table_frames = Vec::new();
+        let mut table_labels: Vec<u32> = Vec::new();
         let mut call_target_at = None;
         let mut if_false_frame = None;
 
@@ -275,8 +308,9 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
             Imm::None => {}
             Imm::BlockType => {
                 let Some(bt) = block_type(body, &mut pos) else { break };
-                if bt != "void" {
-                    text.push_str(&format!(" (result {bt})"));
+                let suffix = bt.describe(types);
+                if !suffix.is_empty() {
+                    text.push_str(&suffix);
                 }
             }
             Imm::Label => {
@@ -307,12 +341,34 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
                 if !ok {
                     break;
                 }
-                text.push_str(&format!(" {} entr{}", depths.len(), if depths.len() == 1 { "y" } else { "ies" }));
-                for d in depths.iter().chain(std::iter::once(&default)) {
+                // The cases are named in the order the module writes them,
+                // and the default comes last: the index the instruction pops
+                // picks one of the cases, and the default is what it picks
+                // when the index is out of range. Printing them is what
+                // turns the instruction from "a branch somewhere" into a
+                // dispatch.
+                text.push_str(&format!(
+                    " {} entr{}",
+                    depths.len(),
+                    if depths.len() == 1 { "y" } else { "ies" }
+                ));
+                let mut labels = Vec::new();
+                for d in &depths {
+                    labels.push(d.to_string());
                     if let Some(f) = frame_at(&stack, *d) {
                         table_frames.push(f);
                     }
                 }
+                text.push_str(&format!(", labels {}", labels.join(" ")));
+                text.push_str(&format!(", default {default}"));
+                if let Some(f) = frame_at(&stack, default) {
+                    table_frames.push(f);
+                }
+                table_labels = depths
+                    .iter()
+                    .chain(std::iter::once(&default))
+                    .copied()
+                    .collect();
             }
             Imm::Func => {
                 let Some(index) = leb_u32(body, &mut pos) else { break };
@@ -431,6 +487,7 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
             branch_frame,
             call_target: call_target_at,
             table_frames,
+            table_labels,
             if_false_frame,
         });
     }
@@ -458,6 +515,7 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
 
     let mut insns = Vec::with_capacity(raws.len());
     let mut targets: Vec<(Addr, Vec<Addr>)> = Vec::new();
+    let mut br_tables: Vec<(Addr, Vec<u32>)> = Vec::new();
     for raw in &raws {
         let mut target = None;
         if let Some(f) = raw.branch_frame {
@@ -488,6 +546,9 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
             if let Some(to) = end_of(*f) {
                 listed.push(Addr(to));
             }
+        }
+        if !raw.table_labels.is_empty() {
+            br_tables.push((Addr(raw.offset), raw.table_labels.clone()));
         }
         if let Some(CallTarget::Direct { to }) = &target
             && raw.flow == FlowKind::ConditionalBranch
@@ -523,6 +584,8 @@ pub fn decode(body: &[u8], start: u64, call_target: &dyn Fn(u32) -> Option<Addr>
         insns,
         targets,
         truncated,
+        locals,
+        br_tables,
     }
 }
 
@@ -564,29 +627,101 @@ fn decode_fc(sub: u32, body: &[u8], pos: &mut usize) -> Option<&'static str> {
     Some(name)
 }
 
-fn block_type(body: &[u8], pos: &mut usize) -> Option<&'static str> {
+/// The type of a block: what it takes and what it leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockType {
+    /// Nothing in, nothing out.
+    Void,
+    /// One value of a named type.
+    One(&'static str),
+    /// A type index: a block with parameters and results.
+    Index(u32),
+}
+
+impl BlockType {
+    /// The type the instruction is printed with.
+    ///
+    /// The parameters and the results are named, because a block that takes
+    /// a value and gives one back says what that value is: a reader who
+    /// knows the block carries an `i32` across it knows that a `br` out of
+    /// it carries an `i32` with it.
+    fn describe(self, types: &[WasmFuncType]) -> String {
+        match self {
+            BlockType::Void => String::new(),
+            BlockType::One(name) => format!(" (result {name})"),
+            BlockType::Index(index) => match types.get(index as usize) {
+                Some(ty) => {
+                    let mut out = String::new();
+                    if !ty.params.is_empty() {
+                        out.push_str(" (param");
+                        for p in &ty.params {
+                            out.push(' ');
+                            out.push_str(p.name());
+                        }
+                    }
+                    if !ty.results.is_empty() {
+                        if out.is_empty() {
+                            out.push_str(" (result");
+                        } else {
+                            out.push_str(", result");
+                        }
+                        for r in &ty.results {
+                            out.push(' ');
+                            out.push_str(r.name());
+                        }
+                    }
+                    if !out.is_empty() {
+                        out.push(')');
+                    }
+                    out
+                }
+                // A type index the module does not declare is a module this
+                // parser could not read; saying so is better than guessing.
+                None => format!(" (type {index})"),
+            },
+        }
+    }
+}
+
+/// Read a block type.
+fn block_type(body: &[u8], pos: &mut usize) -> Option<BlockType> {
     let b = *body.get(*pos)?;
     // A negative byte is a value type or the empty 0x40; anything else starts a
     // signed 33-bit type index.
     if b == 0x40 {
         *pos += 1;
-        return Some("void");
+        return Some(BlockType::Void);
     }
-    let name = match b {
-        0x7f => "i32",
-        0x7e => "i64",
-        0x7d => "f32",
-        0x7c => "f64",
-        0x7b => "v128",
-        0x70 => "funcref",
-        0x6f => "externref",
-        _ => {
-            leb_i64(body, pos)?;
-            return Some("type index");
-        }
-    };
-    *pos += 1;
-    Some(name)
+    if b & 0x80 == 0 {
+        // A single byte below 0x80 is a value type, except for the ones that
+        // are not: 0x00 is the first type index and means a block with no
+        // parameters and no results.
+        let name = match b {
+            0x7f => "i32",
+            0x7e => "i64",
+            0x7d => "f32",
+            0x7c => "f64",
+            0x7b => "v128",
+            0x70 => "funcref",
+            0x6f => "externref",
+            _ => {
+                // A type index, read as a signed 33-bit number.
+                let index = leb_i64(body, pos)?;
+                if index < 0 {
+                    return None;
+                }
+                return Some(BlockType::Index(index as u32));
+            }
+        };
+        *pos += 1;
+        return Some(BlockType::One(name));
+    }
+    // A multi-byte signed number is a type index.
+    let index = leb_i64(body, pos)?;
+    if index < 0 {
+        return None;
+    }
+    Some(BlockType::Index(index as u32))
 }
 
 fn heap_name(byte: u8) -> &'static str {
@@ -655,7 +790,7 @@ mod tests {
     #[test]
     fn decodes_a_constant_body() {
         let body = [0x00, 0x41, 0x2a, 0x0b];
-        let out = decode(&body, 0x100, &no_calls);
+        let out = decode(&body, 0x100, &no_calls, &[]);
         assert_eq!(out.insns.len(), 2);
         assert_eq!(out.insns[0].text, "i32.const 42");
         assert_eq!(out.insns[0].addr, Addr(0x101));
@@ -669,7 +804,7 @@ mod tests {
     fn a_branch_resolves_to_the_instruction_after_the_end() {
         // block ; br 0 ; nop ; end ; nop ; end
         let body = [0x00, 0x02, 0x40, 0x0c, 0x00, 0x01, 0x0b, 0x01, 0x0b];
-        let out = decode(&body, 0, &no_calls);
+        let out = decode(&body, 0, &no_calls, &[]);
         let br = out.insns.iter().find(|i| i.mnemonic.as_ref() == "br").unwrap();
         assert_eq!(br.addr, Addr(3));
         match br.target.clone() {
@@ -683,7 +818,7 @@ mod tests {
     fn a_branch_to_a_loop_restarts_it() {
         // loop ; nop ; br 0 ; end ; end
         let body = [0x00, 0x03, 0x40, 0x01, 0x0c, 0x00, 0x0b, 0x0b];
-        let out = decode(&body, 0, &no_calls);
+        let out = decode(&body, 0, &no_calls, &[]);
         let br = out.insns.iter().find(|i| i.mnemonic.as_ref() == "br").unwrap();
         match br.target.clone() {
             Some(CallTarget::Direct { to }) => assert_eq!(to, Addr(3)),
@@ -695,7 +830,7 @@ mod tests {
     fn an_if_targets_the_instruction_after_else() {
         // if ; else ; nop ; end ; end
         let body = [0x00, 0x04, 0x40, 0x05, 0x01, 0x0b, 0x0b];
-        let out = decode(&body, 0, &no_calls);
+        let out = decode(&body, 0, &no_calls, &[]);
         let cond = &out.insns[0];
         assert_eq!(cond.mnemonic.as_ref(), "if");
         assert_eq!(cond.flow, FlowKind::ConditionalBranch);
@@ -708,7 +843,7 @@ mod tests {
     #[test]
     fn an_unknown_opcode_stops_the_body_and_says_where() {
         let body = [0x00, 0x41, 0x01, 0xfd, 0x00, 0x0b];
-        let out = decode(&body, 0x40, &no_calls);
+        let out = decode(&body, 0x40, &no_calls, &[]);
         assert_eq!(out.insns.len(), 1);
         let (at, why) = out.truncated.expect("truncation is reported");
         assert_eq!(at, Addr(0x43));
@@ -719,7 +854,7 @@ mod tests {
     fn a_truncated_body_never_panics() {
         let body = [0x00, 0x41, 0x2a, 0x0b];
         for cut in 0..body.len() {
-            let _ = decode(&body[..cut], 0, &no_calls);
+            let _ = decode(&body[..cut], 0, &no_calls, &[]);
         }
     }
 }

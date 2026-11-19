@@ -20,9 +20,9 @@ use crate::reader::Reader;
 use std::collections::HashMap;
 
 use occ_core::{
-    Addr, Arch, CoreError, Endian, Export, Fingerprint, Format, FunctionBound, Image, ImageId,
-    Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section, SectionKind,
-    Segment, Symbol, SymbolBinding, SymbolKind,
+    Addr, Arch, ArmMode, ArmModes, CoreError, Endian, Export, Fingerprint, Format, FunctionBound,
+    Image, ImageId, Import, ImportKind, Linkage, Perm, RelocKind, Relocation, Result, Section,
+    SectionKind, Segment, Symbol, SymbolBinding, SymbolKind,
 };
 
 // Section header types.
@@ -196,15 +196,37 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         })
         .collect();
 
-    let symbols = read_symbols(&r, &h, &shdrs, &names, data, object);
+    let mut symbols = read_symbols(&r, &h, &shdrs, &names, data, object);
+    let image_base = segments.iter().map(|s| s.addr.get()).min().unwrap_or(0);
+    let arch = map_machine(h.machine, h.bits);
+
+    // ARM is the one architecture whose instruction set changes inside a
+    // file, and the file says where with mapping symbols.  They have to be
+    // turned into the regions they describe before anything tries to decode
+    // the code.
+    //
+    // This runs before the symbol list is split into imports and exports,
+    // because the state of the program counter is in the low bit of a
+    // function's address and that bit is not part of the address.
+    let mut entry = Addr(h.entry);
+    let mut mapping: Vec<usize> = Vec::new();
+    let arm_modes = if arch == Arch::Arm {
+        arm_regions(&mut symbols, &mut entry, &mut mapping)
+    } else {
+        ArmModes::new()
+    };
+
     let (mut imports, exports) = split_dynamic(&symbols);
     let (relocations, debug_relocations) =
         read_relocations(&r, &h, &shdrs, &names, &symbols, data);
     bind_import_slots(&mut imports, &relocations);
+    // The relocation tables name their target by the index of the symbol in
+    // the table, so the mapping symbols have to stay until they have been
+    // read.  They are noise in a symbol list, and they are taken out here.
+    for index in mapping.into_iter().rev() {
+        symbols.remove(index);
+    }
     let needed = read_needed(&r, &shdrs, &names, data, &mut warnings);
-
-    let image_base = segments.iter().map(|s| s.addr.get()).min().unwrap_or(0);
-    let arch = map_machine(h.machine, h.bits);
 
     // `e_type` is the container's own answer to "how is this loaded", so it is
     // read here rather than re-derived later from section names. `ET_DYN` is
@@ -254,7 +276,7 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         arch,
         bits: h.bits,
         endian: h.endian,
-        entry: Addr(h.entry),
+        entry,
         image_base: Addr(image_base),
         file_size: data.len() as u64,
         sha256: crate::sha256::hex_digest(data),
@@ -269,6 +291,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         interpreter,
         warnings,
         function_bounds,
+        arm_modes,
+        wasm_types: Vec::new(),
+        wasm_funcs: Vec::new(),
     })
 }
 
@@ -722,6 +747,95 @@ fn bind_import_slots(imports: &mut [Import], relocs: &[Relocation]) {
 ///
 /// An undefined dynamic symbol is an import; a defined global in `.dynsym` is an
 /// export. `.symtab` entries are local detail and appear in neither list.
+/// The ARM instruction-set regions the file states, and the symbols that
+/// are mapping symbols.
+///
+/// ELF records the boundary between the two ARM instruction sets with local
+/// mapping symbols: `$a` for A32, `$t` for T32 and `$d` for data.  They are
+/// ordinary entries in the symbol table, so they have already been read; what
+/// is needed here is to turn them into the regions they describe and to say
+/// which entries of the symbol table they are, where they are noise.
+///
+/// The mapping symbols are *not* removed here.  A relocation table names its
+/// target by the index of the symbol in the table, so removing an entry
+/// moves every index after it and every relocation after it names the wrong
+/// symbol: a call to `add` ends up pointing at whatever follows it.  They
+/// are taken out once the relocation tables have been read.
+///
+/// A function symbol carries the state of the program counter in bit zero of
+/// its value: a Thumb function has it set, and the function's address is the
+/// value with that bit cleared.  A file that states no mapping symbols at
+/// all still says which set each of its functions is in, through that bit,
+/// and that is enough to read a stripped binary.
+fn arm_regions(
+    symbols: &mut [Symbol],
+    entry: &mut Addr,
+    mapping: &mut Vec<usize>,
+) -> ArmModes {
+    let mut modes = ArmModes::new();
+    let mut stated = false;
+
+    for (index, s) in symbols.iter().enumerate() {
+        if let Some(mode) = ArmMode::from_mapping_symbol(&s.name) {
+            modes.push(s.addr, mode);
+            stated = true;
+            mapping.push(index);
+        }
+    }
+
+    // A Thumb function's address has bit zero set, and that bit is the state
+    // of the program counter rather than part of the address.  The same is
+    // true of the entry point.
+    let mut functions: Vec<(Addr, bool)> = Vec::new();
+    for s in symbols.iter_mut() {
+        let thumb = s.kind == SymbolKind::Function && s.defined && s.addr.get() & 1 == 1;
+        if thumb {
+            s.addr = Addr(s.addr.get() & !1);
+        }
+        if s.kind == SymbolKind::Function && s.defined {
+            functions.push((s.addr, thumb));
+        }
+    }
+    let entry_thumb = entry.get() & 1 == 1;
+    if entry_thumb {
+        *entry = Addr(entry.get() & !1);
+    }
+
+    if stated {
+        // The mapping symbols are the file's own statement and they win.  A
+        // Thumb function whose address they do not cover is still a Thumb
+        // function, so its own statement is added where they are silent.
+        functions.sort_by_key(|(a, _)| a.get());
+        for (addr, thumb) in functions {
+            if !thumb {
+                continue;
+            }
+            match modes.mode_at(addr) {
+                Some(ArmMode::T32) | None => modes.push(addr, ArmMode::T32),
+                Some(_) => {}
+            }
+        }
+        if entry_thumb && modes.mode_at(*entry).is_none() {
+            modes.push(*entry, ArmMode::T32);
+        }
+        return modes;
+    }
+
+    // No mapping symbols: the state of the program counter in each
+    // function's own symbol is the only statement there is.  The regions
+    // run from one function to the next, which is right for the code and
+    // only approximate for whatever lies between two functions.
+    functions.sort_by_key(|(a, _)| a.get());
+    functions.dedup_by_key(|(a, _)| a.get());
+    for (addr, thumb) in functions {
+        modes.push(addr, if thumb { ArmMode::T32 } else { ArmMode::A32 });
+    }
+    if entry_thumb && modes.mode_at(*entry).is_none() {
+        modes.push(*entry, ArmMode::T32);
+    }
+    modes
+}
+
 fn split_dynamic(symbols: &[Symbol]) -> (Vec<Import>, Vec<Export>) {
     let mut imports = Vec::new();
     let mut exports = Vec::new();

@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use occ_core::{
-    Addr, Arch, BasicBlock, CallTarget, EdgeKind, Evidence, EvidenceKind, EvidenceSource,
+    Addr, Arch, ArmMode, BasicBlock, CallTarget, EdgeKind, Evidence, EvidenceKind, EvidenceSource,
     FlowKind, Function, Image, ImportKind, Instruction, RelocKind, SectionKind, Symbol,
     SymbolKind, Xref, XrefKind,
 };
@@ -31,6 +31,29 @@ use occ_decode::AnyDecoder;
 
 use crate::cfg::{BranchTargets, build_blocks_with_branch_targets};
 use crate::view::View;
+
+/// Decode one instruction at `pc`.
+///
+/// ARM is the one architecture whose instruction set changes inside a
+/// binary: a file can hold a function compiled as A32 beside one compiled
+/// as T32, and the file itself says where the change is.  The decoder is
+/// therefore chosen by the address rather than by the image, or half of a
+/// Thumb binary is read as ARM words that are not instructions.
+///
+/// An address the file marks as data holds no instruction, and the decoder
+/// says so by declining to produce one.
+fn decode_at(view: &View, dec: &AnyDecoder, pc: Addr, bytes: &[u8]) -> Option<occ_decode::Decoded> {
+    let AnyDecoder::Arm(_) = dec else {
+        return dec.decode(pc, bytes);
+    };
+    match view.image().arm_mode_at(pc).unwrap_or(ArmMode::A32) {
+        ArmMode::T32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Thumb)
+            .decode(pc, bytes),
+        ArmMode::A32 => occ_decode::arm::Decoder::with_mode(occ_decode::arm::Mode::Arm)
+            .decode(pc, bytes),
+        ArmMode::Data => None,
+    }
+}
 
 /// Limits and switches for recovery.
 #[derive(Clone, Debug)]
@@ -221,8 +244,10 @@ fn wasm_functions(view: &View, opts: &RecoverOptions, notes: &mut Vec<String>) -
     let image = view.image();
     let data = view.file();
     // Calls address functions by index, and the index space starts with the
-    // imported ones. The symbol table is in body order, so the k-th defined body
-    // is index `imported + k`.
+    // imported ones. The module states which index each body has, so that
+    // mapping is read from the module rather than inferred from the order
+    // the bodies happen to sit in: a code section whose bodies are not in
+    // index order would otherwise send every call to the wrong function.
     let imported = image
         .imports
         .iter()
@@ -235,8 +260,18 @@ fn wasm_functions(view: &View, opts: &RecoverOptions, notes: &mut Vec<String>) -
         .collect();
     bodies.sort_by_key(|s| s.addr.0);
     let mut by_index: HashMap<u32, Addr> = HashMap::new();
-    for (k, sym) in bodies.iter().enumerate() {
-        by_index.insert(imported + k as u32, sym.addr);
+    for (index, sig) in image.wasm_funcs.iter().enumerate() {
+        if let Some(body) = sig.body {
+            by_index.insert(index as u32, body);
+        }
+    }
+    if by_index.is_empty() {
+        // The module carried no signature table. Falling back to the order
+        // the bodies sit in is the best that can be done, and it is right
+        // for every module whose code section is in index order.
+        for (k, sym) in bodies.iter().enumerate() {
+            by_index.insert(imported + k as u32, sym.addr);
+        }
     }
     let call_target = |index: u32| by_index.get(&index).copied();
 
@@ -249,7 +284,7 @@ fn wasm_functions(view: &View, opts: &RecoverOptions, notes: &mut Vec<String>) -
             .zip(usize::try_from(end).ok())
             .and_then(|(a, b)| data.get(a..b));
         let Some(slice) = slice else { continue };
-        let body = occ_decode::wasm::decode(slice, start, &call_target);
+        let body = occ_decode::wasm::decode(slice, start, &call_target, &image.wasm_types);
         if body.insns.is_empty() {
             continue;
         }
@@ -459,6 +494,60 @@ struct Outcome {
     callees: Vec<Addr>,
 }
 
+/// The conditions an `it` block imposes on the instructions after it.
+///
+/// Thumb has no predicated instruction. The condition of a Thumb
+/// instruction lives in the `it` block that governs it, and the block
+/// governs the one to four instructions that follow it in address order.
+///
+/// The conditions have to be known *while* the body is being read. A
+/// conditional return inside one is a branch, and a branch that is read as
+/// a plain return ends the recovery there: the whole rest of the function
+/// was never decoded. The conditions are therefore applied to each
+/// instruction as it is decoded, not to the finished list afterwards.
+struct ItConditions {
+    /// The condition of each instruction the block governs, in order.
+    pending: Vec<&'static str>,
+    /// The address the next governed instruction has to be at.
+    ///
+    /// The architecture says the governed instructions are the ones that
+    /// follow the block, so a gap in the addresses ends the block: the
+    /// instructions after the gap are not among the ones it governs.
+    next: Addr,
+}
+
+impl ItConditions {
+    /// Read the conditions an `it` instruction imposes.
+    ///
+    /// The block's own condition governs the first instruction, and the
+    /// letters in its name say what the ones after it do: `itt` runs the
+    /// second under the same condition and `ite` runs it under the
+    /// opposite one.
+    fn from_it(text: &str, next: Addr) -> Option<ItConditions> {
+        let block = occ_decode::arm::it_block(text)?;
+        let mut pending = Vec::with_capacity(block.conditions.len() + 1);
+        pending.push(block.condition);
+        pending.extend_from_slice(&block.conditions);
+        Some(ItConditions { pending, next })
+    }
+
+    /// The condition the instruction at `addr` runs under, if it is one the
+    /// block governs.
+    ///
+    /// The condition is consumed when it is given out: each instruction of
+    /// the block has its own, and one that runs under the block's
+    /// condition and the next that runs under the opposite one are
+    /// different arms of the same choice.
+    fn take(&mut self, addr: Addr) -> Option<&'static str> {
+        if self.next.0 != addr.0 {
+            return None;
+        }
+        let condition = self.pending.first().copied()?;
+        self.pending.remove(0);
+        Some(condition)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_function(
     view: &View,
@@ -477,6 +566,15 @@ fn decode_function(
     let mut visited: HashSet<u64> = HashSet::new();
     let mut callees: Vec<Addr> = Vec::new();
     let mut budget = opts.max_insns.min(200_000);
+    // The conditions of the `it` block whose instructions are being read.
+    //
+    // The block is Thumb's only way of saying "this happens on one path",
+    // and the path it names is decided by a condition that is not on the
+    // instruction itself. The condition has to be in the instruction's own
+    // name before its flow is read, because a conditional return is a
+    // branch: read as a plain return it ends the function there, and the
+    // body after it is never decoded.
+    let mut it: Option<ItConditions> = None;
 
     work.push_back(entry);
     while let Some(start) = work.pop_front() {
@@ -500,20 +598,43 @@ fn decode_function(
             let Some(bytes) = view.bytes_to_end(pc) else {
                 break;
             };
-            let Some(decoded) = dec.decode(pc, bytes) else {
+            let Some(decoded) = decode_at(view, dec, pc, bytes) else {
                 break;
             };
-            let insn = decoded.insn;
+            let mut insn = decoded.insn;
             let end = insn.end();
             if end.0 > limit.0 {
                 break;
             }
             budget -= 1;
+            // An `it` block is read before the condition is applied, so that
+            // the block is recognised even when the block itself is the
+            // instruction a previous block governs.
+            let block = ItConditions::from_it(&insn.text, end);
+            // A block that is broken by a gap governs nothing after the
+            // gap: the instructions there are not among the ones it names.
+            if it.as_ref().is_some_and(|c| c.next.0 != pc.0) {
+                it = None;
+            }
+            if let Some(block) = it.as_mut()
+                && let Some(condition) = block.take(pc)
+            {
+                occ_decode::arm::apply_condition(&mut insn, condition);
+                // The next governed instruction is the one that follows
+                // this one, and how far that is depends on how this one is
+                // encoded.
+                block.next = insn.end();
+            }
             let flow = insn.flow;
             let target = insn.target.clone();
             let undecoded = insn.mnemonic.starts_with('.');
             insns.insert(pc.0, insn);
             pc = end;
+            // A block that has just been read governs the instructions
+            // that follow it.
+            if let Some(block) = block {
+                it = Some(block);
+            }
 
             if undecoded {
                 // A byte the decoder could not classify is skipped, not treated
@@ -608,6 +729,12 @@ fn decode_function(
     let mut list: Vec<Instruction> = insns.into_values().collect();
     list.sort_by_key(|i| i.addr.0);
     resolve_addresses(view, dec, &mut list);
+    // The conditions of an `it` block were written into the instructions as
+    // they were read, because a conditional return inside one is a branch
+    // and a branch that is read as a return ends the function there. This
+    // pass is the safety net for the one case the reading cannot see: a
+    // block whose governed instruction was read in a different walk.
+    occ_decode::arm::apply_it_conditions(&mut list);
 
     let mut func = Function::new(entry);
     func.blocks = build_blocks_with_branch_targets(&list, entry, &case_targets);
@@ -634,7 +761,7 @@ fn decode_function(
 }
 
 /// Make every function's body and range exclusive.
-///
+//////
 /// A decode can jump over an already-known body to a block laid out beyond it,
 /// and the bytes in between belong to that other function. Leaving them in this
 /// body makes two functions claim one address: one of them then reports a size
@@ -725,7 +852,7 @@ fn fill_holes(
                 let Some(bytes) = view.bytes_to_end(pc) else {
                     break;
                 };
-                let Some(decoded) = dec.decode(pc, bytes) else {
+                let Some(decoded) = decode_at(view, dec, pc, bytes) else {
                     break;
                 };
                 let insn = decoded.insn;
@@ -1006,7 +1133,7 @@ fn find_thunks(view: &View, dec: &AnyDecoder) -> Vec<(Addr, String)> {
             let mut pc = addr;
             let mut rest = bytes;
             for _ in 0..4 {
-                let Some(d) = dec.decode(pc, rest) else { break };
+                let Some(d) = decode_at(view, dec, pc, rest) else { break };
                 let mut hit = None;
                 for m in d.insn.mem_reads.iter() {
                     if let Some(imp) = image.import_by_slot(*m) {

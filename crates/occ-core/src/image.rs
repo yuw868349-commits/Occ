@@ -615,6 +615,102 @@ impl Fingerprint {
     }
 }
 
+/// The ARM instruction set in force over a range of addresses.
+///
+/// ARM is the one architecture here whose instruction set changes inside a
+/// binary.  A file can hold a function compiled as A32 beside one compiled
+/// as T32, and the linker will not object: the two are told apart by the
+/// state of the program counter, which is bit zero of the address the
+/// linker writes into the relocation.
+///
+/// The change is recorded in the file by *mapping symbols* — `$a` for A32,
+/// `$t` for T32 and `$d` for data — and those are the only place the fact
+/// appears.  Without them a Thumb binary decodes as ARM words that are not
+/// instructions at all, and the listing looks plausible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArmMode {
+    /// A32, the four-byte instruction set.
+    A32,
+    /// T32, the one- and two-byte instruction set.
+    T32,
+    /// Not code. A literal pool or a table, where no instruction begins.
+    Data,
+}
+
+impl ArmMode {
+    /// The mapping symbol that states this mode.
+    pub const fn mapping_symbol(self) -> &'static str {
+        match self {
+            ArmMode::A32 => "$a",
+            ArmMode::T32 => "$t",
+            ArmMode::Data => "$d",
+        }
+    }
+
+    /// The mode a mapping symbol names.
+    pub fn from_mapping_symbol(name: &str) -> Option<Self> {
+        match name {
+            "$a" => Some(ArmMode::A32),
+            "$t" => Some(ArmMode::T32),
+            "$d" => Some(ArmMode::Data),
+            _ => None,
+        }
+    }
+}
+
+/// Where each ARM instruction set begins.
+///
+/// The regions are in address order and each runs to the next one, which is
+/// what a mapping symbol means: it states the set at its own address and
+/// leaves the set alone until the next one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArmModes {
+    regions: Vec<(Addr, ArmMode)>,
+}
+
+impl ArmModes {
+    /// An empty set of regions.
+    pub const fn new() -> Self {
+        ArmModes { regions: Vec::new() }
+    }
+
+    /// Record that `mode` begins at `addr`.
+    ///
+    /// The regions are kept in address order, so a region inserted out of
+    /// order still ends up where it belongs.
+    pub fn push(&mut self, addr: Addr, mode: ArmMode) {
+        let at = self
+            .regions
+            .partition_point(|&(a, _)| a < addr);
+        self.regions.insert(at, (addr, mode));
+    }
+
+    /// The instruction set in force at `addr`.
+    ///
+    /// `None` when the image states nothing about the address: either it
+    /// has no mapping symbols at all, or the address falls before the first
+    /// of them.  The caller then has to choose, and the safe choice for an
+    /// image that says nothing is A32.
+    pub fn mode_at(&self, addr: Addr) -> Option<ArmMode> {
+        let i = self.regions.partition_point(|&(a, _)| a <= addr);
+        if i == 0 {
+            None
+        } else {
+            Some(self.regions[i - 1].1)
+        }
+    }
+
+    /// True when nothing is known about the instruction set.
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+
+    /// The regions, in address order.
+    pub fn regions(&self) -> &[(Addr, ArmMode)] {
+        &self.regions
+    }
+}
+
 /// A loaded binary's metadata.
 #[derive(Debug, Clone)]
 pub struct Image {
@@ -673,6 +769,120 @@ pub struct Image {
     /// have dropped. These are facts, not heuristics: recovery uses them as
     /// seeds and treats their ranges as exact.
     pub function_bounds: Vec<FunctionBound>,
+    /// The ARM instruction set in force at each address.
+    ///
+    /// Empty for every other architecture, and for an ARM binary that states
+    /// no mapping symbols — in which case the image is A32 throughout, which
+    /// is what the absence of them means.
+    pub arm_modes: ArmModes,
+    /// The function types a WebAssembly module declares, by type index.
+    ///
+    /// A type index names an entry of the module's type section, and every
+    /// function names one of them. The list is empty for every other format.
+    pub wasm_types: Vec<WasmFuncType>,
+    /// The signature of each WebAssembly function, by function index.
+    ///
+    /// The index space holds the imported functions first and the defined
+    /// ones after, which is the order a `call` names them in. A function's
+    /// parameters are its first local variables, so the number of them says
+    /// how many slots the body has before the ones it declares, and how many
+    /// values a call to it takes off the stack.
+    ///
+    /// The list is empty for every other format.
+    pub wasm_funcs: Vec<WasmFuncSig>,
+}
+
+/// A WebAssembly value type.
+///
+/// The module writes these as single bytes; naming them here is what lets a
+/// decompiled signature say `i32` rather than "a number".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum WasmValueType {
+    /// A thirty-two bit integer.
+    I32,
+    /// A sixty-four bit integer.
+    I64,
+    /// A thirty-two bit float.
+    F32,
+    /// A sixty-four bit float.
+    F64,
+    /// A 128-bit vector.
+    V128,
+    /// A reference to a function.
+    FuncRef,
+    /// A reference to something outside the module.
+    ExternRef,
+}
+
+impl WasmValueType {
+    /// The type's name, as the module writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            WasmValueType::I32 => "i32",
+            WasmValueType::I64 => "i64",
+            WasmValueType::F32 => "f32",
+            WasmValueType::F64 => "f64",
+            WasmValueType::V128 => "v128",
+            WasmValueType::FuncRef => "funcref",
+            WasmValueType::ExternRef => "externref",
+        }
+    }
+
+    /// The width of the type in bytes, for the ones that have one.
+    ///
+    /// A reference has no width the arithmetic could use, and a vector has
+    /// sixteen bytes that no scalar expression can hold, so both report zero.
+    pub fn width(self) -> u8 {
+        match self {
+            WasmValueType::I32 | WasmValueType::F32 => 4,
+            WasmValueType::I64 | WasmValueType::F64 => 8,
+            WasmValueType::V128 => 16,
+            WasmValueType::FuncRef | WasmValueType::ExternRef => 0,
+        }
+    }
+
+    /// True when the type holds a floating point number.
+    pub fn is_float(self) -> bool {
+        matches!(self, WasmValueType::F32 | WasmValueType::F64)
+    }
+
+    /// The type a byte of the module's encoding stands for.
+    pub fn from_byte(byte: u8) -> Option<WasmValueType> {
+        Some(match byte {
+            0x7f => WasmValueType::I32,
+            0x7e => WasmValueType::I64,
+            0x7d => WasmValueType::F32,
+            0x7c => WasmValueType::F64,
+            0x7b => WasmValueType::V128,
+            0x70 => WasmValueType::FuncRef,
+            0x6f => WasmValueType::ExternRef,
+            _ => return None,
+        })
+    }
+}
+
+/// The type of a WebAssembly function: its parameters and its results.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WasmFuncType {
+    /// The parameter types, in order.
+    pub params: Vec<WasmValueType>,
+    /// The result types, in order.
+    pub results: Vec<WasmValueType>,
+}
+
+/// The signature of one WebAssembly function.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WasmFuncSig {
+    /// Index of the function's type in the module's type section.
+    pub type_index: u32,
+    /// How many parameters the function takes.
+    pub params: u32,
+    /// How many results it returns.
+    pub results: u32,
+    /// Offset of the function's body, when the module defines it.
+    ///
+    /// An imported function has no body here: it lives in another module.
+    pub body: Option<Addr>,
 }
 
 /// One function extent the container states.
@@ -690,6 +900,14 @@ impl Image {
     /// Total virtual size covered by segments.
     pub fn mapped_size(&self) -> u64 {
         self.segments.iter().map(|s| s.size).sum()
+    }
+
+    /// The ARM instruction set in force at `addr`.
+    ///
+    /// `None` when the image states nothing about the address. See
+    /// [`Self::arm_modes`].
+    pub fn arm_mode_at(&self, addr: Addr) -> Option<ArmMode> {
+        self.arm_modes.mode_at(addr)
     }
 
     /// Section containing `addr`, if any.
@@ -853,6 +1071,9 @@ mod tests {
             interpreter: Some("/lib64/ld-linux-x86-64.so.2".into()),
             warnings: Vec::new(),
             function_bounds: Vec::new(),
+            arm_modes: Default::default(),
+            wasm_types: Vec::new(),
+            wasm_funcs: Vec::new(),
         }
     }
 

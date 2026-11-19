@@ -16,6 +16,7 @@
 use occ_core::{
     Addr, Arch, Endian, Export, Fingerprint, Format, Image, ImageId, Import, ImportKind, Linkage,
     Perm, Result, Section, SectionKind, Symbol, SymbolBinding, SymbolKind, CoreError,
+    WasmFuncSig, WasmFuncType, WasmValueType,
 };
 use std::collections::HashMap;
 
@@ -46,6 +47,12 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
     let mut data_segments = 0u32;
     let mut memories = 0u32;
     let mut warnings = Vec::new();
+    // The type section: one entry per function type, by type index.
+    let mut func_types: Vec<WasmFuncType> = Vec::new();
+    // The type index of every imported function, in import order.
+    let mut imported_func_types: Vec<u32> = Vec::new();
+    // The type index of every defined function, in definition order.
+    let mut defined_func_types: Vec<u32> = Vec::new();
 
     let mut pos = 8usize;
     while pos < data.len() {
@@ -98,6 +105,34 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                     parse_name_section(data, &mut p, body_end, &mut names);
                 }
             }
+            1 => {
+                // The type section: one entry per function type, each of
+                // them a form, a vector of parameter types and a vector of
+                // result types. The types say what a call's arguments are
+                // and what the body leaves on the stack, so they are kept
+                // rather than counted.
+                if let Some(count) = leb_u32(data, &mut p) {
+                    for _ in 0..count.min(1_000_000) {
+                        let Some(form) = data.get(p).copied() else { break };
+                        p += 1;
+                        if form != 0x60 {
+                            // Not a function type. The rest of the section
+                            // cannot be read without knowing how long this
+                            // one is, so the section stops here.
+                            break;
+                        }
+                        let Some(param_count) = leb_u32(data, &mut p) else { break };
+                        let Some(params) = value_types(data, &mut p, param_count) else {
+                            break;
+                        };
+                        let Some(result_count) = leb_u32(data, &mut p) else { break };
+                        let Some(results) = value_types(data, &mut p, result_count) else {
+                            break;
+                        };
+                        func_types.push(WasmFuncType { params, results });
+                    }
+                }
+            }
             2 => {
                 if let Some(count) = leb_u32(data, &mut p) {
                     for _ in 0..count.min(100_000) {
@@ -109,8 +144,9 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                         p += 1;
                         let imported_kind = match kind {
                             0 => {
-                                let Some(_type_idx) = leb_u32(data, &mut p) else { break };
+                                let Some(type_idx) = leb_u32(data, &mut p) else { break };
                                 imported_funcs += 1;
+                                imported_func_types.push(type_idx);
                                 ImportKind::Normal
                             }
                             1 => ImportKind::Data,
@@ -133,8 +169,16 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
                 }
             }
             3 => {
+                // The function section: one type index per defined function,
+                // in definition order. It is what says which type each
+                // function has, and the type is what says how many
+                // parameters it takes.
                 if let Some(count) = leb_u32(data, &mut p) {
                     defined_funcs = count;
+                    for _ in 0..count.min(1_000_000) {
+                        let Some(type_idx) = leb_u32(data, &mut p) else { break };
+                        defined_func_types.push(type_idx);
+                    }
                 }
             }
             5 => {
@@ -230,6 +274,21 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         memories
     ));
 
+    // The signature of every function, by function index: the imported ones
+    // first, then the defined ones. This is the index space a `call`
+    // names, so it is also what tells a call site how many arguments the
+    // callee takes.
+    let mut wasm_funcs: Vec<WasmFuncSig> = Vec::with_capacity(
+        imported_func_types.len() + defined_func_types.len(),
+    );
+    for type_index in &imported_func_types {
+        wasm_funcs.push(signature_of(*type_index, &func_types, None));
+    }
+    for (i, type_index) in defined_func_types.iter().enumerate() {
+        let body = bodies.get(i).map(|(_, offset, _)| Addr(*offset));
+        wasm_funcs.push(signature_of(*type_index, &func_types, body));
+    }
+
     let mut fp = Fingerprint::unknown(id);
     fp.linkage = if imported_funcs > 0 {
         Linkage::Shared
@@ -260,7 +319,45 @@ pub fn parse(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         interpreter: None,
         warnings,
         function_bounds: Vec::new(),
+        arm_modes: Default::default(),
+        wasm_types: func_types,
+        wasm_funcs,
     })
+}
+
+/// The signature of a function whose type index is known.
+///
+/// A type index that names nothing is a module this parser could not read;
+/// the counts fall back to zero rather than to a guess.
+fn signature_of(
+    type_index: u32,
+    types: &[WasmFuncType],
+    body: Option<Addr>,
+) -> WasmFuncSig {
+    let ty = types.get(type_index as usize);
+    WasmFuncSig {
+        type_index,
+        params: ty.map(|t| t.params.len() as u32).unwrap_or(0),
+        results: ty.map(|t| t.results.len() as u32).unwrap_or(0),
+        body,
+    }
+}
+
+/// Read a vector of value types.
+fn value_types(
+    data: &[u8],
+    pos: &mut usize,
+    count: u32,
+) -> Option<Vec<WasmValueType>> {
+    let mut out = Vec::with_capacity(count.min(1024) as usize);
+    for _ in 0..count.min(1_000_000) {
+        let byte = *data.get(*pos)?;
+        *pos += 1;
+        // A type this parser does not know is kept as a reference rather than
+        // dropped: dropping it would shift every type after it.
+        out.push(WasmValueType::from_byte(byte).unwrap_or(WasmValueType::ExternRef));
+    }
+    Some(out)
 }
 
 fn section_name(id: u8) -> &'static str {

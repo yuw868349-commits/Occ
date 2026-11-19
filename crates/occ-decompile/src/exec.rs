@@ -33,7 +33,8 @@
 use std::collections::BTreeMap;
 
 use crate::ir::{
-    BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, Term, UnOp, mask,
+    BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, Term, UnOp,
+    eval_special, mask,
 };
 
 /// Why evaluation stopped.
@@ -344,6 +345,18 @@ impl Machine {
                     u64::from(v.trailing_zeros().min(width))
                 }
             }
+            Intrinsic::Popcnt => {
+                u64::from((vals.first().copied().unwrap_or(0) & m).count_ones())
+            }
+            Intrinsic::CopySign => {
+                // The magnitude of the first operand with the sign of the
+                // second: every bit but the top one comes from the first,
+                // and the top one from the second.
+                let top = 1u64 << (width.saturating_sub(1));
+                let magnitude = vals.first().copied().unwrap_or(0) & m;
+                let sign = vals.get(1).copied().unwrap_or(0) & top;
+                (magnitude & !top) | sign
+            }
             Intrinsic::Bsr | Intrinsic::Lzcnt => {
                 let v = vals.first().copied().unwrap_or(0) & m;
                 if op == Intrinsic::Bsr && v == 0 {
@@ -499,6 +512,48 @@ impl Machine {
                     Intrinsic::DivRem | Intrinsic::IDivRem => (r as u64) & m,
                     _ => (q as u64) & m,
                 }
+            }
+            Intrinsic::RevBytes
+            | Intrinsic::RevHalves
+            | Intrinsic::RevHalvesSigned
+            | Intrinsic::RevBits
+            | Intrinsic::Select
+            | Intrinsic::Crc32
+            | Intrinsic::Crc32c
+            | Intrinsic::SatAdd
+            | Intrinsic::SatSub
+            | Intrinsic::ExtendAdd
+            | Intrinsic::ExtendAddSigned
+            | Intrinsic::ParallelAdd
+            | Intrinsic::ParallelSub
+            | Intrinsic::ParallelAddSat
+            | Intrinsic::ParallelSubSat
+            | Intrinsic::ParallelAddHalf
+            | Intrinsic::ParallelSubHalf
+            | Intrinsic::ParallelAddUns
+            | Intrinsic::ParallelSubUns
+            | Intrinsic::ParallelAddSatUns
+            | Intrinsic::ParallelSubSatUns
+            | Intrinsic::ParallelAddHalfUns
+            | Intrinsic::ParallelSubHalfUns
+            | Intrinsic::ExchangeAdd
+            | Intrinsic::ExchangeSub
+            | Intrinsic::ExchangeAddSat
+            | Intrinsic::ExchangeSubSat
+            | Intrinsic::ExchangeAddHalf
+            | Intrinsic::ExchangeSubHalf
+            | Intrinsic::ExchangeAddUns
+            | Intrinsic::ExchangeSubUns
+            | Intrinsic::ExchangeAddSatUns
+            | Intrinsic::ExchangeSubSatUns
+            | Intrinsic::ExchangeAddHalfUns
+            | Intrinsic::ExchangeSubHalfUns => {
+                // The operations that work on parts of a word are written
+                // once, in the module that owns the semantics, so that the
+                // interpreter and the folder cannot disagree about them.
+                eval_special(op, &vals, bits).ok_or_else(|| {
+                    Fault::Unsupported(format!("{} could not be evaluated", op.name()))
+                })?
             }
         };
         Ok(r)
@@ -706,7 +761,8 @@ fn bin(op: BinOp, a: u64, b: u64, bits: u8) -> Result<u64, Fault> {
         BinOp::FAdd | BinOp::FSub | BinOp::FMul | BinOp::FDiv | BinOp::FMin | BinOp::FMax
         | BinOp::FEq | BinOp::FNe | BinOp::FLt | BinOp::FLe | BinOp::FGt | BinOp::FGe
         | BinOp::FUnordered | BinOp::I2F32 | BinOp::I2F64 | BinOp::F2I32 | BinOp::F2I64
-        | BinOp::F2F32 | BinOp::F2F64 | BinOp::FSqrt | BinOp::I2F80 | BinOp::FNeg | BinOp::FAbs => {
+        | BinOp::F2F32 | BinOp::F2F64 | BinOp::FSqrt | BinOp::I2F80 | BinOp::FNeg | BinOp::FAbs
+        | BinOp::F2U32 | BinOp::F2U64 | BinOp::FCeil | BinOp::FFloor | BinOp::FRound => {
             return float(op, a, b, bits);
         }
     };
@@ -789,6 +845,9 @@ fn float(op: BinOp, a: u64, b: u64, bits: u8) -> Result<u64, Fault> {
         BinOp::FSqrt => pack(fa.sqrt()),
         BinOp::FNeg => pack(-fa),
         BinOp::FAbs => pack(fa.abs()),
+        BinOp::FCeil => pack(fa.ceil()),
+        BinOp::FFloor => pack(fa.floor()),
+        BinOp::FRound => pack(fa.round_ties_even()),
         BinOp::FEq => u64::from(fa == fb),
         BinOp::FNe => u64::from(fa != fb),
         BinOp::FLt => u64::from(fa < fb),
@@ -804,6 +863,8 @@ fn float(op: BinOp, a: u64, b: u64, bits: u8) -> Result<u64, Fault> {
             (v as u64) & 0xffff_ffff
         }
         BinOp::F2I64 => fa as i64 as u64,
+        BinOp::F2U32 => (fa as u64 as u32) as u64,
+        BinOp::F2U64 => fa as u64,
         BinOp::F2F32 => u64::from((fa as f32).to_bits()),
         BinOp::F2F64 => fa.to_bits(),
         _ => return Err(Fault::Unsupported(format!("float op {op:?}"))),

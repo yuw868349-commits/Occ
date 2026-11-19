@@ -446,10 +446,15 @@ fn fold_float(op: BinOp, a: u64, b: u64, bytes: u8) -> Option<u64> {
                 BinOp::I2F64 => (sign_extend(a, bytes) as f64).to_bits(),
                 BinOp::F2I32 => u64::from((x as i32) as u32),
                 BinOp::F2I64 => (x as i64) as u64,
+                BinOp::F2U32 => u64::from(x as u32),
+                BinOp::F2U64 => x as u64,
                 BinOp::F2F32 => u64::from(x.to_bits()),
                 BinOp::F2F64 => (x as f64).to_bits(),
                 BinOp::FNeg => u64::from((-x).to_bits()),
                 BinOp::FAbs => u64::from(x.abs().to_bits()),
+                BinOp::FCeil => u64::from(x.ceil().to_bits()),
+                BinOp::FFloor => u64::from(x.floor().to_bits()),
+                BinOp::FRound => u64::from(x.round_ties_even().to_bits()),
                 // An 80-bit value does not fit a machine word.
                 _ => return None,
             })
@@ -483,10 +488,15 @@ fn fold_float(op: BinOp, a: u64, b: u64, bytes: u8) -> Option<u64> {
                 BinOp::I2F64 => (sign_extend(a, bytes) as f64).to_bits(),
                 BinOp::F2I32 => u64::from((x as i32) as u32),
                 BinOp::F2I64 => (x as i64) as u64,
+                BinOp::F2U32 => u64::from(x as u32),
+                BinOp::F2U64 => x as u64,
                 BinOp::F2F32 => u64::from((x as f32).to_bits()),
                 BinOp::F2F64 => x.to_bits(),
                 BinOp::FNeg => (-x).to_bits(),
                 BinOp::FAbs => x.abs().to_bits(),
+                BinOp::FCeil => x.ceil().to_bits(),
+                BinOp::FFloor => x.floor().to_bits(),
+                BinOp::FRound => x.round_ties_even().to_bits(),
                 // An 80-bit value does not fit a machine word.
                 _ => return None,
             })

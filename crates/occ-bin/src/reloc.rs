@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 
-use occ_core::{Arch, Endian, Image, Linkage, Relocation};
+use occ_core::{Addr, Arch, ArmMode, Endian, Image, Linkage, Relocation};
 
 /// What applying relocations did.
 #[derive(Debug, Default, Clone)]
@@ -123,7 +123,18 @@ pub fn apply(data: &mut [u8], image: &Image) -> Option<Applied> {
             }
         };
 
-        let outcome = patch_one(data, image.arch, r, place, off, value, endian, &mut pcrel_hi);
+        let thumb = image.arm_mode_at(Addr(place)) == Some(ArmMode::T32);
+        let outcome = patch_one(
+            data,
+            image.arch,
+            r,
+            place,
+            off,
+            value,
+            endian,
+            &mut pcrel_hi,
+            thumb,
+        );
         match outcome {
             Outcome::Patched => report.applied += 1,
             Outcome::Deferred => {
@@ -185,7 +196,18 @@ pub fn apply(data: &mut [u8], image: &Image) -> Option<Applied> {
             Some(a) => debug_section_offset(image, a.0).unwrap_or(value),
             None => value,
         };
-        match patch_one(data, image.arch, r, place, off, value, endian, &mut pcrel_hi) {
+        let thumb = image.arm_mode_at(Addr(place)) == Some(ArmMode::T32);
+        match patch_one(
+            data,
+            image.arch,
+            r,
+            place,
+            off,
+            value,
+            endian,
+            &mut pcrel_hi,
+            thumb,
+        ) {
             Outcome::Patched => report.debug_applied += 1,
             Outcome::Deferred => {
                 report.deferred += 1;
@@ -298,6 +320,7 @@ fn patch_one(
     value: u64,
     endian: Endian,
     pcrel_hi: &mut HashMap<u64, i64>,
+    thumb: bool,
 ) -> Outcome {
     // `SHT_REL` keeps the addend in the bytes being relocated. Each encoder
     // below knows how wide its addend is; until it reads it, assume zero and
@@ -306,7 +329,16 @@ fn patch_one(
     match arch {
         Arch::X86_64 => patch_x86_64(data, r.raw_type, place, off, value, addend, endian),
         Arch::X86 => patch_x86(data, r.raw_type, place, off, value, addend, endian),
-        Arch::Arm => patch_arm(data, r.raw_type, place, off, value, addend, endian),
+        Arch::Arm => patch_arm(
+            data,
+            r.raw_type,
+            place,
+            off,
+            value,
+            addend,
+            endian,
+            thumb,
+        ),
         Arch::Aarch64 => patch_aarch64(data, r.raw_type, place, off, value, addend, endian),
         Arch::RiscV32 | Arch::RiscV64 => patch_riscv(
             data, r, place, off, value, addend, endian, pcrel_hi,
@@ -505,6 +537,7 @@ fn patch_x86(
 /// assembler writes that `-8` into the displacement field, so reading the
 /// field back as an unsigned number and adding it puts every branch eight
 /// bytes past where it belongs — or, for a call, four gigabytes away.
+#[allow(clippy::too_many_arguments)]
 fn patch_arm(
     data: &mut [u8],
     raw: u32,
@@ -513,6 +546,7 @@ fn patch_arm(
     value: u64,
     addend: i64,
     endian: Endian,
+    thumb: bool,
 ) -> Outcome {
     match raw {
         // R_ARM_ABS32: an absolute pointer, which is what a literal pool and
@@ -576,17 +610,26 @@ fn patch_arm(
                 Outcome::Deferred
             }
         }
-        // R_ARM_MOVW_ABS_NC / R_ARM_MOVT_ABS and their PC-relative forms.
-        43..=46 => {
+        // R_ARM_MOVW_ABS_NC / R_ARM_MOVT_ABS and their PC-relative forms,
+        // and the four Thumb spellings of the same four.
+        43..=50 => {
             let v = match raw {
-                45 | 46 => delta(value, addend, place) as u64,
+                45 | 46 | 49 | 50 => delta(value, addend, place) as u64,
                 _ => value.wrapping_add(addend as u64),
             };
-            let imm16 = if raw == 43 || raw == 45 {
+            let imm16 = if matches!(raw, 43 | 45 | 47 | 49) {
                 v as u16
             } else {
                 (v >> 16) as u16
             };
+            // The Thumb spellings are 47 to 50, and they are the only ones
+            // that reach a Thumb instruction.  A file that states the
+            // instruction set of the region says the same thing, and the
+            // two are used together: a Thumb file that names the A32
+            // spelling is still a Thumb file.
+            if thumb || matches!(raw, 47..=50) {
+                return patch_thumb_mov_imm(data, off, imm16, endian);
+            }
             let Some(word) = get_u32(data, off, endian) else {
                 return Outcome::Deferred;
             };
@@ -615,6 +658,48 @@ fn bits32(w: u32, hi: u32, lo: u32) -> u32 {
 fn sext_arm(v: u32, n: u32) -> i64 {
     let shift = 64 - n;
     ((v as i64) << shift) >> shift
+}
+
+/// Patch a Thumb `movw` or `movt`.
+///
+/// The two instruction sets spell the same relocation the same way and put
+/// the immediate in different places.  A32 keeps it in one word: the top
+/// four bits at 19:16 and the low twelve at 11:0.  T32 splits the word in
+/// two halfwords, and the immediate is in four pieces — the top four bits
+/// at 3:0 of the first halfword, the next bit at 10, and the low eleven
+/// split between the two halves of the second.
+///
+/// The halfword that says which of the two it is — `movw` or `movt` — is
+/// bit 7 of the first halfword, and it is left alone: the relocation says
+/// which half of the address to write, and the instruction says which
+/// half of the register to write it into.
+fn patch_thumb_mov_imm(
+    data: &mut [u8],
+    off: usize,
+    imm16: u16,
+    endian: Endian,
+) -> Outcome {
+    let Some(mut hw1) = get_u16(data, off, endian) else {
+        return Outcome::Deferred;
+    };
+    let Some(mut hw2) = get_u16(data, off + 2, endian) else {
+        return Outcome::Deferred;
+    };
+    let imm16 = u32::from(imm16);
+    // The top four bits, the next bit, the next three and the low eight.
+    let imm4 = ((imm16 >> 12) & 0xf) as u16;
+    let i = ((imm16 >> 11) & 1) as u16;
+    let imm3 = ((imm16 >> 8) & 0x7) as u16;
+    let imm8 = (imm16 & 0xff) as u16;
+    // The opcode, the register and the half that says which half of the
+    // address this is stay where they are.
+    hw1 = (hw1 & 0xfbf0) | (i << 10) | imm4;
+    hw2 = (hw2 & 0x8f00) | (imm3 << 12) | imm8;
+    if put_u16(data, off, hw1, endian) && put_u16(data, off + 2, hw2, endian) {
+        Outcome::Patched
+    } else {
+        Outcome::Deferred
+    }
 }
 
 /// Patch a Thumb `bl`/`b.w`.
@@ -1297,6 +1382,7 @@ mod tests {
             0x4020,
             Endian::Little,
             &mut HashMap::new(),
+            false,
         );
         assert!(matches!(outcome, Outcome::Patched));
         assert_eq!(get_u32(&data, 4, Endian::Little).unwrap(), 0x10);

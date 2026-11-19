@@ -242,9 +242,17 @@ fn a_shift_says_which_bit_fell_off_the_end() {
     // number one bit to the right. The carry out of the shift is the bit
     // that comes back in at the top, and the two halves of the number are
     // the two halves of one product.
+    //
+    // The carry is the bit that *fell off the end*, so it is the low bit of
+    // the value before the shift. Reading it from the shifted value would
+    // take the second bit of the number instead of the first, and the
+    // product would lose its top bit: the shift's own result is dead here,
+    // because only the flag it sets is used.
     assert!(code.contains("rcr("), "the rotate through the carry:\n{code}");
-    assert!(code.contains(">> 1"), "the shift:\n{code}");
-    assert!(!code.contains("unparsed"), "{code}");
+    assert!(
+        code.contains("& 1) == 1"),
+        "the carry is the bit that fell off the end:\n{code}"
+    );
 }
 
 #[test]

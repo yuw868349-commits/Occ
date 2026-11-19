@@ -1027,19 +1027,6 @@ fn t32_narrow(w: u16, addr: Addr) -> R {
     t16(u32::from(w), addr)
 }
 
-/// The condition a 16-bit branch tests, and the width of its displacement.
-struct Branch16 {
-    /// The condition suffix, empty for an unconditional branch.
-    cond: &'static str,
-    /// The number of bits in the displacement, before the shift.
-    width: u32,
-    /// The scale applied to the displacement.
-    scale: u32,
-    /// Whether the displacement is a forward-only range.
-    forward_only: bool,
-}
-
-
 /// Decode one 16-bit Thumb instruction.
 ///
 /// The class is chosen by the top three bits.  The measurement shows the
@@ -1089,7 +1076,7 @@ fn t16(x: u32, addr: Addr) -> R {
 /// the destination is the low three bits.
 fn t16_shift_add(x: u32) -> R {
     match bits(x, 12, 11) {
-        0b00 | 0b01 | 0b10 => {
+        0b00..=0b10 => {
             let name = match bits(x, 12, 11) {
                 0b00 => "lsls",
                 0b01 => "lsrs",
@@ -1194,7 +1181,7 @@ fn t16_dp_reg(x: u32) -> R {
     match op {
         // The shifts write the amount in the second operand's place, so
         // the second operand is the amount and not a register.
-        2 | 3 | 4 => R::new(base, format!("{base}s {}, {}", reg(rdn), reg(rm))),
+        2..=4 => R::new(base, format!("{base}s {}, {}", reg(rdn), reg(rm))),
         9 => R::new("rsb", format!("rsbs {}, {}, {}", reg(rdn), reg(rm), imm(0))),
         13 => R::new(
             "mul",
@@ -1272,7 +1259,7 @@ fn t16_dp_special(x: u32) -> R {
                     0b000 => {
                         R::new("blx", format!("blx {}", reg(rm))).flow(FlowKind::IndirectCall)
                     }
-                    0b100 | 0b101 | 0b110 | 0b111 => {
+                    0b100..=0b111 => {
                         R::new("blxns", format!("blxns {}", reg(rm))).flow(FlowKind::IndirectCall)
                     }
                     _ => t16_undefined(x),
@@ -1552,7 +1539,17 @@ fn t16_misc(x: u32, addr: Addr) -> R {
                 if list == 0 {
                     return t16_undefined(x);
                 }
-                return R::new("pop", format!("pop {}", t16_reglist(list, false)));
+                // `pop {..., pc}` is a return: the load writes the program
+                // counter.  Without the flow, the walk that reads a
+                // function's body runs on into whatever follows the
+                // return, and the body of the next function is folded
+                // into this one.
+                let flow = if list & (1 << 8) != 0 {
+                    FlowKind::Return
+                } else {
+                    FlowKind::Next
+                };
+                return R::new("pop", format!("pop {}", t16_reglist(list, false))).flow(flow);
             }
             // `10111110`: `bkpt`.
             if bits(x, 15, 8) == 0b1011_1110 {
@@ -2023,6 +2020,12 @@ fn t32_dp_reg(hw1: u32, hw2: u32) -> R {
             return R::new("mov", text);
         }
         let mut name = String::from(SHIFTS[shift.kind as usize]);
+        // The shift writes the flags when the instruction says it does,
+        // and the name says so: `lsrs.w` and `lsr.w` are different
+        // instructions.
+        if s {
+            name.push('s');
+        }
         name.push_str(".w");
         let text = format!(
             "{name} {}, {}, #{}",
@@ -2569,7 +2572,14 @@ fn t32_ldm(hw1: u32, hw2: u32) -> R {
         rn_name.push('!');
     }
     let text = format!("{base} {rn_name}, {names}");
-    R::new(base.trim_end_matches(".w"), text)
+    // A load that names the program counter is a return: it writes the
+    // program counter, and the body of the function ends there.
+    let flow = if load && hw2 & 0x8000 != 0 {
+        FlowKind::Return
+    } else {
+        FlowKind::Next
+    };
+    R::new(base.trim_end_matches(".w"), text).flow(flow)
 }
 
 /// The load and store dual class.
@@ -2597,13 +2607,22 @@ fn t32_ldrd(hw1: u32, hw2: u32) -> R {
             reg(rn),
             imm(signed)
         ),
-        (true, false) => format!(
-            "{name} {}, {}, [{}, {}]",
-            reg(rt),
-            reg(rt2),
-            reg(rn),
-            imm(signed)
-        ),
+        (true, false) => {
+            // A zero offset prints nothing: `[r0]` and `[r0, #0]` are one
+            // address, and writing the zero says the encoding had a field
+            // it did not use.
+            if offset == 0 {
+                format!("{name} {}, {}, [{}]", reg(rt), reg(rt2), reg(rn))
+            } else {
+                format!(
+                    "{name} {}, {}, [{}, {}]",
+                    reg(rt),
+                    reg(rt2),
+                    reg(rn),
+                    imm(signed)
+                )
+            }
+        }
         _ => format!(
             "{name} {}, {}, [{}], {}",
             reg(rt),
@@ -2666,225 +2685,345 @@ fn t32_exclusive(hw1: u32, hw2: u32) -> R {
     R::new("strex", text)
 }
 
-/// The shift by a register, the extend, and the saturating add and
-/// subtract.
+/// The data-processing class whose first halfword is `1111 1010`.
 ///
-/// `1111 1010 op(3) S Rn | 1111 Rd ...` is the class of the register
-/// shifts; the same space holds the extends and the parallel additions
-/// and subtractions, and the second halfword says which of them.
+/// The class holds the register shifts, the extends that add an extended
+/// value to another one, the parallel additions and subtractions, the
+/// checksums, and a handful of instructions that share their space.
+///
+/// Two fields name the instruction: the operation is the four bits above
+/// the first register in the first halfword, and the variant is the four
+/// bits above the second register in the second.  The second halfword of
+/// the class always starts with `1111` — every encoding whose top four
+/// bits are clear belongs to another class, and the top bit alone is not
+/// enough to tell them apart.
+///
+/// The table below was read off the reference implementations over the
+/// whole class, field by field: the operation chooses the group, and the
+/// variant chooses within it.
 fn t32_dp_reg2(hw1: u32, hw2: u32) -> R {
+    if bits(hw2, 15, 12) != 0xF {
+        return t32_undefined(hw1, hw2);
+    }
     let rn = bits(hw1, 3, 0);
     let rd = bits(hw2, 11, 8);
     let rm = bits(hw2, 3, 0);
-    let s = bits(hw1, 4, 4) == 1;
-    let kind = bits(hw1, 7, 5);
+    let op = bits(hw1, 7, 4);
     let variant = bits(hw2, 7, 4);
 
-    // The parallel additions and subtractions, which sit in the space with
-    // the seventh bit set.
-    if kind & 0b100 != 0 {
-        let plain = match bits(hw1, 6, 4) {
-            0b000 => "sadd8",
-            0b001 => "sadd16",
-            0b010 => "sasx",
-            0b100 => "ssub8",
-            0b101 => "ssub16",
-            0b110 => "ssax",
-            _ => return t32_undefined(hw1, hw2),
+    // The extends.  Their variant says that they are one: the top bit of
+    // it is set, and the bottom two are the rotation of the source.  The
+    // bit above those two says which of the two spellings it is, and
+    // both spellings are read.
+    if op <= 5 && bits(variant, 3, 3) == 1 {
+        // The rotation of the source: the two bits below the variant, and
+        // they count up rather than down.
+        let rotate = (variant & 3) * 8;
+        // With the program counter as the first operand the instruction is
+        // the plain extend: it takes one operand instead of two.
+        if rn == 15 {
+            let (name, wide) = match op {
+                0 => ("sxth", true),
+                1 => ("uxth", true),
+                2 => ("sxtb16", false),
+                3 => ("uxtb16", false),
+                4 => ("sxtb", true),
+                _ => ("uxtb", true),
+            };
+            let text = if rotate == 0 {
+                if wide {
+                    format!("{name}.w {}, {}", reg(rd), reg(rm))
+                } else {
+                    format!("{name} {}, {}", reg(rd), reg(rm))
+                }
+            } else if wide {
+                format!("{name}.w {}, {}, ror #{}", reg(rd), reg(rm), rotate)
+            } else {
+                format!("{name} {}, {}, ror #{}", reg(rd), reg(rm), rotate)
+            };
+            return R::new(name, text);
+        }
+        let name = match op {
+            0 => "sxtah",
+            1 => "uxtah",
+            2 => "sxtab16",
+            3 => "uxtab16",
+            4 => "sxtab",
+            _ => "uxtab",
         };
+        let text = if rotate == 0 {
+            format!("{name} {}, {}, {}", reg(rd), reg(rn), reg(rm))
+        } else {
+            format!(
+                "{name} {}, {}, {}, ror #{}",
+                reg(rd),
+                reg(rn),
+                reg(rm),
+                rotate
+            )
+        };
+        return R::new(name, text);
+    }
+
+    // The register shifts.  Their operation is the top two bits of the
+    // operation field and the flag is the last one.
+    if op <= 7 {
+        if variant != 0 {
+            return t32_undefined(hw1, hw2);
+        }
+        let name = match op >> 1 {
+            0 => "lsl",
+            1 => "lsr",
+            2 => "asr",
+            _ => "ror",
+        };
+        let mut full = String::from(name);
+        if op & 1 == 1 {
+            full.push('s');
+        }
+        full.push_str(".w");
+        let text = format!("{full} {}, {}, {}", reg(rd), reg(rn), reg(rm));
+        return R::new(name, text);
+    }
+
+    // The instructions that share the space: the saturating add and
+    // subtract, the byte reversals, the select and the count of leading
+    // zeros.  They are looked for first, because the groups that follow
+    // draw from the same operation field and only the variant tells them
+    // apart.
+    //
+    // The byte reversals and the count of leading zeros take one source,
+    // and it is the one in the second halfword.  Their first halfword
+    // carries a register field as well, but the instruction has no second
+    // operand for it, so the assembler writes the source register in both
+    // places and the field carries nothing the decoder can use.
+    let shared = match (op, variant) {
+        (8, 8) => Some(("qadd", format!("qadd {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
+        (8, 9) => Some(("qdadd", format!("qdadd {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
+        (8, 10) => Some(("qsub", format!("qsub {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
+        (8, 11) => Some(("qdsub", format!("qdsub {}, {}, {}", reg(rd), reg(rm), reg(rn)))),
+        (9, 8) => Some(("rev", format!("rev.w {}, {}", reg(rd), reg(rm)))),
+        (9, 9) => Some(("rev16", format!("rev16.w {}, {}", reg(rd), reg(rm)))),
+        (9, 10) => Some(("rbit", format!("rbit {}, {}", reg(rd), reg(rm)))),
+        (9, 11) => Some(("revsh", format!("revsh.w {}, {}", reg(rd), reg(rm)))),
+        (10, 8) => Some(("sel", format!("sel {}, {}, {}", reg(rd), reg(rn), reg(rm)))),
+        (11, 8) => Some(("clz", format!("clz {}, {}", reg(rd), reg(rm)))),
+        _ => None,
+    };
+    if let Some((name, text)) = shared {
+        return R::new(name, text);
+    }
+
+    // The checksums are not a Thumb instruction.  They are an ARMv8
+    // extension, and they are encoded in the A32 space: `crc32b` and
+    // `crc32cb` have the first halfword `0xFAC0` and `0xFAD0`.  The
+    // Thumb space has an operation field at that position with no
+    // instruction behind it, and every reference disassembler reads
+    // those encodings as undefined — there is no Thumb encoding of
+    // `crc32` to read them as.  Reading them as the A32 instruction
+    // would name an instruction the Thumb machine cannot execute.
+    if (op == 12 || op == 13) && bits(variant, 3, 2) == 0b10 {
+        return t32_undefined(hw1, hw2);
+    }
+
+    // The parallel additions and subtractions.  Their operation names the
+    // kind of the operation and their variant says which of the six
+    // spellings it is: the signed one, the saturating one, the halving
+    // one, and the three unsigned ones.
+    let base = match op {
+        8 => "add8",
+        9 => "add16",
+        12 => "sub8",
+        13 => "sub16",
+        _ => "",
+    };
+    if !base.is_empty() {
         let name = match variant {
-            0b0000 => plain.to_string(),
-            0b0001 => match plain {
-                "sadd8" | "ssub8" => "qadd8".to_string(),
-                "sadd16" | "ssub16" => "qadd16".to_string(),
-                _ => "qasx".to_string(),
-            },
-            0b0010 => match plain {
-                "sadd8" | "ssub8" => "shadd8".to_string(),
-                "sadd16" | "ssub16" => "shadd16".to_string(),
-                _ => "shasx".to_string(),
-            },
-            0b0011 => "qadd".to_string(),
-            0b0100 => match plain {
-                "sadd8" | "ssub8" => "uadd8".to_string(),
-                "sadd16" | "ssub16" => "uadd16".to_string(),
-                _ => "uasx".to_string(),
-            },
-            0b0101 => match plain {
-                "sadd8" | "ssub8" => "uqadd8".to_string(),
-                "sadd16" | "ssub16" => "uqadd16".to_string(),
-                _ => "uqasx".to_string(),
-            },
-            0b0110 => match plain {
-                "sadd8" | "ssub8" => "uhadd8".to_string(),
-                "sadd16" | "ssub16" => "uhadd16".to_string(),
-                _ => "uhasx".to_string(),
-            },
-            0b0111 => "uqadd".to_string(),
+            0 => format!("s{base}"),
+            1 => format!("q{base}"),
+            2 => format!("sh{base}"),
+            4 => format!("u{base}"),
+            5 => format!("uq{base}"),
+            6 => format!("uh{base}"),
             _ => return t32_undefined(hw1, hw2),
         };
         let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), reg(rm));
-        return R::new(name, text);
+        return R::new(&name, text);
     }
 
-    // The extends, which are the shifts with the fourth bit of the
-    // variant set.
-    if variant == 0b1111 {
-        let name = match (kind & 0b011, s) {
-            (0b00, false) => "sxtah",
-            (0b00, true) => "uxtah",
-            (0b01, false) => "sxtab16",
-            (0b01, true) => "uxtab16",
-            (0b10, false) => "sxtab",
-            (0b10, true) => "uxtab",
+    // The exchanged additions and subtractions.  These do the same
+    // work as the parallel ones, but over the half words of the
+    // operands rather than over their bytes, and they take the halves
+    // the other way round: the high half of the result comes from the
+    // high half of the first operand and the low half of the second,
+    // and the low half of the result comes from the low half of the
+    // first and the high half of the second.
+    //
+    // They are looked for after the parallel ones, because they draw
+    // from the same operation field and only the operation tells them
+    // apart.
+    let base = match op {
+        10 => "asx",
+        14 => "sax",
+        _ => "",
+    };
+    if !base.is_empty() {
+        let name = match variant {
+            0 => format!("s{base}"),
+            1 => format!("q{base}"),
+            2 => format!("sh{base}"),
+            4 => format!("u{base}"),
+            5 => format!("uq{base}"),
+            6 => format!("uh{base}"),
             _ => return t32_undefined(hw1, hw2),
         };
-        // The rotate is the two bits beside the offset, and they count
-        // down rather than up.
-        let rotate = ((bits(hw2, 4, 4) << 1) | bits(hw2, 5, 5)) * 8;
+        let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), reg(rm));
+        return R::new(&name, text);
+    }
+
+    t32_undefined(hw1, hw2)
+}
+
+/// The multiply and divide family.
+///
+/// `1111 1011 op(4) Rn | ...` holds the multiplies, the long multiplies,
+/// the half-word multiplies and the divides. The operation field picks
+/// which of them, and the bits beside the registers pick the form.
+///
+/// The second halfword's top nibble says which of two layouts the
+/// instruction is in, and the two layouts put the destination and the
+/// accumulator in different places: in one the destination is the second
+/// nibble and the accumulator the first, and in the other it is the other
+/// way round. Reading them the same way round gives an answer that is
+/// right about half the time.
+///
+/// Both layouts and every form in them were read out of two independent
+/// references rather than from a table, because the family has thirty-odd
+/// members and the table that describes it is easy to misread.
+fn t32_multiply(hw1: u32, hw2: u32) -> R {
+    let rn = bits(hw1, 3, 0);
+    let op = bits(hw1, 7, 4);
+    let rm = bits(hw2, 3, 0);
+    let rd = bits(hw2, 11, 8);
+    // The layout with an explicit accumulator: the accumulator is the top
+    // nibble of the second halfword and the destination the next one.
+    if bits(hw2, 15, 12) != 0b1111 {
+        let ra = bits(hw2, 15, 12);
+        let sub = bits(hw2, 5, 4);
+        // The long multiplies name two destination registers, and they
+        // take the two nibbles in the other order: the low half first.
+        let long = match (op, sub) {
+            (0b1000, 0b00) => Some("smull"),
+            (0b1010, 0b00) => Some("umull"),
+            (0b1100, 0b00) => Some("smlal"),
+            (0b1110, 0b00) => Some("umlal"),
+            _ => None,
+        };
+        if let Some(name) = long {
+            let text = format!(
+                "{name} {}, {}, {}, {}",
+                reg(ra),
+                reg(rd),
+                reg(rn),
+                reg(rm)
+            );
+            return R::new(name, text);
+        }
+        let name = match (op, sub) {
+            (0b0000, 0b00) => "mla",
+            (0b0000, 0b01) => "mls",
+            (0b0001, 0b00) => "smlabb",
+            (0b0001, 0b01) => "smlabt",
+            (0b0001, 0b10) => "smlatb",
+            (0b0001, 0b11) => "smlatt",
+            (0b0010, 0b00) => "smlad",
+            (0b0010, 0b01) => "smladx",
+            (0b0011, 0b00) => "smlawb",
+            (0b0011, 0b01) => "smlawt",
+            (0b0100, 0b00) => "smlsd",
+            (0b0100, 0b01) => "smlsdx",
+            (0b0101, 0b00) => "smmla",
+            (0b0101, 0b01) => "smmlar",
+            (0b0110, 0b00) => "smmls",
+            (0b0110, 0b01) => "smmlsr",
+            (0b0111, 0b00) => "usada8",
+            _ => return t32_undefined(hw1, hw2),
+        };
+        let text = format!("{name} {}, {}, {}, {}", reg(rd), reg(rn), reg(rm), reg(ra));
+        return R::new(name, text);
+    }
+    // The layout with the top nibble set: the form is in bits 7:4.
+    let b76 = bits(hw2, 7, 6);
+    let b54 = bits(hw2, 5, 4);
+    // The long multiplies name two destination registers, the low one
+    // first, and the form they use is a different pair of bits.
+    let long = match op {
+        0b1000 if b76 == 0b00 && b54 == 0b00 => Some("smull"),
+        0b1010 if b76 == 0b00 && b54 == 0b00 => Some("umull"),
+        0b1100 => match (b76, b54) {
+            (0b00, 0b00) => Some("smlal"),
+            (0b10, 0b00) => Some("smlalbb"),
+            (0b10, 0b01) => Some("smlalbt"),
+            (0b10, 0b10) => Some("smlaltb"),
+            (0b10, 0b11) => Some("smlaltt"),
+            (0b11, 0b00) => Some("smlald"),
+            (0b11, 0b01) => Some("smlaldx"),
+            _ => None,
+        },
+        0b1101 => match (b76, b54) {
+            (0b11, 0b00) => Some("smlsld"),
+            (0b11, 0b01) => Some("smlsldx"),
+            _ => None,
+        },
+        0b1110 => match (b76, b54) {
+            (0b00, 0b00) => Some("umlal"),
+            (0b01, 0b10) => Some("umaal"),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some(name) = long {
         let text = format!(
-            "{name} {}, {}, {}, ror #{}",
+            "{name} {}, {}, {}, {}",
+            reg(bits(hw2, 15, 12)),
             reg(rd),
             reg(rn),
-            reg(rm),
-            rotate
+            reg(rm)
         );
         return R::new(name, text);
     }
-
-    // The shifts by a register.
-    let name = match kind & 0b011 {
-        0b00 => "lsl",
-        0b01 => "lsr",
-        0b10 => "asr",
-        _ => "ror",
+    // The forms with three operands, and the two that name an
+    // accumulator the encoding does not have.
+    let name = match (op, b76, b54) {
+        (0b0000, 0b00, 0b00) => "mul",
+        (0b0000, 0b00, 0b01) => "mls",
+        (0b0001, 0b00, 0b00) => "smulbb",
+        (0b0001, 0b00, 0b01) => "smulbt",
+        (0b0001, 0b00, 0b10) => "smultb",
+        (0b0001, 0b00, 0b11) => "smultt",
+        (0b0010, 0b00, 0b00) => "smuad",
+        (0b0010, 0b00, 0b01) => "smuadx",
+        (0b0011, 0b00, 0b00) => "smulwb",
+        (0b0011, 0b00, 0b01) => "smulwt",
+        (0b0100, 0b00, 0b00) => "smusd",
+        (0b0100, 0b00, 0b01) => "smusdx",
+        (0b0101, 0b00, 0b00) => "smmul",
+        (0b0101, 0b00, 0b01) => "smmulr",
+        (0b0110, 0b00, 0b00) => "smmls",
+        (0b0110, 0b00, 0b01) => "smmlsr",
+        (0b0111, 0b00, 0b00) => "usad8",
+        (0b1001, 0b11, 0b11) => "sdiv",
+        (0b1011, 0b11, 0b11) => "udiv",
+        _ => return t32_undefined(hw1, hw2),
     };
-    let mut full = String::from(name);
-    if s {
-        full.push('s');
+    // The two that name an accumulator the encoding does not carry print
+    // the program counter, which is what the references print for it.
+    if matches!(name, "mls" | "smmls" | "smmlsr") {
+        let text = format!("{name} {}, {}, {}, pc", reg(rd), reg(rn), reg(rm));
+        return R::new(name, text);
     }
-    full.push_str(".w");
-    let text = format!("{full} {}, {}, {}", reg(rd), reg(rn), reg(rm));
+    let text = format!("{name} {}, {}, {}", reg(rd), reg(rn), reg(rm));
     R::new(name, text)
-}
-
-/// The multiply family.
-///
-/// `1111 1011 op(4) Rn | Rd Ra ...` holds the multiplies, the long
-/// multiplies and the half-word multiplies. The operation field picks
-// which of them, and the four bits beside the registers pick the form.
-fn t32_multiply(hw1: u32, hw2: u32) -> R {
-    let rn = bits(hw1, 3, 0);
-    let rd = bits(hw2, 15, 12);
-    let rm = bits(hw2, 3, 0);
-    let ra = bits(hw2, 7, 4);
-    let rna = bits(hw2, 11, 8);
-    let op = bits(hw1, 7, 4);
-    let variant = bits(hw2, 5, 4);
-    match op {
-        // The multiply-accumulate and the multiply-long.
-        0b0000 => {
-            let name = if variant == 0 { "mla" } else { "mls" };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new(name, text)
-        }
-        // The half-word multiplies that add.
-        0b0001 => {
-            let name = match variant {
-                0b00 => "smlabb",
-                0b01 => "smlabt",
-                0b10 => "smlatb",
-                _ => return t32_undefined(hw1, hw2),
-            };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new(name, text)
-        }
-        // The half-word multiplies that add two products.
-        0b0010 => {
-            let name = match variant {
-                0b00 => "smlad",
-                0b01 => "smladx",
-                _ => return t32_undefined(hw1, hw2),
-            };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new(name, text)
-        }
-        // The half-word multiplies that subtract.
-        0b0100 => {
-            let name = match variant {
-                0b00 => "smlsd",
-                0b01 => "smlsdx",
-                _ => return t32_undefined(hw1, hw2),
-            };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new(name, text)
-        }
-        // The multiplies by half a word that accumulate.
-        0b0101 | 0b0110 => {
-            let name = if op == 0b0101 { "smmla" } else { "smmls" };
-            let name = match variant {
-                0b00 => name.to_string(),
-                0b01 => format!("{name}r"),
-                _ => return t32_undefined(hw1, hw2),
-            };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new(name, text)
-        }
-        // The accumulation of four products.
-        0b0111 => {
-            let text = format!(
-                "usada8 {}, {}, {}, {}",
-                reg(rd),
-                reg(rn),
-                reg(rm),
-                reg(ra)
-            );
-            R::new("usada8", text)
-        }
-        // The long multiplies.
-        0b1000 | 0b1010 => {
-            let name = if op == 0b1000 { "smull" } else { "umull" };
-            let text = format!(
-                "{name} {}, {}, {}, {}",
-                reg(rd),
-                reg(rna),
-                reg(rm),
-                reg(rn)
-            );
-            R::new(name, text)
-        }
-        _ => t32_undefined(hw1, hw2),
-    }
 }
 
 /// The undefined instruction in the 32-bit space.
@@ -2949,7 +3088,7 @@ fn t32(w: u32, addr: Addr) -> R {
         // immediate clear or set.  The bit that tells them apart is the
         // ninth: zero is the modified immediate, which is the one with
         // the rotated eight-bit field.
-        0b1111000 | 0b1111001 | 0b1111010 | 0b1111011 => {
+        0b1111000..=0b1111011 => {
             if bits(hw2, 15, 15) == 1 {
                 t32_branch(hw1, hw2, addr)
             } else if bits(hw1, 9, 9) == 0 {
@@ -2960,7 +3099,7 @@ fn t32(w: u32, addr: Addr) -> R {
         }
         // `11111xx`: the single load and store, the register data
         // processing, the multiplies, and the coprocessor space.
-        0b1111100 | 0b1111101 | 0b1111110 | 0b1111111 => match hw1 >> 8 {
+        0b1111100..=0b1111111 => match hw1 >> 8 {
             0xF8 | 0xF9 => t32_load_store(hw1, hw2),
             0xFA => t32_dp_reg2(hw1, hw2),
             0xFB => t32_multiply(hw1, hw2),
@@ -2987,5 +3126,247 @@ impl R {
     fn with_pc(mut self, a: Addr) -> R {
         self.pc = Some(a);
         self
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `it` block
+//
+// Thumb has no predicated instructions. A conditional block is an `it`
+// instruction that governs the four after it, and the arm each of them
+// takes is in the `it`'s own name.
+//
+// The decoder reads one instruction at a time and cannot know what came
+// before it, so the block is resolved afterwards over a run of
+// instructions that were read together. The analysis layer calls this
+// once the body of a function has been read.
+//
+// The condition is written into the instruction's own name, which is where
+// ARM puts it and where the rest of the tool looks for it: `moveq r0, #1`
+// is a move that happens only when the condition holds, and a move that
+// happens always is a different function.
+// ---------------------------------------------------------------------------
+
+/// The conditions an `it` block imposes on the instructions after it.
+///
+/// Thumb has no predicated instructions. A conditional block is an `it`
+/// instruction that governs the four after it, and the arm each of them
+/// takes is in the `it`'s own name: `itt` runs the second under the same
+/// condition, `ite` runs it under the opposite one.
+pub struct ItBlock {
+    /// The condition the first instruction runs under.
+    pub condition: &'static str,
+    /// The condition of each instruction after the first, in order.
+    pub conditions: Vec<&'static str>,
+}
+
+/// Read an `it` block's own name.
+///
+/// The name is the instruction's mnemonic — `it` followed by one letter for
+/// each instruction after the first — and the condition is the word after
+/// it. `None` when the instruction is not an `it` at all.
+pub fn it_block(text: &str) -> Option<ItBlock> {
+    let text = text.trim();
+    let (mnemonic, rest) = text.split_once(char::is_whitespace)?;
+    let condition = known_condition(rest.split_whitespace().next()?)?;
+    let letters = mnemonic.strip_prefix("it")?;
+    if !letters.chars().all(|c| c == 't' || c == 'e') {
+        return None;
+    }
+    let mut conditions = Vec::with_capacity(letters.len());
+    for letter in letters.chars() {
+        let c = if letter == 'e' {
+            inverse_condition(condition)?
+        } else {
+            condition
+        };
+        conditions.push(c);
+    }
+    Some(ItBlock {
+        condition,
+        conditions,
+    })
+}
+
+/// The condition names ARM knows.
+///
+/// The list is here rather than taken from the text so that the name the
+/// condition is written under is one this tool knows how to read back.
+pub fn known_condition(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "eq" => "eq",
+        "ne" => "ne",
+        "hs" => "hs",
+        "cs" => "cs",
+        "lo" => "lo",
+        "cc" => "cc",
+        "mi" => "mi",
+        "pl" => "pl",
+        "vs" => "vs",
+        "vc" => "vc",
+        "hi" => "hi",
+        "ls" => "ls",
+        "ge" => "ge",
+        "lt" => "lt",
+        "gt" => "gt",
+        "le" => "le",
+        "al" => "al",
+        _ => return None,
+    })
+}
+
+/// The condition that is the opposite of `cond`.
+///
+/// The condition codes come in pairs, and the opposite of a pair is the
+/// other half of it. `al` has no opposite: it holds always, and so does
+/// its opposite.
+pub fn inverse_condition(cond: &'static str) -> Option<&'static str> {
+    Some(match cond {
+        "eq" => "ne",
+        "ne" => "eq",
+        "hs" | "cs" => "lo",
+        "lo" | "cc" => "hs",
+        "mi" => "pl",
+        "pl" => "mi",
+        "vs" => "vc",
+        "vc" => "vs",
+        "hi" => "ls",
+        "ls" => "hi",
+        "ge" => "lt",
+        "lt" => "ge",
+        "gt" => "le",
+        "le" => "gt",
+        // `al` holds on every path, and so does the arm that would be its
+        // opposite.
+        "al" => "al",
+        _ => return None,
+    })
+}
+
+/// The Thumb instructions whose name ends in an `s` because they update the
+/// flags.
+///
+/// Inside an `it` block the flags are not updated, and the instruction is
+/// written in the form that does not update them: the conditional `movs`
+/// is a `mov`. The names are listed rather than derived from a rule,
+/// because a name that ends in `s` may also be a name that ends in a
+/// condition.
+const FLAG_SETTING: &[&str] = &[
+    "movs", "adds", "subs", "adcs", "sbcs", "rsbs", "ands", "orrs", "eors", "bics", "muls",
+    "mvns", "lsls", "lsrs", "asrs", "rors",
+];
+
+/// Write a condition into an instruction's own name.
+///
+/// ARM puts the condition at the end of the mnemonic, and that is where
+/// the rest of the tool looks for it: `moveq r0, #1` is a move that
+/// happens only when the condition holds, and a move that happens always
+/// is a different function.
+///
+/// Two details are the architecture's rather than the printer's. The width
+/// marker says how the instruction is encoded and not what it does, so the
+/// condition goes in front of it: `beq.w`, not `b.w.eq`. And an
+/// instruction inside an `it` block does not update the flags, so it is
+/// written in the form that does not: the conditional `movs` is a `mov`.
+///
+/// The instruction's flow follows. A branch that runs only on one path is
+/// a conditional branch, and saying so is what stops the recovery from
+/// treating a conditional return as the end of the function.
+pub fn apply_condition(insn: &mut Instruction, condition: &str) {
+    let text = insn.text.trim();
+    let (name, rest) = match text.find(char::is_whitespace) {
+        Some(i) => (&text[..i], text[i..].trim()),
+        None => (text, ""),
+    };
+    // A directive the decoder emitted is not an instruction and has no
+    // condition to carry.
+    if name.is_empty() || name.starts_with('.') {
+        return;
+    }
+    // A branch that already carries a condition keeps it.
+    //
+    // The architecture does not allow a conditional instruction inside an
+    // `it` block — the block *is* the condition — so a decoder that prints
+    // one has already said what the instruction means, and writing the
+    // block's condition on top of it would name two conditions at once.
+    if insn.flow == FlowKind::ConditionalBranch {
+        return;
+    }
+    let (base, marker) = match name.split_once('.') {
+        Some((b, m)) => (b, Some(m)),
+        None => (name, None),
+    };
+    let base = match FLAG_SETTING.contains(&base) {
+        true => &base[..base.len() - 1],
+        false => base,
+    };
+    // An instruction that already carries this condition keeps it.
+    //
+    // The condition is written in two passes — once as the body is read,
+    // and once over the finished list, which is the safety net for a
+    // block that straddles two reads — and the second pass must not name
+    // the condition twice. `al` is left out: it is the condition that
+    // always holds, and a name that ends in it is not carrying it.
+    if condition != "al" && base.len() > condition.len() && base.ends_with(condition) {
+        return;
+    }
+    let mut named = String::from(base);
+    named.push_str(condition);
+    if let Some(m) = marker {
+        named.push('.');
+        named.push_str(m);
+    }
+    insn.mnemonic = base.into();
+    insn.text = if rest.is_empty() {
+        named
+    } else {
+        format!("{named} {rest}")
+    };
+    if matches!(
+        insn.flow,
+        FlowKind::Return | FlowKind::UnconditionalBranch | FlowKind::IndirectBranch
+    ) {
+        insn.flow = FlowKind::ConditionalBranch;
+    }
+}
+
+/// Apply the conditions an `it` block imposes.
+///
+/// The instructions are read in address order after the body has been
+/// decoded, because a block may straddle the boundaries of the basic
+/// blocks the control flow recovery found: an `it` at the end of one
+/// block governs the first instruction of the next.
+///
+/// A block whose instructions are not consecutive in the address space
+/// stops there. The architecture says the instructions of an `it` block
+/// are the ones that follow it, and a gap means the ones after the gap
+/// are not among them.
+pub fn apply_it_conditions(list: &mut [Instruction]) {
+    let mut i = 0;
+    while i < list.len() {
+        let Some(block) = it_block(&list[i].text) else {
+            i += 1;
+            continue;
+        };
+        let mut address = list[i].end();
+        // The first instruction of a block always runs under the block's own
+        // condition; the letters in the name say what the ones after it do.
+        if let Some(insn) = list.get_mut(i + 1)
+            && insn.addr.0 == address.0
+        {
+            apply_condition(insn, block.condition);
+            address = insn.end();
+        }
+        for (k, condition) in block.conditions.iter().enumerate() {
+            let Some(insn) = list.get_mut(i + 2 + k) else {
+                break;
+            };
+            if insn.addr.0 != address.0 {
+                break;
+            }
+            apply_condition(insn, condition);
+            address = insn.end();
+        }
+        i += 1;
     }
 }
