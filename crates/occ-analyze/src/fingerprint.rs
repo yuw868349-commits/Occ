@@ -11,8 +11,8 @@
 //! agreeing signals.
 
 use occ_core::{
-    Claim, CompilerFamily, Evidence, EvidenceKind, EvidenceSource, Fingerprint, Handle, Image,
-    LangGuess, SectionKind,
+    Claim, CompilerFamily, Evidence, EvidenceKind, EvidenceSource, Fingerprint, Format, Handle,
+    Image, LangGuess, SectionKind,
 };
 
 use crate::entropy::{HIGH_ENTROPY, per_section};
@@ -44,6 +44,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             .iter()
             .any(|i| matches!(i.name.as_str(), "_CorExeMain" | "_CorDllMain" | "_CorMain"));
     let delphi = delphi_sections(image) || delphi_symbols(&symbols);
+    let msvc_rt = msvc_runtime(image);
 
     // Compiler family: strongest signal first.
     let mut claim = Claim::new(handle.clone(), "compiler family has not been determined");
@@ -123,6 +124,14 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.95,
         ));
     }
+    if let Some(rt) = msvc_rt {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::ImportCall,
+            EvidenceSource::Loader,
+            format!("the import table links the MSVC runtime ({rt})"),
+            0.6,
+        ));
+    }
     if delphi {
         claim = claim.with(Evidence::support(
             EvidenceKind::FormatMeta,
@@ -147,7 +156,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             CompilerFamily::Go
         } else if symbols.contains("$s") {
             CompilerFamily::Swift
-        } else if symbols.contains("__C_specific_handler") {
+        } else if symbols.contains("__C_specific_handler") || msvc_rt.is_some() {
             CompilerFamily::Msvc
         } else if comment.as_deref().is_some_and(|c| c.contains("GCC:")) {
             CompilerFamily::Gcc
@@ -304,23 +313,78 @@ fn runtime(image: &Image) -> Option<String> {
         }
         return Some(i.clone());
     }
-    let names: Vec<&str> = image.imports.iter().map(|i| i.name.as_str()).collect();
-    if names.iter().any(|n| n.contains("ucrtbase")) {
+    // The libraries are the answer for a PE. The symbol-name fallback below
+    // must not run for one: `malloc` and `free` are imported by the UCRT
+    // forwarders too, and answering `glibc` for a Windows binary because
+    // those two names appear is a wrong answer, not a weak one.
+    let libs = import_libraries(image);
+    if libs.iter().any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase") {
         return Some("ucrt".into());
     }
-    if names.iter().any(|n| n.contains("msvcrt")) {
-        return Some("msvcrt".into());
+    // Name the C runtime rather than whichever of the pair sorts first:
+    // `msvcp90` is the C++ library that sits beside `msvcr90`, and reporting
+    // the C++ one as "the runtime" hides which ABI the binary links.
+    if let Some(v) = libs.iter().find(|l| l.starts_with("msvcr")) {
+        return Some(v.clone());
     }
-    if names.iter().any(|n| {
-        matches!(
-            *n,
-            "__libc_start_main" | "__errno_location" | "malloc" | "free" | "memcpy"
-        )
-    }) {
-        return Some("glibc".into());
+    if let Some(v) = libs.iter().find(|l| l.starts_with("msvcp")) {
+        return Some(v.clone());
+    }
+    if image.format == Format::Elf {
+        let names: Vec<&str> = image.imports.iter().map(|i| i.name.as_str()).collect();
+        if names.iter().any(|n| n.contains("ucrtbase")) {
+            return Some("ucrt".into());
+        }
+        if names.iter().any(|n| n.contains("msvcrt")) {
+            return Some("msvcrt".into());
+        }
+        if names.iter().any(|n| {
+            matches!(
+                *n,
+                "__libc_start_main" | "__errno_location" | "malloc" | "free" | "memcpy"
+            )
+        }) {
+            return Some("glibc".into());
+        }
     }
     if image.section_by_name(".gopclntab").is_some() {
         return Some("go".into());
+    }
+    None
+}
+
+/// Importing libraries, lower-cased and without the extension.
+fn import_libraries(image: &Image) -> Vec<String> {
+    let mut v: Vec<String> = image
+        .imports
+        .iter()
+        .filter_map(|i| i.library.as_deref())
+        .map(|l| {
+            let l = l.to_ascii_lowercase();
+            l.split('.').next().unwrap_or(&l).to_string()
+        })
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The MSVC runtime family, if the import table links one.
+///
+/// `msvcr90`/`msvcp90` and the UCRT forwarders are only ever produced by MSVC.
+/// A plain `msvcrt.dll` is not evidence: MinGW links it too, which is why it
+/// is not in this match.
+fn msvc_runtime(image: &Image) -> Option<&'static str> {
+    let libs = import_libraries(image);
+    if libs.iter().any(|l| l.starts_with("api-ms-win-crt-") || l == "ucrtbase") {
+        return Some("ucrt");
+    }
+    // `msvcr90`/`msvcr100` are versioned MSVC runtimes; `msvcrt` is the
+    // system DLL that MinGW also links, so it must not be matched here.
+    if libs.iter().any(|l| {
+        (l.starts_with("msvcr") || l.starts_with("msvcp")) && !l.starts_with("msvcrt")
+    }) {
+        return Some("msvcr");
     }
     None
 }
@@ -347,8 +411,16 @@ fn runtime_import(image: &Image, libs: &[&str]) -> bool {
 /// equivalent is `.text`/`.data`/`.bss`/`.tls`, so the combination is a
 /// reliable discriminator rather than a loose "a section called DATA".
 fn delphi_sections(image: &Image) -> bool {
-    let has = |n: &str| image.section_by_name(n).is_some() || image.section_by_name(&format!(".{n}")).is_some();
-    has("CODE") && has("DATA") && has("BSS")
+    let has = |n: &str| {
+        image.section_by_name(n).is_some() || image.section_by_name(&format!(".{n}")).is_some()
+    };
+    // `CODE` and `DATA` alone are already something no MSVC link emits;
+    // `BSS` is normally there but a small binary can merge it away, and
+    // requiring it missed a Borland-built sample whose sections were
+    // `CODE, DATA, .idata, .reloc, .rsrc`. `.text` still has to be absent
+    // for the relaxed form, so an ordinary MSVC image cannot match.
+    let no_text = image.section_by_name(".text").is_none();
+    has("CODE") && has("DATA") && (has("BSS") || no_text)
 }
 
 /// Unstripped Delphi binaries keep VCL/RTL symbols, which are published as
@@ -489,6 +561,62 @@ mod tests {
         let fp = fingerprint(&img, &v);
         assert_eq!(fp.compiler, CompilerFamily::Delphi);
         assert_eq!(fp.language, LangGuess::Pascal);
+    }
+
+    #[test]
+    fn ucrt_forwarders_are_not_mistaken_for_glibc() {
+        let data = vec![0u8; 16];
+        let base = image_with_sections(vec![section(".text", 0, 16)]);
+        let img = with_imports(
+            base,
+            &[
+                ("api-ms-win-crt-heap-l1-1-0.dll", "malloc"),
+                ("api-ms-win-crt-runtime-l1-1-0.dll", "exit"),
+            ],
+        );
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.runtime.as_deref(), Some("ucrt"));
+        assert_eq!(fp.compiler, CompilerFamily::Msvc);
+    }
+
+    #[test]
+    fn versioned_msvcr_identifies_msvc_but_plain_msvcrt_does_not() {
+        let data = vec![0u8; 16];
+        let base = image_with_sections(vec![section(".text", 0, 16)]);
+        let img = with_imports(
+            base,
+            &[
+                ("MSVCR90.dll", "printf"),
+                ("MSVCP90.dll", "??0exception@@QAE@XZ"),
+            ],
+        );
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::Msvc);
+        assert_eq!(fp.runtime.as_deref(), Some("msvcr90"));
+
+        // MinGW links plain msvcrt.dll: a compiler family is not derivable
+        // from that alone, and reporting `msvc` would be a guess.
+        let img2 = with_imports(
+            image_with_sections(vec![section(".text", 0, 16)]),
+            &[("msvcrt.dll", "printf")],
+        );
+        let v2 = View::new(&img2, &data);
+        let fp2 = fingerprint(&img2, &v2);
+        assert_eq!(fp2.compiler, CompilerFamily::Unknown);
+    }
+
+    #[test]
+    fn borland_layout_without_bss_is_still_delphi() {
+        let data = vec![0u8; 16];
+        let img = image_with_sections(vec![
+            section("CODE", 0, 8),
+            section("DATA", 8, 8),
+        ]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::Delphi);
     }
 
     #[test]
