@@ -4522,6 +4522,7 @@ mod tests {
                 target: None,
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
+                mem_addr: Vec::new(),
             })
             .collect();
         let lifted = LifterTrait::lift_block(&mut lifter, &insns);
@@ -4573,6 +4574,7 @@ mod tests {
                 target: None,
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
+                mem_addr: Vec::new(),
             })
             .collect();
         LifterTrait::lift_block(&mut lifter, &insns)

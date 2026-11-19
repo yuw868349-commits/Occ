@@ -576,6 +576,7 @@ pub fn decode(
             flow: raw.flow,
             target,
             mem_reads: Vec::new(),
+            mem_addr: Vec::new(),
             mem_writes: Vec::new(),
         });
     }

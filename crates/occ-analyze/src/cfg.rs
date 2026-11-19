@@ -192,6 +192,7 @@ mod tests {
             flow,
             target: target.map(|to| CallTarget::Direct { to: Addr(to) }),
             mem_reads: Vec::new(),
+            mem_addr: Vec::new(),
             mem_writes: Vec::new(),
         }
     }

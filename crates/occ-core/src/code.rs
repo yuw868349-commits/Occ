@@ -113,6 +113,12 @@ pub struct Instruction {
     pub mem_reads: Vec<Addr>,
     /// Absolute addresses written by a memory operand.
     pub mem_writes: Vec<Addr>,
+    /// Addresses the instruction computes but does not dereference: a `lea`
+    /// with a RIP-relative displacement. Keeping them apart from `mem_reads`
+    /// matters twice: a reader loses the only pointer to a string when a
+    /// `lea` is treated as a load, and a data-flow engine must not conclude
+    /// that the bytes at the target were read.
+    pub mem_addr: Vec<Addr>,
 }
 
 impl Instruction {
@@ -412,6 +418,7 @@ mod tests {
             target: None,
             mem_reads: Vec::new(),
             mem_writes: Vec::new(),
+            mem_addr: Vec::new(),
         }
     }
 

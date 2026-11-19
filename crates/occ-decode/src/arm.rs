@@ -243,6 +243,7 @@ fn finish(r: R, origin: Addr, raw: Vec<u8>) -> Decoded {
             flow: r.flow,
             target: r.target,
             mem_reads: r.reads,
+            mem_addr: Vec::new(),
             mem_writes: r.writes,
         },
         rip_target: r.pc,

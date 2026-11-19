@@ -95,7 +95,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
         claim = claim.with(Evidence::support(
             EvidenceKind::ImportCall,
             EvidenceSource::Loader,
-            "MSVC exception handler is imported",
+            "the import table names `__C_specific_handler`; MSVC and MinGW SEH both do",
             0.5,
         ));
     }
@@ -138,6 +138,26 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             EvidenceSource::Loader,
             "Borland RTL section layout (CODE/DATA/BSS, no .text)",
             0.7,
+        ));
+    }
+    // MinGW is GCC: it links libgcc and registers its frame information, and
+    // it also links the UCRT and imports `__C_specific_handler` for SEH. Those
+    // two facts are shared with MSVC, so a runtime import alone must not
+    // outrank a libgcc reference.
+    let libs = import_libraries(image);
+    let mingw = symbols.contains("__register_frame_info")
+        || symbols.contains("__deregister_frame_info")
+        || libs.iter().any(|l| l.contains("libgcc") || l.contains("libstdc++"))
+        || contains_ascii_ci(view.file(), b"MinGW-w64")
+        || contains_ascii_ci(view.file(), b"GCC: (MinGW")
+        || comment.as_deref().is_some_and(|c| c.contains("MinGW"));
+    if mingw {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::Symbol,
+            EvidenceSource::Loader,
+            "the file names libgcc/MinGW-w64: the toolchain is GCC, which also \
+             links the UCRT and imports the SEH handler",
+            0.6,
         ));
     }
     let mut marker_language: Option<LangGuess> = None;
@@ -197,10 +217,12 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             CompilerFamily::Go
         } else if symbols.contains("$s") {
             CompilerFamily::Swift
-        } else if symbols.contains("__C_specific_handler") || msvc_rt.is_some() || msvc_link {
-            CompilerFamily::Msvc
+        } else if mingw && !msvc_link {
+            CompilerFamily::Gcc
         } else if comment.as_deref().is_some_and(|c| c.contains("GCC:")) {
             CompilerFamily::Gcc
+        } else if msvc_link || msvc_rt.is_some() {
+            CompilerFamily::Msvc
         } else {
             CompilerFamily::Unknown
         }

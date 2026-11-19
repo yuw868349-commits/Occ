@@ -519,6 +519,16 @@ impl Decoder {
             }
         }
 
+        // `lea` computes an address without touching it. Record it separately
+        // so a string reference is an address the code takes, not a byte it
+        // reads.
+        let mut addrs = Vec::new();
+        if mnemonic == "lea" && reads.is_empty() && writes.is_empty() {
+            if let Some(rt) = rip_target {
+                addrs.push(rt);
+            }
+        }
+
         let mut text = self.render(&p, mnemonic, &ops, len);
         // objdump's convention: keep the RIP-relative spelling, which shows how
         // the instruction encodes, and append the address it resolves to. Both
@@ -540,6 +550,7 @@ impl Decoder {
                 target,
                 mem_reads: reads,
                 mem_writes: writes,
+                mem_addr: addrs,
             },
             rip_target,
         }
@@ -581,6 +592,7 @@ impl Decoder {
                 target: None,
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
+                mem_addr: Vec::new(),
             },
             rip_target: None,
         }

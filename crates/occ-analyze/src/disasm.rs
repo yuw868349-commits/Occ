@@ -1438,6 +1438,25 @@ fn build_xrefs(functions: &[Function], thunks: &[(Addr, String)], image: &Image)
                     add(insn.addr, *m, XrefKind::DataWrite, Some(f.entry));
                 }
             }
+            // An address computed by `lea` is the only pointer some code has
+            // to a string or a table. Skipping it made the string xref
+            // features blind to every "load the address into the argument
+            // register" call site, which is how a compiler passes a literal.
+            for m in &insn.mem_addr {
+                if !image.is_mapped(*m) {
+                    continue;
+                }
+                let looks_code = image
+                    .symbol_at(*m)
+                    .map(|s| s.kind == SymbolKind::Function)
+                    .unwrap_or(false);
+                let kind = if looks_code {
+                    XrefKind::AddressTaken
+                } else {
+                    XrefKind::DataRead
+                };
+                add(insn.addr, *m, kind, Some(f.entry));
+            }
         }
     }
     out.sort_by_key(|x| (x.from.0, x.to.0));

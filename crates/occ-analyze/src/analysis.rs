@@ -496,6 +496,7 @@ mod tests {
             flow: FlowKind::Next,
             target: None,
             mem_reads: Vec::new(),
+            mem_addr: Vec::new(),
             mem_writes: Vec::new(),
         }
     }
