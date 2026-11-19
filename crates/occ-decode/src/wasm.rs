@@ -577,6 +577,7 @@ pub fn decode(
             target,
             mem_reads: Vec::new(),
             mem_addr: Vec::new(),
+            imm_values: Vec::new(),
             mem_writes: Vec::new(),
         });
     }

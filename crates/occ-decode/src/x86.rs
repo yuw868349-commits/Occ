@@ -522,6 +522,13 @@ impl Decoder {
         // `lea` computes an address without touching it. Record it separately
         // so a string reference is an address the code takes, not a byte it
         // reads.
+        let imms: Vec<u64> = ops
+            .iter()
+            .filter_map(|o| match o {
+                Operand::Imm(v, _) => Some(*v as u64),
+                _ => None,
+            })
+            .collect();
         let mut addrs = Vec::new();
         if mnemonic == "lea" && reads.is_empty() && writes.is_empty() {
             if let Some(rt) = rip_target {
@@ -551,6 +558,7 @@ impl Decoder {
                 mem_reads: reads,
                 mem_writes: writes,
                 mem_addr: addrs,
+                imm_values: imms,
             },
             rip_target,
         }
@@ -593,6 +601,7 @@ impl Decoder {
                 mem_reads: Vec::new(),
                 mem_writes: Vec::new(),
                 mem_addr: Vec::new(),
+                imm_values: Vec::new(),
             },
             rip_target: None,
         }

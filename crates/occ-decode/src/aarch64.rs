@@ -146,6 +146,7 @@ impl Decoder {
                 target: r.target,
                 mem_reads: r.reads,
             mem_addr: Vec::new(),
+            imm_values: Vec::new(),
                 mem_writes: r.writes,
             },
             rip_target: r.pc,

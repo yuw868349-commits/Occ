@@ -119,6 +119,12 @@ pub struct Instruction {
     /// `lea` is treated as a load, and a data-flow engine must not conclude
     /// that the bytes at the target were read.
     pub mem_addr: Vec<Addr>,
+    /// Immediate operands, as written. A 32-bit image passes the address of a
+    /// string in a `push`/`mov` immediate rather than through a memory
+    /// operand, so a reader that only follows memory operands never sees the
+    /// reference. Recording the values lets the analysis stage decide which
+    /// ones name mapped addresses.
+    pub imm_values: Vec<u64>,
 }
 
 impl Instruction {
@@ -419,6 +425,7 @@ mod tests {
             mem_reads: Vec::new(),
             mem_writes: Vec::new(),
             mem_addr: Vec::new(),
+            imm_values: Vec::new(),
         }
     }
 

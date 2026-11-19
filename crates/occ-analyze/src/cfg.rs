@@ -193,6 +193,7 @@ mod tests {
             target: target.map(|to| CallTarget::Direct { to: Addr(to) }),
             mem_reads: Vec::new(),
             mem_addr: Vec::new(),
+            imm_values: Vec::new(),
             mem_writes: Vec::new(),
         }
     }

@@ -1442,6 +1442,25 @@ fn build_xrefs(functions: &[Function], thunks: &[(Addr, String)], image: &Image)
             // to a string or a table. Skipping it made the string xref
             // features blind to every "load the address into the argument
             // register" call site, which is how a compiler passes a literal.
+            for v in &insn.imm_values {
+                let a = Addr(*v);
+                if !image.is_mapped(a) {
+                    continue;
+                }
+                // A mapped immediate is a pointer written by the compiler:
+                // `push 0x402191` passes a string, `mov reg, 0x402000` takes
+                // the address of a table.
+                let looks_code = image
+                    .symbol_at(a)
+                    .map(|s| s.kind == SymbolKind::Function)
+                    .unwrap_or(false);
+                let kind = if looks_code {
+                    XrefKind::AddressTaken
+                } else {
+                    XrefKind::DataRead
+                };
+                add(insn.addr, a, kind, Some(f.entry));
+            }
             for m in &insn.mem_addr {
                 if !image.is_mapped(*m) {
                     continue;
