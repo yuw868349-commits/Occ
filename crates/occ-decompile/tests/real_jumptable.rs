@@ -24,15 +24,22 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 const SOURCE: &str = r#"
 volatile int sink;
+/* One distinct callee per case. A single `tap(i)` helper is not enough: a
+   compiler can fold seven calls to one function with different arguments into
+   a byte table and one call, and then there is no dispatch table to recover.
+   Distinct callees leave no option but a jump table, which is what this
+   fixture is for. */
+#define TAP(n) __attribute__((noinline)) static void tap##n(void) { sink += n * 13 + 1; }
+TAP(0) TAP(1) TAP(2) TAP(3) TAP(4) TAP(5) TAP(6)
 int classify(int c) {
     switch (c) {
-    case 0: sink = 1; return 10;
-    case 1: sink = 2; return 21;
-    case 2: sink = 3; return 32;
-    case 3: sink = 4; return 43;
-    case 4: sink = 5; return 54;
-    case 5: sink = 6; return 65;
-    case 6: sink = 7; return 76;
+    case 0: tap0(); return 10;
+    case 1: tap1(); return 21;
+    case 2: tap2(); return 32;
+    case 3: tap3(); return 43;
+    case 4: tap4(); return 54;
+    case 5: tap5(); return 65;
+    case 6: tap6(); return 76;
     default: sink = 9; return -1;
     }
 }

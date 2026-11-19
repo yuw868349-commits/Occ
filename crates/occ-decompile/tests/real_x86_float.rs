@@ -66,11 +66,13 @@ void fill_rep(char *d, int c, unsigned long n) {
     __asm__ volatile ("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
 }
 
-int atomic_add(int *p) {
+/* C11 spells the pointee `_Atomic int`; clang rejects a plain `int *`
+   here while gcc accepts it. The fixture must compile under both. */
+int atomic_add(_Atomic int *p) {
     return atomic_fetch_add(p, 3);
 }
 
-int atomic_cas(int *p, int expected) {
+int atomic_cas(_Atomic int *p, int expected) {
     int e = expected;
     return atomic_compare_exchange_strong(p, &e, 7);
 }

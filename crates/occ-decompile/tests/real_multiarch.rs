@@ -37,11 +37,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// answer is checked rather than the spelling.
 const SOURCE: &str = r#"
 volatile int sink;
+/* An empty asm block with a memory clobber sits after each store. Without it
+   clang if-converts the chain: it computes the value with `setb` and writes
+   one store, the branches vanish from the machine code, and a test that asks
+   for three branches would be asking the compiler not to optimize. The
+   barrier keeps the stores where the source puts them, so the control flow
+   the test is about survives. It is not there to help the decompiler: it is
+   there to make the compiler preserve the shape the source has. */
+#define KEEP __asm__ volatile("" ::: "memory")
 int classify(int x) {
-    if (x < 0) { sink = 1; return -1; }
-    if (x == 0) { sink = 2; return 0; }
-    if (x < 10) { sink = 3; return 1; }
-    sink = 4;
+    if (x < 0) { sink = 1; KEEP; return -1; }
+    if (x == 0) { sink = 2; KEEP; return 0; }
+    if (x < 10) { sink = 3; KEEP; return 1; }
+    sink = 4; KEEP;
     return 2;
 }
 int main(int argc, char **argv) { return classify(argc - 1); }

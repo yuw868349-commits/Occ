@@ -25,6 +25,7 @@ use super::{
 };
 use crate::ir::{
     BinOp, BoolOp, CastKind, CondOp, Expr, FlagCond, FlagState, Intrinsic, Stmt, UnOp, mask,
+    sign_extend,
 };
 
 /// The register width a target models.
@@ -1195,7 +1196,19 @@ impl<'a> Lifter<'a> {
             self.core.set_flags(flags, None);
             return;
         }
-        let operand = self.snapshot(&ops[1], stmts);
+        // An immediate is a bit pattern at the operand's width, and the
+        // arithmetic is modular at that width. `add edi, 0xffffff9c` adds
+        // minus a hundred, not plus four billion; reading the pattern as an
+        // unsigned 64-bit number turns `index - 100` into `index + 4294967196`
+        // and every case label derived from it is off by 2^32. Sign-extending
+        // to 64 bits keeps the modular value and keeps the offset small enough
+        // for a human (and a case label) to read. Widths above four bytes are
+        // already sign-extended by the decoder.
+        let operand = if let Operand::Imm(v) = &ops[1] {
+            Expr::Const(sign_extend(*v, bits) as u64)
+        } else {
+            self.snapshot(&ops[1], stmts)
+        };
         // The carry and the overflow say things about the value that was
         // there before the operation, so it is given a name of its own.
         // The logical operations say nothing about the old value, and they

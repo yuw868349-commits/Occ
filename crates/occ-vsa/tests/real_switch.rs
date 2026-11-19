@@ -22,52 +22,37 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SOURCE: &str = r#"
-#include <stddef.h>
+const SOURCE: &str = r#"#include <stddef.h>
 volatile int sink;
 
-static int add(int a, int b) { return a + b; }
-static int sub(int a, int b) { return a - b; }
-static int mul(int a, int b) { return a * b; }
-static int divide(int a, int b) { return b ? a / b : 0; }
+/* One distinct noinline callee per case, and a volatile pointer table for the
+   dispatch. Without them the compiler is free to fold a switch into
+   arithmetic or turn `ops[i](a,b)` into a jump table of code offsets: clang
+   does exactly that for the obvious fixture, and then there is no data table
+   for the pass to resolve. The side effects keep both shapes real, which is
+   what this test measures. */
+#define TAP(p,n) __attribute__((noinline)) static void p##n(void){ sink += n + 1; }
+TAP(d,0) TAP(d,1) TAP(d,2) TAP(d,3) TAP(d,4) TAP(d,5) TAP(d,6) TAP(d,7) TAP(d,8) TAP(d,9)
+TAP(b,0) TAP(b,1) TAP(b,2) TAP(b,3) TAP(b,4) TAP(b,5) TAP(b,6)
 
-typedef int (*op)(int, int);
-static const op ops[] = {add, sub, mul, divide};
+static int add(int a,int b){return a+b;}
+static int sub(int a,int b){return a-b;}
+static int mul(int a,int b){return a*b;}
+static int dv(int a,int b){return b?a/b:0;}
+typedef int (*op)(int,int);
+static op volatile ops[] = {add,sub,mul,dv};
+int dispatch(int which,int a,int b){ if(which<0||which>3) return -1; return ops[which](a,b); }
 
-int dispatch(int which, int a, int b) {
-    if (which < 0 || which > 3) return -1;
-    return ops[which](a, b);
-}
+int dense(int x){ switch(x){
+ case 0: d0(); return 11; case 1: d1(); return 22; case 2: d2(); return 33;
+ case 3: d3(); return 44; case 4: d4(); return 55; case 5: d5(); return 66;
+ case 6: d6(); return 77; case 7: d7(); return 88; case 8: d8(); return 99;
+ case 9: d9(); return 111; default: return -1; } }
 
-int dense(int x) {
-    switch (x) {
-    case 0: sink += 1; return 11;
-    case 1: sink += 2; return 22;
-    case 2: sink += 3; return 33;
-    case 3: sink += 4; return 44;
-    case 4: sink += 5; return 55;
-    case 5: sink += 6; return 66;
-    case 6: sink += 7; return 77;
-    case 7: sink += 8; return 88;
-    case 8: sink += 9; return 99;
-    case 9: sink += 10; return 111;
-    default: return -1;
-    }
-}
-
-int biased(int x) {
-    switch (x) {
-    case 100: sink += 1; return 1;
-    case 101: sink += 2; return 2;
-    case 102: sink += 3; return 3;
-    case 103: sink += 4; return 4;
-    case 104: sink += 5; return 5;
-    case 105: sink += 6; return 6;
-    case 106: sink += 7; return 7;
-    default: return 0;
-    }
-}
-
+int biased(int x){ switch(x){
+ case 100: b0(); return 1; case 101: b1(); return 2; case 102: b2(); return 3;
+ case 103: b3(); return 4; case 104: b4(); return 5; case 105: b5(); return 6;
+ case 106: b6(); return 7; default: return 0; } }
 int main(int argc, char **argv) {
     sink = dispatch(argc & 3, argc, 2);
     sink += dense(argc);

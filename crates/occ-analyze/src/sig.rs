@@ -176,6 +176,7 @@ impl SignatureDb {
         // the others, which is a fact about the symbol table and not about
         // the code.
         let mut seen: HashMap<u64, ()> = HashMap::new();
+        let mut bodies: Vec<&[u8]> = Vec::new();
         for sym in &image.symbols {
             if !sym.defined || sym.kind != SymbolKind::Function || sym.name.is_empty() {
                 continue;
@@ -200,8 +201,72 @@ impl SignatureDb {
             if let Some(sig) = Signature::learn(&sym.name, code, want) {
                 db.insert(sig);
             }
+            if let Some(body) = view.bytes(sym.addr, 64) {
+                bodies.push(body);
+            }
         }
+        db.prune_ambiguous(&bodies);
         db
+    }
+
+    /// Drop every signature that cannot name a function uniquely.
+    ///
+    /// Library code contains bodies that are byte-identical apart from the
+    /// name: `_IO_puts.cold`, `_IO_fclose.cold` and friends are one `call
+    /// abort` each, and no prefix can tell them apart. Keeping all of them
+    /// makes every later match a collision, and picking one of the names
+    /// would be a wrong answer. Removing the whole conflicting set is the
+    /// only honest option: those functions stay unnamed, and the signatures
+    /// that are actually distinctive name everything else.
+    ///
+    /// The comparison is run against the bodies the database was learned
+    /// from, using the same rule `match_all` applies at call time, so a
+    /// conflict that would be reported later is removed here instead.
+    fn prune_ambiguous(&mut self, bodies: &[&[u8]]) {
+        let mut doomed: Vec<bool> = vec![false; self.entries.len()];
+        for body in bodies {
+            let matching: Vec<usize> = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.matches(body))
+                .map(|(i, _)| i)
+                .collect();
+            if matching.len() < 2 {
+                continue;
+            }
+            let best = matching.iter().map(|&i| self.entries[i].len()).max().unwrap_or(0);
+            let winners: Vec<usize> = matching
+                .into_iter()
+                .filter(|&i| self.entries[i].len() == best)
+                .collect();
+            let mut names: Vec<&str> = winners.iter().map(|&i| self.entries[i].name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            if names.len() > 1 {
+                for i in winners {
+                    doomed[i] = true;
+                }
+            }
+        }
+        if doomed.iter().any(|&d| d) {
+            self.entries = std::mem::take(&mut self.entries)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !doomed[*i])
+                .map(|(_, s)| s)
+                .collect();
+            self.reindex();
+        }
+    }
+
+    /// Rebuild the first-four-bytes index after the entry list changed.
+    fn reindex(&mut self) {
+        self.index.clear();
+        for i in 0..self.entries.len() {
+            let key = key_of(&self.entries[i].bytes);
+            self.index.entry(key).or_default().push(i);
+        }
     }
 
     /// Match every unnamed function against the database.

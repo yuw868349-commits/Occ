@@ -105,8 +105,12 @@ fn build(name: &str, source: &str) -> Option<PathBuf> {
     let bin = dir.join(format!("{name}-{unique}"));
     // A compiler that is present but fails is a failure, not a skip: a broken
     // fixture would leave the feature untested and the suite green.
+    // The stack protector is explicit: Ubuntu's gcc enables it by default and
+    // clang does not, and the coverage test measures the canary failure block.
+    // A fixture whose block count depends on which compiler is installed
+    // tests the distribution, not the tracer.
     let output = Command::new("cc")
-        .args(["-O0", "-fno-inline", "-g", "-pthread", "-o"])
+        .args(["-O0", "-fno-inline", "-g", "-pthread", "-fstack-protector-strong", "-o"])
         .arg(&bin)
         .arg(&src)
         .output()
