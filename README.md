@@ -53,9 +53,10 @@ end)`. There is `code.function target=<handle>`, `code.explore`, `code.taint`,
 flow, and how much to render; the caller says how much it wants to read.
 
 **5. Zero dependencies.** `Cargo.lock` contains twelve path crates and no
-registry source. JSON, SHA-256, demangling, ELF/PE/Mach-O/WASM parsing, x86 and
-AArch64 and RISC-V decoding, DWARF, and the MCP transport are all implemented
-here. The only external symbols are the Linux system calls in `occ-sys`.
+registry source. JSON, SHA-256, demangling, ELF/PE/Mach-O/WASM parsing, x86,
+ARM32, AArch64, RISC-V and WASM decoding, DWARF, and the MCP transport are all
+implemented here. The only external symbols are the Linux system calls in
+`occ-sys`.
 
 ## One exchange, asked and answered
 
@@ -233,11 +234,15 @@ caller can re-decode independently.
 | ELF | Both classes, both byte orders, `ET_REL`/`ET_EXEC`/`ET_DYN`/core. Section and program headers, `.symtab` and `.dynsym` merged and de-duplicated, relocations, PLT/GOT binding, interpreter and `DT_NEEDED`. |
 | PE/COFF | PE32 and PE32+, imports with IAT slots, exports, base relocations, Rich header detection, and raw `COFF` objects. |
 | Mach-O | Thin and fat, `MH_EXECUTE`/`DYLIB`/`BUNDLE`/`OBJECT`, load commands, `LC_SYMTAB`, `__DWARF` sections. |
-| WASM | Sections, imports, exports, function bodies decoded from bytecode. |
+| WASM | The type, import, function and code sections, the signature each function index names, and the function bodies decoded from bytecode. |
 
-Architectures: x86 and x86-64 (full decode, decompile, symbolic execution),
-AArch64 and RISC-V 32/64 (full instruction decode, decompile, symbolic
-execution, taint), WebAssembly bytecode.
+Architectures: x86 and x86-64 (full decode, decompile, symbolic execution,
+taint), ARM 32-bit in both instruction sets (A32 and Thumb, with the
+conditional blocks, the extends, the parallel additions and the exchanged
+ones; full decode, decompile, symbolic execution), AArch64
+and RISC-V 32/64 (full instruction decode, decompile, symbolic execution,
+taint), WebAssembly (full decode, and decompile by walking the structured
+regions the bytecode is built from).
 
 Loading does what a loader does: mapped segments and permissions, symbol tables,
 import/export resolution, **PLT/GOT and IAT binding** so `call [rip+0x2f4a]`
@@ -299,6 +304,43 @@ optimised code with shapes no compiler emits. `cargo run -p occ-decompile
 --example decompile_symbol -- /lib/x86_64-linux-gnu/libc.so.6 warn` decompiles
 one symbol from it, and the whole library can be walked the same way without
 running out of stack.
+
+WebAssembly is the one architecture that does not go through that pipeline, and
+the reason is in the bytecode rather than in the implementation. A WASM
+function is not a graph of basic blocks: it is a tree of `block`, `loop`, `if`
+and `end`, and the instructions between them carry a stack whose height
+depends on the path taken to reach them. Lifting that into a register machine
+would mean inventing a register for every stack slot, inventing a condition
+code for every branch, and then recovering the structure the bytecode already
+states explicitly.
+
+So the WASM lifter walks the tree instead, and the shape it produces is the
+shape the source had: `if` becomes an `if`, a `loop` whose only back edge is
+at its end becomes a `do`/`while`, a `br_table` becomes a `switch`. A branch
+that leaves a region carries the values the region's result type names, and
+the two halves of an `if` that leave different values are joined by a
+synthetic phi, exactly as a join would be in the other architectures. A
+label is a `break` and a `continue` where the bytecode says so, and what the
+module does not state — the register a local lives in, the name of a table —
+is named the way the module names it.
+
+Two details are worth stating because they are where a WASM lifter usually
+goes wrong. The first is reachability: a `br_table` has one branch per case,
+and they do not all leave the same number of regions, so a region is dead
+only when every branch out of it leaves it — a per-frame decision, not a
+per-function one. The second is the operand stack: a branch truncates the
+stack to the height its target frame was opened at, and the values above that
+height are the ones it carries, so a `br` out of a region with a result moves
+the result with it.
+
+One shape no compiler emits is a branch back to the top of its own loop. A
+compiler folds its `continue` into a conditional around the rest of the body,
+so a `br 0` in the middle of a loop never appears in compiled output; the
+decoder still has to read it and the decompiler still has to say it as
+`continue`. `tests/fixtures/fixture.wasm3` is written by hand for it, built by
+`scripts/wasm3_fixture.py`, which writes the sections out because there is no
+WAT assembler in the build environment — a fixture that needs a tool the build
+does not have is a test that skips itself.
 
 `code.explore` forks the state at branch conditions that depend on an argument,
 accumulates constraints along each path, solves them for the inputs that reach it,
@@ -613,22 +655,25 @@ the evidence."*
 
 | Crate | Responsibility | Lines |
 | --- | --- | --- |
-| `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 3.0k |
-| `occ-json` | JSON value, parser, writer, schema validation. | 2.0k |
-| `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid`, `setrlimit`, `atexit` as `extern "C"`. | 1.8k |
-| `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, `ar` archives, demangling, SHA-256. | 4.7k |
-| `occ-decode` | x86, AArch64, RISC-V and WASM instruction decoding. | 11.6k |
-| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 4.2k |
-| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.4k |
-| `occ-decompile` | Lift, SSA, cleanup, structuring, rendering. | 15.1k |
-| `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 3.6k |
-| `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 3.1k |
-| `occ-vsa` | Value sets: what an indirect branch or call can reach, and why. | 2.7k |
-| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.6k |
-| `occ-mcp` | The 38 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.6k |
-| `occ-ffi` | The C interface: thirteen functions, one hand-written header. | 1.4k |
+| `occ-core` | Handles, addresses, evidence, hypotheses, image IR, depth budgets. No I/O. | 2.2k |
+| `occ-json` | JSON value, parser, writer, schema validation. | 1.5k |
+| `occ-sys` | `ptrace`, `waitpid`, `mmap`, `kill`, `setpgid`, `setrlimit`, `atexit` as `extern "C"`. | 1.1k |
+| `occ-bin` | Container parsing: ELF, PE/COFF, Mach-O, WASM, `ar` archives, demangling, SHA-256. | 5.8k |
+| `occ-decode` | x86, ARM32 in both instruction sets, AArch64, RISC-V and WASM instruction decoding. | 16.7k |
+| `occ-analyze` | Recursive descent, CFG, cross references, strings, entropy, fingerprint, jump tables. | 4.0k |
+| `occ-dwarf` | DWARF units, abbreviations, line program, location lists. | 2.0k |
+| `occ-decompile` | Lift, SSA, cleanup, structuring, reshaping, rendering; the WASM structured walk. | 18.5k |
+| `occ-sym` | Path exploration, constraint solving, taint propagation over that IR. | 2.8k |
+| `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 1.3k |
+| `occ-vsa` | Value sets: what an indirect branch or call can reach, and why. | 1.8k |
+| `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.7k |
+| `occ-mcp` | The 39 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.6k |
+| `occ-ffi` | The C interface: thirteen functions, one hand-written header. | 0.7k |
 
-61.7k lines of Rust, 466 tests, 82 end-to-end MCP checks.
+64.7k lines of Rust, 625 tests, 82 end-to-end MCP checks. The line count is the
+code, not the comments and not the blank lines, and it leaves out the SVE
+encoding tables, which are generated from the architecture manual rather than
+written by hand and which run to a hundred thousand lines on their own.
 
 ## Verification
 
@@ -636,7 +681,7 @@ Unit tests are necessary and not sufficient: most of the serious bugs found whil
 building this were invisible to them and obvious against a real file.
 
 ```bash
-cargo test --workspace                                         # 466 tests
+cargo test --workspace                                         # 625 tests
 cargo clippy --workspace --all-targets -- -D warnings          # clean
 python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
 scripts/ffi_check.sh /bin/true                                 # the C interface
@@ -723,6 +768,19 @@ AVX-512 shift form the table does not carry, and 32-bit libraries whose `.text`
 holds data that `objdump` reads one byte at a time where the decoder follows the
 encoding.
 
+The same rule covers a class that can be enumerated rather than swept.
+Thumb-32's `0xFA` space — the register shifts, the extends, and the parallel
+additions and subtractions — is one first halfword plus sixteen bits of second,
+so `scripts/t32_fa_scan.py` reads all of its encodings with `llvm-objdump`,
+`cargo run -p occ-decode --example t32_fa_table` writes the decoder's reading of
+the same space, and `scripts/t32_fa_cmp.py` compares the two. That comparison
+found three mistakes in the class: a checksum group carried over from A32 that
+the Thumb space does not have, a byte-reversal reading that took its source from
+the wrong halfword, and an extend group that stopped at half its range. The
+remaining differences are all encodings where the reference reads a field the
+architecture manual marks as ignored; the report names them as such rather than
+counting them as agreement.
+
 Bugs this discipline caught, each of which had passing unit tests at the time:
 
 - **dynsym index off by one** — `__libc_start_main` resolved as `__mempcpy_chk`,
@@ -805,9 +863,28 @@ Bugs this discipline caught, each of which had passing unit tests at the time:
 
 Stated because the tool is supposed to state them, not because they are temporary.
 
-- **Decompilation, path exploration and taint cover x86-64, AArch64 and
-  RISC-V.** WASM decodes and recovers control flow, but `code.decompile` returns
-  an outline for it rather than a made-up body.
+- **Decompilation covers x86-64, x86-32, ARM32, AArch64, RISC-V and
+  WebAssembly; path exploration and taint cover all of them except
+  WebAssembly.** A WASM function is decompiled by walking the structured
+  regions the bytecode is built from, which produces a body, but not the
+  register-level program the symbolic executor explores: there is no
+  register file to fork and no condition flags to read, so `code.explore`
+  and `code.paths` report that they have nothing to execute rather than
+  guessing. The operand stack could be modelled as that state, and that
+  work has not been done.
+- **ARM32's 32-bit Thumb space is not finished.** The 16-bit set is, and in
+  the 32-bit set the conditional branches, the extends, the parallel
+  additions and subtractions, the exchanged forms, the multiply family,
+  the load and store multiples, the load and store singles and the
+  exclusive accesses are read. The table branches (`tbb`, `tbh`), the
+  acquire and release forms, and the coprocessor space — VFP and NEON —
+  are not. The CRC32 extension is read in neither instruction set: it is
+  an ARMv8 instruction written in the A32 space, and the Thumb space at
+  that encoding has nothing behind it, which is why the decoder reports
+  those halfwords as undefined rather than naming an instruction the
+  Thumb machine cannot execute. An encoding this decoder cannot read is
+  reported as an undefined instruction or as a coprocessor instruction,
+  never as a guess at what it might have been.
 - **AVX-512 coverage is uneven by construction.** The EVEX table holds the
   encodings both disassemblers agreed on, which is most of the set but not all of
   it: `vpshldw`, `vdbpsadbw`, `vrsqrt14ps` and a few dozen others are missing,
