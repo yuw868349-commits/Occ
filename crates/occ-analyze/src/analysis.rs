@@ -207,6 +207,17 @@ impl Analysis {
             image.fingerprint.clone()
         };
 
+        // A packed image only shows its stub. Saying so here is part of the
+        // result, not a footnote: 1483 recovered functions read as a complete
+        // analysis of a file whose real code has not been decompressed yet.
+        let mut notes = rec.notes;
+        if let Some(pack) = &fp.packer_suspicion {
+            notes.push(format!(
+                "image is packed ({}): the functions below are the unpacking stub, not the payload",
+                pack.statement.trim_end_matches('.')
+            ));
+        }
+
         Analysis {
             coverage: Coverage {
                 code_bytes: rec.code_bytes,
@@ -225,7 +236,7 @@ impl Analysis {
             xrefs: XrefTable::new(rec.xrefs),
             strings,
             thunks: rec.thunks,
-            notes: rec.notes,
+            notes,
             index,
             string_at,
         }
@@ -315,14 +326,21 @@ impl Analysis {
     /// "decoded as instructions" rather than "covered": a build whose code is
     /// half `.word` would otherwise read as complete.
     pub fn summary(&self) -> String {
-        format!(
+        let base = format!(
             "{} functions, {} instructions, {} blocks, {:.1}% of {} executable bytes decoded as instructions",
             self.coverage.functions,
             self.coverage.insns,
             self.coverage.blocks,
             self.coverage.fraction() * 100.0,
             self.coverage.code_bytes
-        )
+        );
+        match &self.fingerprint.packer_suspicion {
+            Some(p) => format!(
+                "{base} — packed (confidence {:.2}): these functions are the stub, not the payload",
+                p.confidence
+            ),
+            None => base,
+        }
     }
 }
 

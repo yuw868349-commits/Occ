@@ -31,6 +31,20 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     let symbols = symbol_blob(image);
     let imports = import_blob(image);
 
+    // Runtime toolchains that own the entry point and the calling convention.
+    // These are decided before the generic compiler heuristics because a
+    // VB6 or CLR image contains MSVC-compiled runtime code inside it: the
+    // question "which compiler built this file" would answer `msvc` for the
+    // runtime and miss what actually produced the executable around it.
+    let msvb = runtime_import(image, &["msvbvm50", "msvbvm60"])
+        || image.imports.iter().any(|i| i.name.starts_with("__vba"));
+    let dotnet = runtime_import(image, &["mscoree"])
+        || image
+            .imports
+            .iter()
+            .any(|i| matches!(i.name.as_str(), "_CorExeMain" | "_CorDllMain" | "_CorMain"));
+    let delphi = delphi_sections(image) || delphi_symbols(&symbols);
+
     // Compiler family: strongest signal first.
     let mut claim = Claim::new(handle.clone(), "compiler family has not been determined");
     if let Some(c) = &comment {
@@ -93,8 +107,38 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.9,
         ));
     }
+    if msvb {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::ImportCall,
+            EvidenceSource::Loader,
+            "the import table names the Visual Basic 6 runtime (MSVBVM)",
+            0.95,
+        ));
+    }
+    if dotnet {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::ImportCall,
+            EvidenceSource::Loader,
+            "the entry point is the CLR stub (_CorExeMain/mscoree)",
+            0.95,
+        ));
+    }
+    if delphi {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::FormatMeta,
+            EvidenceSource::Loader,
+            "CODE/DATA/BSS/TLS section set and VCL symbol names are Delphi's layout",
+            0.8,
+        ));
+    }
     claim.recompute();
-    fp.compiler = if claim.confidence >= 0.5 {
+    fp.compiler = if msvb {
+        CompilerFamily::Msvb
+    } else if dotnet {
+        CompilerFamily::DotNet
+    } else if delphi {
+        CompilerFamily::Delphi
+    } else if claim.confidence >= 0.5 {
         if comment.as_deref().is_some_and(|c| c.contains("clang version")) {
             CompilerFamily::Clang
         } else if comment.as_deref().is_some_and(|c| c.contains("rustc")) {
@@ -113,6 +157,13 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     } else {
         CompilerFamily::Unknown
     };
+    // The statement must say what was found, not what was asked. Leaving the
+    // placeholder in place made a confident VB6 reading print "compiler family
+    // has not been determined" next to the evidence that had settled it.
+    claim.statement = match fp.compiler {
+        CompilerFamily::Unknown => "compiler family has not been determined".to_string(),
+        other => format!("compiler family is {}", other.label()),
+    };
     fp.compiler_claim = claim;
 
     // Language.
@@ -121,6 +172,13 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
         CompilerFamily::Go => LangGuess::Go,
         CompilerFamily::Swift => LangGuess::Swift,
         CompilerFamily::Zig => LangGuess::Zig,
+        CompilerFamily::Msvb => LangGuess::VisualBasic,
+        CompilerFamily::Delphi => LangGuess::Pascal,
+        // A CLR image can be C#, VB.NET, F# or PowerShell; the container does
+        // not say which. Saying `csharp` here would be a guess dressed as a
+        // reading, so the language stays unknown and the compiler family
+        // carries the finding.
+        CompilerFamily::DotNet => LangGuess::Unknown,
         _ => {
             if symbols.contains("_Z") && !symbols.contains("rust_eh_personality") {
                 LangGuess::Cpp
@@ -169,7 +227,11 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             ));
         }
     }
-    let packed_names = ["UPX0", "UPX1", ".aspack", ".adata", ".packed", "MPRESS1"];
+    let packed_names = [
+        "UPX0", "UPX1", "UPX2", ".aspack", ".adata", ".packed", "MPRESS1", "MPRESS2", ".nsp0",
+        ".nsp1", ".petite", ".themida", ".vmp0", ".vmp1", ".winlice", ".perplex", ".kkrunchy",
+        "PEC2", "ASPack",
+    ];
     for n in packed_names {
         if image.section_by_name(n).is_some() {
             pack = pack.with(Evidence::support(
@@ -179,6 +241,44 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
                 0.8,
             ));
         }
+    }
+
+    // A writable *and* executable section is the decompression stub's own
+    // output buffer. Optimised compilers do not emit one: W^X is the norm on
+    // every platform this tool reads. Two or more is a wrapper's fingerprint
+    // regardless of which packer it is, which is what catches the builds that
+    // rename their sections (`.kaine0`, `.kaine1`) to defeat the name list.
+    let rwx: Vec<&str> = image
+        .sections
+        .iter()
+        .filter(|s| s.perm.write() && s.perm.exec())
+        .map(|s| s.name.as_str())
+        .collect();
+    if !rwx.is_empty() {
+        pack = pack.with(Evidence::support(
+            EvidenceKind::FormatMeta,
+            EvidenceSource::Heuristic,
+            format!(
+                "{} writable+executable section(s) ({}): compiled code is not W^X",
+                rwx.len(),
+                rwx.join(", ")
+            ),
+            if rwx.len() >= 2 { 0.7 } else { 0.45 },
+        ));
+    }
+
+    // A stub that only needs GetModuleHandleA/LoadLibraryA and has almost no
+    // imports is unpacking the rest of itself at run time.
+    if image.imports.len() <= 2 && image.sections.iter().any(|s| s.kind == SectionKind::Code) {
+        pack = pack.with(Evidence::support(
+            EvidenceKind::ImportCall,
+            EvidenceSource::Heuristic,
+            format!(
+                "only {} import(s) for a native executable",
+                image.imports.len()
+            ),
+            0.3,
+        ));
     }
     if image.imports.len() <= 3 && image.section_by_name(".text").is_some() {
         pack = pack.with(Evidence::support(
@@ -227,6 +327,36 @@ fn runtime(image: &Image) -> Option<String> {
 
 fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// True when something is imported from one of `libs` (case-insensitive,
+/// extension-insensitive: PE records `MSVBVM60.dll`, some writers use
+/// `MSVBVM60.DLL` or no extension at all).
+fn runtime_import(image: &Image, libs: &[&str]) -> bool {
+    image.imports.iter().any(|i| {
+        i.library.as_deref().is_some_and(|l| {
+            let l = l.to_ascii_lowercase();
+            let stem = l.split('.').next().unwrap_or(&l);
+            libs.contains(&stem)
+        })
+    })
+}
+
+/// Delphi and C++ Builder emit a fixed four-section layout: `CODE`, `DATA`,
+/// `BSS`, `TLS` (with the dot missing), plus `.idata`/`.didata`. MSVC's
+/// equivalent is `.text`/`.data`/`.bss`/`.tls`, so the combination is a
+/// reliable discriminator rather than a loose "a section called DATA".
+fn delphi_sections(image: &Image) -> bool {
+    let has = |n: &str| image.section_by_name(n).is_some() || image.section_by_name(&format!(".{n}")).is_some();
+    has("CODE") && has("DATA") && has("BSS")
+}
+
+/// Unstripped Delphi binaries keep VCL/RTL symbols, which are published as
+/// `@System@@...`, `@Classes@...` or the older `System@@` spelling.
+fn delphi_symbols(symbols: &str) -> bool {
+    symbols.lines().any(|l| {
+        l.starts_with("@System@") || l.starts_with("@Classes@") || l.starts_with("System@@")
+    })
 }
 
 fn read_comment(view: &View) -> Option<String> {
@@ -305,5 +435,96 @@ mod tests {
         let fp = fingerprint(&img, &v);
         assert_eq!(fp.compiler, CompilerFamily::Unknown);
         assert_eq!(fp.compiler_claim.confidence, 0.0);
+    }
+
+    fn with_imports(mut img: Image, imports: &[(&str, &str)]) -> Image {
+        let mut slot = 0x3000;
+        for (lib, name) in imports {
+            img.imports.push(occ_core::Import {
+                name: (*name).into(),
+                library: Some((*lib).into()),
+                ordinal: None,
+                slot: Some(Addr(slot)),
+                kind: occ_core::ImportKind::Normal,
+            });
+            slot += 8;
+        }
+        img
+    }
+
+    #[test]
+    fn vb6_runtime_import_beats_the_msvc_code_inside_it() {
+        let data = vec![0u8; 16];
+        let base = image_with_sections(vec![section(".text", 0, 16)]);
+        let img = with_imports(base, &[("MSVBVM60.dll", "ThunRTMain")]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::Msvb);
+        assert_eq!(fp.language, LangGuess::VisualBasic);
+        assert!(fp.compiler_claim.confidence >= 0.9);
+    }
+
+    #[test]
+    fn clr_stub_is_reported_as_dotnet() {
+        let data = vec![0u8; 16];
+        let base = image_with_sections(vec![section(".text", 0, 16)]);
+        let img = with_imports(base, &[("mscoree.dll", "_CorExeMain")]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::DotNet);
+        // C#, VB.NET, F# all produce this image; the container does not say
+        // which, so the language must stay unknown rather than guess C#.
+        assert_eq!(fp.language, LangGuess::Unknown);
+    }
+
+    #[test]
+    fn delphi_section_layout_is_detected() {
+        let data = vec![0u8; 16];
+        let img = image_with_sections(vec![
+            section("CODE", 0, 8),
+            section("DATA", 8, 4),
+            section("BSS", 12, 4),
+        ]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::Delphi);
+        assert_eq!(fp.language, LangGuess::Pascal);
+    }
+
+    #[test]
+    fn writable_executable_sections_raise_packer_suspicion() {
+        // Two RWX code sections: no compiler emits this, a decompression stub
+        // does. The section names are deliberately not on any known-packer
+        // list, which is the case that used to pass unnoticed.
+        let mut data = vec![0u8; 64];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        let img = image_with_sections(vec![
+            Section {
+                index: 1,
+                name: ".kaine0".into(),
+                addr: Addr(0x1000),
+                file_offset: 0,
+                size: 32,
+                file_size: 32,
+                kind: SectionKind::Code,
+                perm: Perm::R.union(Perm::W).union(Perm::X),
+            },
+            Section {
+                index: 2,
+                name: ".pack".into(),
+                addr: Addr(0x1020),
+                file_offset: 32,
+                size: 32,
+                file_size: 32,
+                kind: SectionKind::Code,
+                perm: Perm::R.union(Perm::W).union(Perm::X),
+            },
+        ]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        let pack = fp.packer_suspicion.expect("packer should be suspected");
+        assert!(pack.confidence >= 0.5, "confidence {}", pack.confidence);
     }
 }

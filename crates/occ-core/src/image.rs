@@ -490,6 +490,12 @@ pub enum CompilerFamily {
     Swift,
     /// Zig.
     Zig,
+    /// Microsoft Visual Basic 6 runtime (MSVBVM50/60).
+    Msvb,
+    /// Borland/Embarcadero Delphi or C++ Builder.
+    Delphi,
+    /// A CLR image: the entry point is the CLR stub, not native code.
+    DotNet,
     /// Not determined.
     Unknown,
 }
@@ -505,6 +511,9 @@ impl CompilerFamily {
             CompilerFamily::Go => "go",
             CompilerFamily::Swift => "swift",
             CompilerFamily::Zig => "zig",
+            CompilerFamily::Msvb => "msvb",
+            CompilerFamily::Delphi => "delphi",
+            CompilerFamily::DotNet => "dotnet",
             CompilerFamily::Unknown => "unknown",
         }
     }
@@ -525,6 +534,12 @@ pub enum LangGuess {
     Swift,
     /// Zig.
     Zig,
+    /// Visual Basic (6 and earlier native, or VB.NET).
+    VisualBasic,
+    /// A CLR language that the metadata has not narrowed further (C#, F#, …).
+    CSharp,
+    /// Object Pascal (Delphi, Free Pascal).
+    Pascal,
     /// Not determined.
     Unknown,
 }
@@ -539,6 +554,9 @@ impl LangGuess {
             LangGuess::Go => "go",
             LangGuess::Swift => "swift",
             LangGuess::Zig => "zig",
+            LangGuess::VisualBasic => "visual-basic",
+            LangGuess::CSharp => "csharp",
+            LangGuess::Pascal => "pascal",
             LangGuess::Unknown => "unknown",
         }
     }

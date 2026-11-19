@@ -323,13 +323,22 @@ static TOOLS: [ToolDef; 39] = [
 // ---------------------------------------------------------------------------
 
 fn summary_of(file: &ImageFile) -> String {
-    format!(
+    let base = format!(
         "{} — {} functions, {} strings, {:.1}% of executable bytes decoded as instructions",
         file.image.headline(),
         file.analysis.coverage.functions,
         file.analysis.strings.len(),
         f64::from(file.analysis.coverage.fraction()) * 100.0
-    )
+    );
+    // Without this the first line of every reply reads as a complete analysis
+    // of a packed file whose payload has not been decompressed yet.
+    match &file.analysis.fingerprint.packer_suspicion {
+        Some(p) => format!(
+            "{base} — packed (confidence {:.2}): the functions are the stub, not the payload",
+            p.confidence
+        ),
+        None => base,
+    }
 }
 
 /// Coverage, as every reply reports it.
