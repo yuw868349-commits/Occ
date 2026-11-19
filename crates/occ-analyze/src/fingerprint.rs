@@ -50,7 +50,24 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     let borland_layout = borland_sections(image);
     let borland_marker = borland_product(view);
     let delphi = delphi_symbols(&symbols) || matches!(borland_marker, Some((CompilerFamily::Delphi, _)));
-    let borland = borland_layout || borland_marker.is_some();
+    // CODE/DATA/BSS is not Borland's alone: TASM and hand-written Win32
+    // assembly produce the same section names, and so do a few linkers for
+    // other toolchains. The layout is a hint that needs one corroborating
+    // Borland fact — its product string, its RTL symbols, or Pascal/Delphi
+    // mangling. Claiming `borland` from sections alone labelled a TASM
+    // crackme as C++ Builder.
+    // A full Borland RTL link also emits BSS and a TLS directory; TASM does
+    // not, which is the difference between a C++ Builder binary and the
+    // SECTION names happening to match.
+    let borland_full = borland_layout
+        && image.section_by_name("BSS").is_some()
+        && (image.section_by_name("TLS").is_some() || image.section_by_name(".tls").is_some());
+    let borland_rt = borland_full
+        || symbols.contains("@System@@")
+        || symbols.contains("Borland")
+        || symbols.contains("Delphi")
+        || delphi;
+    let borland = (borland_layout && borland_rt) || borland_marker.is_some() || delphi;
     let msvc_rt = msvc_runtime(image);
     let msvc_link = rich_header(view);
 
@@ -132,7 +149,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.95,
         ));
     }
-    if borland_layout {
+    if borland && borland_layout {
         claim = claim.with(Evidence::support(
             EvidenceKind::FormatMeta,
             EvidenceSource::Loader,
@@ -670,9 +687,10 @@ mod tests {
     }
 
     #[test]
-    fn the_borland_layout_names_the_toolchain_but_not_the_language() {
-        // Delphi and C++ Builder share this layout, so the layout alone can
-        // only say "Borland".
+    fn the_borland_layout_alone_is_not_enough() {
+        // Delphi and C++ Builder share this layout, and so do TASM and some
+        // hand-written assembly linkers. Without a Borland fact the layout
+        // says nothing about the compiler.
         let data = vec![0u8; 16];
         let img = image_with_sections(vec![
             section("CODE", 0, 8),
@@ -681,7 +699,7 @@ mod tests {
         ]);
         let v = View::new(&img, &data);
         let fp = fingerprint(&img, &v);
-        assert_eq!(fp.compiler, CompilerFamily::Borland);
+        assert_eq!(fp.compiler, CompilerFamily::Unknown);
         assert_eq!(fp.language, LangGuess::Unknown);
 
         // Pascal symbol mangling is the evidence that separates Delphi from
@@ -748,15 +766,28 @@ mod tests {
     }
 
     #[test]
-    fn borland_layout_without_bss_still_names_the_toolchain() {
+    fn borland_layout_with_delphi_mangling_names_delphi() {
         let data = vec![0u8; 16];
-        let img = image_with_sections(vec![
+        let mut img = image_with_sections(vec![
             section("CODE", 0, 8),
             section("DATA", 8, 8),
         ]);
+        img.symbols.push(occ_core::Symbol {
+            name: "@System@@HandleFinally$qqrv".into(),
+            addr: Addr(0x1000),
+            size: 0,
+            kind: occ_core::SymbolKind::Function,
+            binding: occ_core::SymbolBinding::Global,
+            section: None,
+            defined: true,
+            demangled: false,
+        });
         let v = View::new(&img, &data);
         let fp = fingerprint(&img, &v);
-        assert_eq!(fp.compiler, CompilerFamily::Borland);
+        // Pascal RTL mangling is the fact that separates Delphi from C++
+        // Builder; the layout plus that mangle is a Delphi reading.
+        assert_eq!(fp.compiler, CompilerFamily::Delphi);
+        assert_eq!(fp.language, LangGuess::Pascal);
     }
 
     #[test]
