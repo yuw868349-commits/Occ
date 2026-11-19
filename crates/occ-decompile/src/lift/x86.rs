@@ -1057,6 +1057,22 @@ impl<'a> Lifter<'a> {
             | "cmovb" | "cmovbe" | "cmova" | "cmovae" | "cmovs" | "cmovns" => {
                 self.lift_cmov(m, &p.ops, &mut out.stmts)
             }
+            "pop" if p.ops.is_empty() => {
+                // `pop ds`/`pop es` move a selector, not a general register.
+                // In the flat 16-bit model a COM image runs in, every
+                // selector names the same segment, so the base does not
+                // change and dropping the write is exact, not an omission.
+                self.core.notes.push((
+                    insn.addr,
+                    format!("{}: selector move; the flat model's base is unchanged", insn.text),
+                ));
+            }
+            "push" if p.ops.is_empty() => {
+                self.core.notes.push((
+                    insn.addr,
+                    format!("{}: selector push; the value is not tracked", insn.text),
+                ));
+            }
             "push" => self.lift_push(&p.ops, &mut out.stmts),
             "pop" => self.lift_pop(&p.ops, &mut out.stmts),
             "leave" => {
@@ -1092,7 +1108,9 @@ impl<'a> Lifter<'a> {
             }
             "call" => self.lift_call(insn, &p.ops, &mut out.stmts),
             "jmp" => self.lift_jmp(&p.ops, &mut out.stmts),
-            "ret" | "retn" => self.lift_ret(&p.ops, insn.addr, &mut out.stmts),
+            "ret" | "retn" | "retf" | "retfq" => {
+                self.lift_ret(&p.ops, insn.addr, &mut out.stmts)
+            }
             other => {
                 if cond_of_jcc(other).is_some() {
                     // Handled by take_condition once the block ends.
@@ -4162,6 +4180,35 @@ impl<'a> Lifter<'a> {
         addr: Addr,
         stmts: &mut Vec<Stmt>,
     ) -> bool {
+        if m.starts_with("lods") {
+            // `lods` reads [rsi] into the accumulator and advances rsi. The
+            // decoder prints the accumulator first and the memory operand
+            // second, so the generic string path, which expects memory first,
+            // would drop the load entirely.
+            let width = match m {
+                "lodsb" => 1,
+                "lodsw" => 2,
+                "lodsd" => 4,
+                _ => 8,
+            };
+            let Some(mem) = ops.get(1) else {
+                return false;
+            };
+            let address = self.elem_address(mem, 0, stmts);
+            let value = Expr::Load {
+                addr: Box::new(address),
+                size: width,
+                signed: false,
+            };
+            self.core
+                .write(&Operand::Reg(Reg::view(0, width, 0)), value, stmts);
+            self.bump(6, Expr::Const(u64::from(width)), stmts);
+            self.core.notes.push((
+                addr,
+                format!("{m}: one {width}-byte load into the accumulator"),
+            ));
+            return true;
+        }
         let Some(Operand::Mem { size, .. }) = ops.first() else {
             return false;
         };
@@ -4214,6 +4261,34 @@ impl<'a> Lifter<'a> {
                     } else {
                         format!("{m}: one {width}-byte copy")
                     },
+                ));
+            }
+            "lodsb" | "lodsw" | "lodsd" | "lodsq" => {
+                // `lods` reads [rsi] into the accumulator and advances rsi.
+                // The decoder prints `al, byte ptr [si]`, so the memory
+                // operand is the second one; a bare `lodsb` prints no
+                // operands and still has to load.
+                let width = match m {
+                    "lodsb" => 1,
+                    "lodsw" => 2,
+                    "lodsd" => 4,
+                    _ => 8,
+                };
+                let Some(mem) = ops.get(1).or_else(|| ops.first()) else {
+                    return false;
+                };
+                let address = self.elem_address(mem, 0, stmts);
+                let value = Expr::Load {
+                    addr: Box::new(address),
+                    size: width,
+                    signed: false,
+                };
+                self.core
+                    .write(&Operand::Reg(Reg::view(0, width, 0)), value, stmts);
+                self.bump(6, Expr::Const(u64::from(width)), stmts);
+                self.core.notes.push((
+                    addr,
+                    format!("{m}: one {width}-byte load into the accumulator"),
                 ));
             }
             "stosb" | "stos" => {
