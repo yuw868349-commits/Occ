@@ -739,6 +739,10 @@ buffer to two independent disassemblers, and records what they agree on.
 | `scripts/vsib_tables.py` | `vsib_tables.rs` (gather/scatter) | GNU objdump 2.42 + LLVM 23 |
 | `scripts/compare_tables.py` | `cmp_ops.rs` (comparisons) | GNU objdump 2.42 + LLVM 23 |
 
+`scripts/README.md` lists every development instrument in that directory — what
+each one produces, what it needs installed, and which of them are libraries
+rather than programs.
+
 The agreement rule is what makes this usable: an encoding the two channels
 describe differently is dropped, not guessed. A few hundred encodings are
 dropped that way, and the table says nothing about them rather than something

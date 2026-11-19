@@ -12,6 +12,11 @@ are separate implementations of the same architecture manual, and where
 they differ the encoding is either undefined or unpredictable, so both
 have to be read to tell the two apart.
 
+This script records one side only.  It is what to use when the reference
+reading has to be inspected by hand, or when two recordings of the same
+class are to be compared offline with `t32_fa_diff.py`.  `t32_fa_cmp.py`
+does the whole round in one process and is the one to run after a change.
+
 Usage:
     t32_fa_scan.py [--out table.txt] [--rn 3] [--objdump llvm|gnu]
 """

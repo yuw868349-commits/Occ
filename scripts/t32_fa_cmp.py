@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read every encoding of the T32 `0xFA` class and record what it means.
+"""Check the T32 `0xFA` class against `llvm-objdump`, in one process.
 
 The class is the one whose first halfword is `1111 1010`: the register
 shifts, the extends, and the parallel additions and subtractions.  It is
@@ -7,11 +7,17 @@ read from the second halfword as well, so a mistake in one field shows up
 as a different instruction rather than as a wrong operand, and the only
 way to find it is to read every encoding of the class and compare.
 
-The reference is `llvm-objdump`, which is a different implementation of
-the same architecture manual.  Where the two disagree, the difference is
-reported: the class has more than one way to spell each instruction, and
-a name that differs is not always a mistake, but an instruction that
-means something else always is.
+Both sides are produced here rather than read from files: this script
+writes every encoding into an object, asks `llvm-objdump` what it is,
+runs the decoder over the same bytes through the `t32_fa_table` example,
+and diffs the two listings.  Use `t32_fa_scan.py` instead when the
+reference side alone has to be inspected by hand.
+
+The reference is a different implementation of the same architecture
+manual.  Where the two disagree, the difference is reported: the class
+has more than one way to spell each instruction, and a name that differs
+is not always a mistake, but an instruction that means something else
+always is.
 
 Usage:
     t32_fa_cmp.py [--arch armv7]

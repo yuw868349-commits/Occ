@@ -3,3 +3,12 @@
 __pycache__/
 *.pyc
 core.*
+
+# Editor and desktop droppings. The fixtures under tests/fixtures are the only
+# binaries this repository keeps on purpose, so nothing here may match *.o.
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
