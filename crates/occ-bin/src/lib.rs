@@ -1,8 +1,10 @@
 //! Binary container parsing, with no external dependencies.
 //!
 //! One entry point, [`load`], and one output type, [`occ_core::Image`].
-//! Format detection is by magic bytes only: extension and file name are
-//! caller-supplied text and carry no information about the contents.
+//! Format detection is by magic bytes, with one exception that the format
+//! itself forces: a DOS `.COM` has no header at all, so its extension and
+//! its size are the only discriminators that exist, and
+//! [`com::looks_like_com`] applies both.
 //!
 //! Modules are split by container rather than by task, because the containers
 //! share almost nothing: ELF has a section table and a program header table,
@@ -15,6 +17,7 @@
 #![deny(missing_docs)]
 
 pub mod ar;
+pub mod com;
 pub mod demangle;
 pub mod elf;
 pub mod macho;
@@ -85,6 +88,9 @@ pub fn load(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
         Format::Coff => pe::parse_coff(data, path, id),
         Format::MachO | Format::MachOFat => macho::parse(data, path, id),
         Format::Wasm => wasm::parse(data, path, id),
+        // A COM file has no leading bytes to recognise, so it is decided
+        // last: anything a magic check claims is not one.
+        Format::Unknown if com::looks_like_com(path, data) => com::parse(data, path, id),
         Format::Unknown => Err(CoreError::UnsupportedFormat(format!(
             "{path}: leading bytes match no known container"
         ))),
@@ -98,6 +104,7 @@ pub fn load(data: &[u8], path: &str, id: ImageId) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use occ_core::{Addr, Arch, Linkage};
 
     #[test]
     fn probe_distinguishes_elf_from_everything_else() {
@@ -107,6 +114,37 @@ mod tests {
         assert_eq!(probe_format(b"hello, world"), Format::Unknown);
         assert_eq!(probe_format(b""), Format::Unknown);
         assert_eq!(probe_format(b"\x7f"), Format::Unknown);
+    }
+
+    #[test]
+    fn a_com_file_loads_at_one_hundred_and_decodes_as_sixteen_bit() {
+        let bytes: Vec<u8> = vec![
+            0xe9, 0x02, 0x00, // jmp +2
+            0xb8, 0x34, 0x12, // mov ax, 0x1234
+            0xcd, 0x21, // int 0x21
+        ];
+        let img = load(&bytes, "TEST.COM", ImageId(0)).expect("com should load");
+        assert_eq!(img.format, Format::Com);
+        assert_eq!(img.arch, Arch::X86);
+        assert_eq!(img.bits, 16);
+        assert_eq!(img.entry, Addr(0x100));
+        assert_eq!(img.image_base, Addr(0));
+        assert_eq!(img.sections.len(), 1);
+        assert_eq!(img.sections[0].addr, Addr(0x100));
+        assert_eq!(img.sections[0].size, bytes.len() as u64);
+        assert_eq!(img.fingerprint.linkage, Linkage::Executable);
+        assert!(img.warnings.iter().any(|w| w.contains("no header")));
+
+        // The same bytes under a name that is not `.com` are not a COM
+        // image: the format has no magic, so the name is the discriminator.
+        assert!(load(&bytes, "TEST.BIN", ImageId(0)).is_err());
+    }
+
+    #[test]
+    fn an_oversized_com_is_refused_rather_than_truncated() {
+        let bytes = vec![0u8; 0x1_0000];
+        assert!(!com::looks_like_com("BIG.COM", &bytes));
+        assert!(load(&bytes, "BIG.COM", ImageId(0)).is_err());
     }
 
     #[test]

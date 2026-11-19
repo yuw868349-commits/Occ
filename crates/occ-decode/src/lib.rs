@@ -120,7 +120,10 @@ mod tests {
 
     #[test]
     fn rejects_impossible_widths() {
-        assert!(AnyDecoder::new(Arch::X86, 16).is_none());
+        // x86 has three legacy widths and all three are decoded; 8-bit
+        // registers exist but there is no 8-bit x86 mode.
+        assert!(AnyDecoder::new(Arch::X86, 16).is_some());
+        assert!(AnyDecoder::new(Arch::X86, 8).is_none());
         assert!(AnyDecoder::new(Arch::Aarch64, 32).is_none());
         assert!(AnyDecoder::new(Arch::Other, 32).is_none());
     }

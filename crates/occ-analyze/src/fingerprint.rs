@@ -43,8 +43,16 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             .imports
             .iter()
             .any(|i| matches!(i.name.as_str(), "_CorExeMain" | "_CorDllMain" | "_CorMain"));
-    let delphi = delphi_sections(image) || delphi_symbols(&symbols);
+    // Borland's RTL emits a section set no Microsoft link produces, and the
+    // compiler's own runtime strings name the product directly. Both mean
+    // "Borland toolchain"; only Pascal symbol mangling means "Delphi" rather
+    // than C++ Builder.
+    let borland_layout = borland_sections(image);
+    let borland_marker = borland_product(view);
+    let delphi = delphi_symbols(&symbols) || matches!(borland_marker, Some((CompilerFamily::Delphi, _)));
+    let borland = borland_layout || borland_marker.is_some();
     let msvc_rt = msvc_runtime(image);
+    let msvc_link = rich_header(view);
 
     // Compiler family: strongest signal first.
     let mut claim = Claim::new(handle.clone(), "compiler family has not been determined");
@@ -124,6 +132,37 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.95,
         ));
     }
+    if borland_layout {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::FormatMeta,
+            EvidenceSource::Loader,
+            "Borland RTL section layout (CODE/DATA/BSS, no .text)",
+            0.7,
+        ));
+    }
+    let mut marker_language: Option<LangGuess> = None;
+    if let Some((family, marker)) = borland_marker {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::Bytes,
+            EvidenceSource::Loader,
+            format!("the file carries the compiler's own product string '{marker}'"),
+            0.7,
+        ));
+        // A product string that names the C++ product settles the language;
+        // Delphi's own string does the same for Pascal.
+        marker_language = match family {
+            CompilerFamily::Borland => Some(LangGuess::Cpp),
+            _ => Some(LangGuess::Pascal),
+        };
+    }
+    if msvc_link {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::Bytes,
+            EvidenceSource::Loader,
+            "the DOS stub carries an MSVC linker Rich header (DanS/Rich)",
+            0.6,
+        ));
+    }
     if let Some(rt) = msvc_rt {
         claim = claim.with(Evidence::support(
             EvidenceKind::ImportCall,
@@ -147,6 +186,8 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
         CompilerFamily::DotNet
     } else if delphi {
         CompilerFamily::Delphi
+    } else if borland {
+        CompilerFamily::Borland
     } else if claim.confidence >= 0.5 {
         if comment.as_deref().is_some_and(|c| c.contains("clang version")) {
             CompilerFamily::Clang
@@ -156,7 +197,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             CompilerFamily::Go
         } else if symbols.contains("$s") {
             CompilerFamily::Swift
-        } else if symbols.contains("__C_specific_handler") || msvc_rt.is_some() {
+        } else if symbols.contains("__C_specific_handler") || msvc_rt.is_some() || msvc_link {
             CompilerFamily::Msvc
         } else if comment.as_deref().is_some_and(|c| c.contains("GCC:")) {
             CompilerFamily::Gcc
@@ -183,6 +224,10 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
         CompilerFamily::Zig => LangGuess::Zig,
         CompilerFamily::Msvb => LangGuess::VisualBasic,
         CompilerFamily::Delphi => LangGuess::Pascal,
+        // Delphi vs C++ Builder is not decided by the section layout, so the
+        // language stays unknown unless a product string or Pascal mangling
+        // settled it above.
+        CompilerFamily::Borland => marker_language.unwrap_or(LangGuess::Unknown),
         // A CLR image can be C#, VB.NET, F# or PowerShell; the container does
         // not say which. Saying `csharp` here would be a guess dressed as a
         // reading, so the language stays unknown and the compiler family
@@ -277,8 +322,15 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     }
 
     // A stub that only needs GetModuleHandleA/LoadLibraryA and has almost no
-    // imports is unpacking the rest of itself at run time.
-    if image.imports.len() <= 2 && image.sections.iter().any(|s| s.kind == SectionKind::Code) {
+    // imports is unpacking the rest of itself at run time. This inference
+    // needs a container that *can* express imports: a COM image has no import
+    // table at all, so "zero imports" there is a property of the format and
+    // not evidence about the code.
+    let has_import_table = matches!(image.format, Format::Elf | Format::Pe | Format::MachO);
+    if has_import_table
+        && image.imports.len() <= 2
+        && image.sections.iter().any(|s| s.kind == SectionKind::Code)
+    {
         pack = pack.with(Evidence::support(
             EvidenceKind::ImportCall,
             EvidenceSource::Heuristic,
@@ -289,7 +341,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.3,
         ));
     }
-    if image.imports.len() <= 3 && image.section_by_name(".text").is_some() {
+    if has_import_table && image.imports.len() <= 3 && image.section_by_name(".text").is_some() {
         pack = pack.with(Evidence::support(
             EvidenceKind::ImportCall,
             EvidenceSource::Heuristic,
@@ -410,7 +462,7 @@ fn runtime_import(image: &Image, libs: &[&str]) -> bool {
 /// `BSS`, `TLS` (with the dot missing), plus `.idata`/`.didata`. MSVC's
 /// equivalent is `.text`/`.data`/`.bss`/`.tls`, so the combination is a
 /// reliable discriminator rather than a loose "a section called DATA".
-fn delphi_sections(image: &Image) -> bool {
+fn borland_sections(image: &Image) -> bool {
     let has = |n: &str| {
         image.section_by_name(n).is_some() || image.section_by_name(&format!(".{n}")).is_some()
     };
@@ -429,6 +481,52 @@ fn delphi_symbols(symbols: &str) -> bool {
     symbols.lines().any(|l| {
         l.starts_with("@System@") || l.starts_with("@Classes@") || l.starts_with("System@@")
     })
+}
+
+/// The compiler's own product string, when the file carries one.
+///
+/// These are copyright notices baked into the runtime, so they name the
+/// toolchain rather than describe the input. A file can contain the text by
+/// accident (an embedded resource, a decoy in a crackme), which is why the
+/// match is on the exact product wording and why the evidence carries a
+/// weight below the structural signals.
+fn borland_product(view: &View) -> Option<(CompilerFamily, &'static str)> {
+    let file = view.file();
+    if contains_ascii_ci(file, b"Borland C++") {
+        return Some((CompilerFamily::Borland, "Borland C++"));
+    }
+    if contains_ascii_ci(file, b"Borland Delphi") {
+        return Some((CompilerFamily::Delphi, "Borland Delphi"));
+    }
+    None
+}
+
+/// Case-insensitive substring search over raw bytes.
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack.len() >= needle.len()
+        && haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+}
+
+/// True when the DOS stub carries an MSVC linker `Rich` header.
+///
+/// `link.exe` writes a `DanS` marker followed by product ids and a `Rich`
+/// checksum into the stub. Compilers that do not use Microsoft's linker
+/// (Borland, MinGW's ld, Delphi) do not emit it, so its presence dates the
+/// link step to MSVC — not necessarily the language, which is why the weight
+/// is 0.6 and the runtime/import evidence still outranks it.
+fn rich_header(view: &View) -> bool {
+    let file = view.file();
+    if view.image().format != Format::Pe {
+        return false;
+    }
+    let stub = &file[..file.len().min(0x400)];
+    let Some(pos) = stub.windows(4).position(|w| w == b"Rich") else {
+        return false;
+    };
+    stub[..pos].windows(4).any(|w| w == b"DanS")
 }
 
 fn read_comment(view: &View) -> Option<String> {
@@ -550,7 +648,9 @@ mod tests {
     }
 
     #[test]
-    fn delphi_section_layout_is_detected() {
+    fn the_borland_layout_names_the_toolchain_but_not_the_language() {
+        // Delphi and C++ Builder share this layout, so the layout alone can
+        // only say "Borland".
         let data = vec![0u8; 16];
         let img = image_with_sections(vec![
             section("CODE", 0, 8),
@@ -559,8 +659,26 @@ mod tests {
         ]);
         let v = View::new(&img, &data);
         let fp = fingerprint(&img, &v);
-        assert_eq!(fp.compiler, CompilerFamily::Delphi);
-        assert_eq!(fp.language, LangGuess::Pascal);
+        assert_eq!(fp.compiler, CompilerFamily::Borland);
+        assert_eq!(fp.language, LangGuess::Unknown);
+
+        // Pascal symbol mangling is the evidence that separates Delphi from
+        // C++ Builder, and it is what the language answer must rest on.
+        let mut img2 = image_with_sections(vec![section("CODE", 0, 8)]);
+        img2.symbols.push(occ_core::Symbol {
+            name: "@System@@LoadString$".into(),
+            addr: Addr(0x1000),
+            size: 0,
+            kind: occ_core::SymbolKind::Function,
+            binding: occ_core::SymbolBinding::Global,
+            section: None,
+            defined: true,
+            demangled: false,
+        });
+        let v2 = View::new(&img2, &data);
+        let fp2 = fingerprint(&img2, &v2);
+        assert_eq!(fp2.compiler, CompilerFamily::Delphi);
+        assert_eq!(fp2.language, LangGuess::Pascal);
     }
 
     #[test]
@@ -608,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn borland_layout_without_bss_is_still_delphi() {
+    fn borland_layout_without_bss_still_names_the_toolchain() {
         let data = vec![0u8; 16];
         let img = image_with_sections(vec![
             section("CODE", 0, 8),
@@ -616,7 +734,7 @@ mod tests {
         ]);
         let v = View::new(&img, &data);
         let fp = fingerprint(&img, &v);
-        assert_eq!(fp.compiler, CompilerFamily::Delphi);
+        assert_eq!(fp.compiler, CompilerFamily::Borland);
     }
 
     #[test]

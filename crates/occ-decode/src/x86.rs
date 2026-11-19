@@ -10,9 +10,12 @@
 //! the caller see exactly which byte was not understood. That is the only
 //! honest failure mode here: guessing a length is worse than admitting the gap.
 //!
-//! 16-bit real mode is out of scope. 32-bit protected mode is covered for the
-//! cases that appear inside 64-bit code (operand-size prefixes) but not as a
-//! standalone target.
+//! All three legacy modes are decoded: 16-bit real mode (DOS `.COM` and
+//! `.EXE` images), 32-bit protected mode, and 64-bit long mode. The mode is
+//! not a per-instruction choice but a decoder-wide default: it fixes which
+//! operand and address widths a bare opcode means, and the `66`/`67` prefixes
+//! switch to the *other* width, so the same byte means `ax` in one mode and
+//! `eax` in the other.
 
 use occ_core::{Addr, Arch, CallTarget, FlowKind, Instruction, MAX_INSN_LEN};
 
@@ -49,6 +52,23 @@ const REG8: [&str; 16] = [
     "al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b",
     "r13b", "r14b", "r15b",
 ];
+/// Base/index pairs of 16-bit addressing, indexed by the ModRM r/m field.
+///
+/// `None` is r/m 6 with mod 0, which is a sixteen-bit absolute address rather
+/// than `[bp]`; the single-register forms carry an empty second name.
+const ADDR16_PAIRS: [Option<(&str, &str)>; 8] = [
+    Some(("bx", "si")),
+    Some(("bx", "di")),
+    Some(("bp", "si")),
+    Some(("bp", "di")),
+    Some(("si", "")),
+    Some(("di", "")),
+    // r/m 6 is `[bp]` when a displacement follows; with mod 00 it is the
+    // sixteen-bit absolute form and never reaches this table.
+    Some(("bp", "")),
+    Some(("bx", "")),
+];
+
 /// 8-bit registers without a REX prefix: the high-byte forms.
 const REG8_NOREX: [&str; 16] = [
     "al", "cl", "dl", "bl", "ah", "ch", "dh", "bh", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b",
@@ -192,6 +212,12 @@ enum Operand {
         /// writes the lanes `k1` selects and leaves the rest of memory
         /// alone.
         mask: u8,
+        /// This operand uses 16-bit addressing, where `base` is not a
+        /// register number but the ModRM r/m field, which names a *pair* of
+        /// registers (`bx+si`, `bp+di`, …) or a single one. The encoding
+        /// predates the flat register file: there are eight forms, not
+        /// sixteen, and no SIB byte exists in this mode.
+        addr16: bool,
     },
     /// Direct branch displacement, kept as a signed delta.
     Rel(i64),
@@ -224,10 +250,10 @@ pub struct Decoder {
 pub use crate::Decoded;
 
 impl Decoder {
-    /// Create a decoder for `bits` (32 or 64). Returns `None` for other widths.
+    /// Create a decoder for `bits` (16, 32 or 64). Returns `None` otherwise.
     pub fn new(bits: u8) -> Option<Self> {
         match bits {
-            32 | 64 => Some(Decoder {
+            16 | 32 | 64 => Some(Decoder {
                 bits,
                 origin: Addr::NULL,
             }),
@@ -288,21 +314,31 @@ impl Decoder {
         p.rex = rex;
         p.rex_present = rex != 0;
 
+        // The operand-size prefix does not mean "16 bits"; it means "not the
+        // default". In 16-bit mode a bare opcode is 16-bit and `66` selects
+        // 32; in the other two modes it is the reverse.
         let op_size = if rex & 0x08 != 0 {
             Size::Q
-        } else if p.op66 {
-            Size::W
         } else {
-            Size::D
+            match (self.bits, p.op66) {
+                (16, false) => Size::W,
+                (16, true) => Size::D,
+                (_, true) => Size::W,
+                _ => Size::D,
+            }
         };
-        // Address size is 64 in long mode unless 0x67 is present, and 32 in
-        // protected mode unless 0x67 is present.
-        let addr_size = if self.bits == 64 {
-            if p.op67 { Size::D } else { Size::Q }
-        } else if p.op67 {
-            Size::W
-        } else {
-            Size::D
+        // Address size follows the same rule: 16-bit mode addresses with
+        // 16-bit registers and `67` widens to 32; 32-bit mode addresses with
+        // 32 and `67` narrows to 16; long mode addresses with 64 and `67`
+        // narrows to 32.
+        let addr_size = match (self.bits, p.op67) {
+            (64, false) => Size::Q,
+            (64, true) => Size::D,
+            (32, false) => Size::D,
+            (32, true) => Size::W,
+            (16, false) => Size::W,
+            (16, true) => Size::D,
+            _ => Size::D,
         };
 
         if i >= bytes.len() {
@@ -571,11 +607,13 @@ impl Decoder {
         match op {
             0x40..=0x4f => {
                 // In 64-bit mode these bytes are REX prefixes and were consumed
-                // above, so reaching here means 32-bit mode, where they are the
-                // single-byte inc/dec forms.
+                // above, so reaching here means a legacy mode, where they are
+                // the single-byte inc/dec forms. Their width is the operand
+                // size: `ax` in 16-bit mode, `eax` in 32-bit mode, and the
+                // `66` prefix picks the other of the two.
                 let r = usize::from(op & 7);
                 let name = if op & 8 == 0 { "inc" } else { "dec" };
-                Some((name, FlowKind::Next, None, vec![Operand::Reg(REG32[r])]))
+                Some((name, FlowKind::Next, None, vec![Operand::Reg(os.regs(p.rex_present)[r])]))
             }
             // The loop family: rel8 conditional branches that also decrement
             // rcx. `jrcxz` is the only one gcc emits, for `do { } while (n--)`.
@@ -646,29 +684,27 @@ impl Decoder {
                 Some((name, FlowKind::Next, None, ops))
             }
             0x50..=0x57 => {
+                // In long mode a push moves a 64-bit slot even when the
+                // operand-size prefix names 16 bits, which is what
+                // `push_size` encodes; the legacy modes move the operand
+                // size itself.
+                let slot = self.push_size(os);
                 let r = ((op & 7) | p.rex_b()) as usize;
                 Some((
-                    "push",
+                "push",
                     FlowKind::Next,
                     None,
-                    vec![Operand::Reg(if self.bits == 64 {
-                        REG64[r]
-                    } else {
-                        REG32[r]
-                    })],
+                    vec![Operand::Reg(slot.regs(p.rex_present)[r])],
                 ))
             }
             0x58..=0x5f => {
+                let slot = self.push_size(os);
                 let r = ((op & 7) | p.rex_b()) as usize;
                 Some((
-                    "pop",
+                "pop",
                     FlowKind::Next,
                     None,
-                    vec![Operand::Reg(if self.bits == 64 {
-                        REG64[r]
-                    } else {
-                        REG32[r]
-                    })],
+                    vec![Operand::Reg(slot.regs(p.rex_present)[r])],
                 ))
             }
             0x63 => {
@@ -679,6 +715,20 @@ impl Decoder {
                 //
                 // `m.reg` already carries the REX.R extension; adding it again
                 // pushed the index past the end of the register table.
+                if self.bits != 64 {
+                    // Outside long mode this byte is ARPL: adjust the
+                    // requested privilege level of a selector. It is a
+                    // 16-bit instruction in both legacy modes, and decoding
+                    // it as movsxd would read a 32-bit immediate that is not
+                    // there and desynchronise the stream.
+                    let m = self.modrm(p, Size::W, asz, b, i)?;
+                    return Some((
+                        "arpl",
+                        FlowKind::Next,
+                        None,
+                        vec![mem_operand(&m, Size::W, p), reg_operand(&m, Size::W, p)],
+                    ));
+                }
                 let m = self.modrm(p, Size::D, asz, b, i)?;
                 let destination = if p.rex & 0x08 != 0 {
                     REG64[usize::from(m.reg & 15)]
@@ -875,12 +925,16 @@ impl Decoder {
                 vec![],
             )),
             0x91..=0x97 => {
-                let r = ((op & 7) | p.rex_b()) as usize;
+                // `xchg` with the accumulator: the register is the opcode's
+                // low three bits, at the operand size, so `xchg ax, cx` in
+                // 16-bit mode is the same byte as `xchg eax, ecx` in 32-bit.
+                let regs = os.regs(p.rex_present);
+                let r = usize::from((op & 7) | p.rex_b());
                 Some((
                     "xchg",
                     FlowKind::Next,
                     None,
-                    vec![Operand::Reg(REG64[r]), Operand::Reg(REG64[0])],
+                    vec![Operand::Reg(regs[r]), Operand::Reg(regs[0])],
                 ))
             }
             // The sign-extension instructions are named after the width
@@ -938,7 +992,7 @@ impl Decoder {
             // after it. Each one is guarded on the mode rather than on a
             // table entry, because the encoding means nothing outside 32-bit
             // code.
-            0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f if self.bits == 32 => {
+            0x06 | 0x07 | 0x0e | 0x16 | 0x17 | 0x1e | 0x1f if self.bits != 64 => {
                 // Segment-register push and pop. The four legacy segments
                 // are the only ones that have an encoding: `fs` and `gs`
                 // were added after this group was full and need `0f a0`
@@ -954,7 +1008,7 @@ impl Decoder {
                 };
                 Some((name, FlowKind::Next, None, vec![Operand::Reg(seg)]))
             }
-            0x27 | 0x2f | 0x37 | 0x3f if self.bits == 32 => {
+            0x27 | 0x2f | 0x37 | 0x3f if self.bits != 64 => {
                 // The BCD adjust instructions. Decimal arithmetic stopped
                 // being worth a circuit decades ago, and 32-bit code that
                 // predates that still calls them.
@@ -966,7 +1020,7 @@ impl Decoder {
                 };
                 Some((name, FlowKind::Next, None, vec![]))
             }
-            0x60 | 0x61 if self.bits == 32 => {
+            0x60 | 0x61 if self.bits != 64 => {
                 // Push and pop of every general-purpose register at once.
                 // The `66` form moves 16-bit registers and the listing calls
                 // it `pushaw`; the plain form is the 32-bit one.
@@ -975,33 +1029,35 @@ impl Decoder {
                 } else {
                     ("popa", "popaw")
                 };
+                // The `w` suffix says the stack slot is 16 bits, which is
+                // the default in 16-bit mode and the `66` form elsewhere.
                 Some((
-                    if p.op66 { wide } else { name },
+                    if os == Size::W { wide } else { name },
                     FlowKind::Next,
                     None,
                     vec![],
                 ))
             }
-            0x62 if self.bits == 32 => {
+            0x62 if self.bits != 64 => {
                 // BOUND: an array-bounds check against a pair of limits in
                 // memory. 64-bit mode reuses this byte as the EVEX prefix,
                 // so the encoding only exists in 32-bit code.
-                let m = self.modrm(p, Size::D, asz, b, i)?;
+                let m = self.modrm(p, os, asz, b, i)?;
                 m.mem.as_ref()?;
                 Some((
                     "bound",
                     FlowKind::Next,
                     None,
-                    vec![reg_operand(&m, Size::D, p), mem_operand(&m, Size::D, p)],
+                    vec![reg_operand(&m, os, p), mem_operand(&m, os, p)],
                 ))
             }
-            0xce if self.bits == 32 => Some(("into", FlowKind::Next, None, vec![])),
-            0x9a | 0xea if self.bits == 32 => {
+            0xce if self.bits != 64 => Some(("into", FlowKind::Next, None, vec![])),
+            0x9a | 0xea if self.bits != 64 => {
                 // A far call or jump: an offset at the operand size, then a
                 // sixteen-bit selector. Both halves are part of the
                 // instruction, so both are read even though the listing
                 // prints them as a single target.
-                let offset = self.imm(b, i, if p.op66 { 2 } else { 4 })?;
+                let offset = self.imm(b, i, if os == Size::W { 2 } else { 4 })?;
                 let selector = self.imm(b, i, 2)?;
                 let name = if op == 0x9a { "lcall" } else { "ljmp" };
                 Some((
@@ -1013,12 +1069,12 @@ impl Decoder {
                     },
                     None,
                     vec![
-                        Operand::Imm(offset, if p.op66 { Size::W } else { Size::D }),
+                        Operand::Imm(offset, if os == Size::W { Size::W } else { Size::D }),
                         Operand::Imm(selector, Size::W),
                     ],
                 ))
             }
-            0xd4 | 0xd5 if self.bits == 32 => {
+            0xd4 | 0xd5 if self.bits != 64 => {
                 // ASCII adjust after multiply and after divide: both read one
                 // immediate byte, the base.
                 let base = self.imm(b, i, 1)?;
@@ -1029,36 +1085,55 @@ impl Decoder {
                 // The string forms of `in` and `out`. The port is always `dx`
                 // and the buffer is always `esi` or `edi`, so the encoding
                 // carries no operand and only the width changes with `66`.
-                let name = match (op, p.op66) {
-                    (0x6c, true) => "insw",
-                    (0x6c, false) => "insb",
-                    (0x6d, true) => "insw",
-                    (0x6d, false) => "insd",
-                    (0x6e, true) => "outsw",
-                    (0x6e, false) => "outsb",
-                    (0x6f, true) => "outsw",
-                    _ => "outsd",
+                let name = match (op, os) {
+                    (0x6c | 0x6d, Size::W) => "insw",
+                    (0x6c | 0x6d, Size::D) => "insd",
+                    (0x6e | 0x6f, Size::W) => "outsw",
+                    (0x6e | 0x6f, Size::D) => "outsd",
+                    _ => "insb",
                 };
                 Some((name, FlowKind::Next, None, vec![]))
             }
-            0xc4 | 0xc5 if self.bits == 32 => {
+            0xc4 | 0xc5 if self.bits != 64 => {
                 // Load far pointer: a general-purpose register and a memory
                 // operand holding an offset with a selector after it. In
                 // 64-bit mode these two bytes are the VEX prefix instead,
                 // which is why the arm is guarded on the mode rather than on
                 // the opcode.
-                let m = self.modrm(p, Size::D, asz, b, i)?;
+                let m = self.modrm(p, os, asz, b, i)?;
                 let name = if op == 0xc4 { "les" } else { "lds" };
                 m.mem.as_ref()?;
                 Some((
                     name,
                     FlowKind::Next,
                     None,
-                    vec![reg_operand(&m, Size::D, p), mem_operand(&m, Size::D, p)],
+                    vec![reg_operand(&m, os, p), mem_operand(&m, os, p)],
                 ))
             }
-            0x9c => Some(("pushfq", FlowKind::Next, None, vec![])),
-            0x9d => Some(("popfq", FlowKind::Next, None, vec![])),
+            // The flags word is a stack slot: 16 bits in 16-bit mode, 32 in
+            // the others, and the `66` prefix swaps the pair. `pushfq` is
+            // long mode only, and printing it in a 16-bit listing would
+            // claim a 64-bit push that the mode cannot encode.
+            0x9c => Some((
+                match os {
+                    Size::W => "pushfw",
+                    Size::Q => "pushfq",
+                    _ => "pushfd",
+                },
+                FlowKind::Next,
+                None,
+                vec![],
+            )),
+            0x9d => Some((
+                match os {
+                    Size::W => "popfw",
+                    Size::Q => "popfq",
+                    _ => "popfd",
+                },
+                FlowKind::Next,
+                None,
+                vec![],
+            )),
             0x9e => Some(("sahf", FlowKind::Next, None, vec![])),
             0x9f => Some(("lahf", FlowKind::Next, None, vec![])),
             0xa0..=0xa3 => {
@@ -1074,6 +1149,8 @@ impl Decoder {
                 let addr_width = match (self.bits, p.op67) {
                     (64, false) => 8,
                     (64, true) => 4,
+                    (16, false) => 2,
+                    (16, true) => 4,
                     (_, true) => 2,
                     (_, false) => 4,
                 };
@@ -1082,10 +1159,8 @@ impl Decoder {
                     Size::B
                 } else if p.rex & 0x08 != 0 {
                     Size::Q
-                } else if p.op66 {
-                    Size::W
                 } else {
-                    Size::D
+                    os
                 };
                 let acc = Operand::Reg(match size {
                     Size::B => "al",
@@ -1099,6 +1174,7 @@ impl Decoder {
                     scale: 1,
                     disp: raw,
                     rip_relative: false,
+                    addr16: false,
                     // The listing leaves the width off an absolute
                     // operand: the accumulator beside it already says
                     // how wide the move is.
@@ -1167,6 +1243,7 @@ impl Decoder {
                     scale: 1,
                     disp: 0,
                     rip_relative: false,
+                    addr16: false,
                     size: Some(size),
                     broadcast: None,
                     vsib: None,
@@ -1319,11 +1396,14 @@ impl Decoder {
                 ))
             }
             0xe8 => {
-                let v = self.imm(b, i, 4)?;
+                // A near branch displacement is as wide as the operand
+                // size: rel16 in 16-bit mode, rel32 with `66` there, and
+                // the reverse in 32-bit mode.
+                let v = self.imm(b, i, if os == Size::W { 2 } else { 4 })?;
                 Some(("call", FlowKind::Call, None, vec![Operand::Rel(v)]))
             }
             0xe9 => {
-                let v = self.imm(b, i, 4)?;
+                let v = self.imm(b, i, if os == Size::W { 2 } else { 4 })?;
                 Some((
                     "jmp",
                     FlowKind::UnconditionalBranch,
@@ -1504,6 +1584,7 @@ impl Decoder {
                     scale: mem.scale,
                     disp: mem.disp,
                     rip_relative: mem.rip_relative,
+                    addr16: mem.addr16,
                     size: None,
                     broadcast: None,
                     vsib: None,
@@ -1695,6 +1776,7 @@ impl Decoder {
                         scale: mem.scale,
                         disp: mem.disp,
                         rip_relative: mem.rip_relative,
+                        addr16: mem.addr16,
                         size: None,
                         broadcast: None,
                         vsib: None,
@@ -1789,7 +1871,7 @@ impl Decoder {
                 ))
             }
             0x80..=0x8f => {
-                let v = self.imm(b, i, 4)?;
+                let v = self.imm(b, i, if os == Size::W { 2 } else { 4 })?;
                 Some((
                     jcc_name(op & 0x0f),
                     FlowKind::ConditionalBranch,
@@ -2373,6 +2455,42 @@ impl Decoder {
             });
         }
 
+        // Sixteen-bit addressing is a different encoding, not a narrower
+        // form of the 32-bit one: the r/m field selects one of eight
+        // base/index combinations, there is no SIB byte, and a displacement
+        // is 8 or 16 bits. `67` in 32-bit mode selects this table too, which
+        // is why the test is on the address size and not on `bits`.
+        if asz == Size::W && self.bits != 64 {
+            let rm_low = byte & 7;
+            let mut disp = 0i64;
+            let base = if rm_low == 6 && mode == 0 {
+                // r/m 6 with mod 0 is not `[bp]`: it is a sixteen-bit
+                // absolute address, the only one this encoding has.
+                disp = self.imm(b, i, 2)?;
+                None
+            } else {
+                Some(rm_low)
+            };
+            if mode == 1 {
+                disp = self.imm(b, i, 1)?;
+            } else if mode == 2 {
+                disp = self.imm(b, i, 2)?;
+            }
+            return Some(ModRm {
+                mode,
+                reg,
+                rm: rm_low,
+                mem: Some(MemRef {
+                    base,
+                    index: None,
+                    scale: 1,
+                    disp,
+                    rip_relative: false,
+                    addr16: true,
+                }),
+            });
+        }
+
         let mut base: Option<u8> = None;
         let mut index: Option<u8> = None;
         let mut scale = 1u8;
@@ -2432,6 +2550,7 @@ impl Decoder {
                 scale,
                 disp,
                 rip_relative,
+                addr16: false,
             }),
         })
     }
@@ -2583,6 +2702,7 @@ impl Decoder {
                 broadcast,
                 vsib,
                 mask,
+                addr16,
             } => {
                 let mut s = String::new();
                 if let Some(sz) = size {
@@ -2622,8 +2742,31 @@ impl Decoder {
                     s.push('[');
                     // Address registers follow the address size, which is the
                     // machine width unless a 0x67 prefix narrowed it.
-                    let regs: &[&str; 16] = if self.bits == 64 { &REG64 } else { &REG32 };
+                    // The implicit operands of the string instructions use
+                    // the *address* width, which is 16 bits in real mode.
+                    let regs: &[&str; 16] = if self.bits == 64 {
+                        &REG64
+                    } else if self.bits == 16 {
+                        &REG16
+                    } else {
+                        &REG32
+                    };
                     let mut first = true;
+                    if *addr16 {
+                        // The r/m field names a pair here; `[bp]` (r/m 6 with
+                        // a displacement) and `[bx]` (r/m 7) are the two
+                        // single-register forms. Pairs are written without a
+                        // scale because the encoding has none.
+                        let pair = ADDR16_PAIRS[usize::from((*base).unwrap_or(6) & 7)];
+                        if let Some((b, ix)) = pair {
+                            s.push_str(b);
+                            if !ix.is_empty() {
+                                s.push('+');
+                                s.push_str(ix);
+                            }
+                        }
+                        first = false;
+                    } else {
                     if let Some(b) = base {
                         s.push_str(regs[usize::from(*b & 15)]);
                         first = false;
@@ -2654,6 +2797,7 @@ impl Decoder {
                             s.push_str(&format!("*{scale}"));
                         }
                         first = false;
+                    }
                     }
                     if *disp != 0 || first {
                         if !first {
@@ -2718,6 +2862,9 @@ struct MemRef {
     scale: u8,
     disp: i64,
     rip_relative: bool,
+    /// Sixteen-bit addressing: `base` carries the ModRM r/m field and names
+    /// a register pair rather than a register number.
+    addr16: bool,
 }
 
 struct ModRm {
@@ -2864,6 +3011,7 @@ fn mem_operand(m: &ModRm, size: Size, p: &Prefix) -> Operand {
             scale: mem.scale,
             disp: mem.disp,
             rip_relative: mem.rip_relative,
+            addr16: mem.addr16,
             size: Some(size),
             broadcast: None,
             vsib: None,
@@ -3517,6 +3665,7 @@ fn mem_ref_operand(mem: &MemRef, size: Size) -> Operand {
         scale: mem.scale,
         disp: mem.disp,
         rip_relative: mem.rip_relative,
+        addr16: mem.addr16,
         size: Some(size),
         broadcast: None,
         vsib: None,
@@ -3572,6 +3721,80 @@ fn condition_name(cond: u8) -> &'static str {
 mod tests {
     use super::*;
 
+    fn d16(bytes: &[u8]) -> Decoded {
+        Decoder::new(16)
+            .unwrap()
+            .decode(Addr(0x100), bytes)
+            .unwrap()
+    }
+
+    fn d32(bytes: &[u8]) -> Decoded {
+        Decoder::new(32)
+            .unwrap()
+            .decode(Addr(0x401000), bytes)
+            .unwrap()
+    }
+
+    #[test]
+    fn sixteen_bit_mode_defaults_to_word_and_pair_addressing() {
+        // 8b 40 04 = mov ax, [bx+si+4]: 16-bit addressing names a pair, and
+        // the displacement is one byte because mod is 01.
+        let i = d16(&[0x8b, 0x40, 0x04]).insn;
+        assert_eq!(i.mnemonic.as_ref(), "mov");
+        assert_eq!(i.text, "mov ax, word ptr [bx+si + 0x4]");
+        assert_eq!(i.len, 3);
+
+        // 8b 46 00 = mov ax, [bp+0]: r/m 6 is the single-register form when a
+        // displacement is present, not the absolute form it is at mod 00.
+        assert_eq!(d16(&[0x8b, 0x46, 0x00]).insn.text, "mov ax, word ptr [bp]");
+
+        // 8b 06 34 12 = mov ax, [0x1234]: r/m 6 with mod 00 is the only
+        // sixteen-bit absolute address in the encoding.
+        let abs = d16(&[0x8b, 0x06, 0x34, 0x12]).insn;
+        assert_eq!(abs.text, "mov ax, word ptr ds:0x1234");
+        assert_eq!(abs.len, 4);
+        assert_eq!(abs.mem_reads, vec![Addr(0x1234)]);
+    }
+
+    #[test]
+    fn prefixes_switch_widths_instead_of_naming_sixteen_bits() {
+        // In 16-bit mode a bare `b8` moves a word and `66 b8` a dword.
+        assert_eq!(d16(&[0xb8, 0x34, 0x12]).insn.text, "mov ax, 0x1234");
+        assert_eq!(
+            d16(&[0x66, 0xb8, 0x34, 0x12, 0x00, 0x00]).insn.text,
+            "mov eax, 0x1234"
+        );
+        // The same rule for branches: e9 takes rel16 by default.
+        let j = d16(&[0xe9, 0x10, 0x00]).insn;
+        assert_eq!(j.len, 3);
+        assert_eq!(j.mnemonic.as_ref(), "jmp");
+        // And `66` makes it rel32.
+        assert_eq!(d16(&[0x66, 0xe9, 0x10, 0x00, 0x00, 0x00]).insn.len, 6);
+    }
+
+    #[test]
+    fn a_nineteen_sixty_seven_prefix_selects_pair_addressing_in_32_bit_code() {
+        // 67 8b 00 = mov eax, [bx+si]: the address-size prefix switches the
+        // *addressing* width, not the operand width, in protected mode too.
+        let i = d32(&[0x67, 0x8b, 0x00]).insn;
+        assert_eq!(i.text, "mov eax, dword ptr [bx+si]");
+        assert_eq!(i.len, 3);
+    }
+
+    #[test]
+    fn sixteen_bit_instructions_keep_their_legacy_names() {
+        // 60 = pushaw in 16-bit mode, and 66 60 = pusha (32-bit slots).
+        assert_eq!(d16(&[0x60]).insn.text, "pushaw");
+        assert_eq!(d16(&[0x66, 0x60]).insn.text, "pusha");
+        // 9c = pushfw here, 66 9c = pushfd.
+        assert_eq!(d16(&[0x9c]).insn.text, "pushfw");
+        assert_eq!(d16(&[0x66, 0x9c]).insn.text, "pushfd");
+        // 40 = inc ax, 66 40 = inc eax.
+        assert_eq!(d16(&[0x40]).insn.text, "inc ax");
+        assert_eq!(d16(&[0x66, 0x40]).insn.text, "inc eax");
+        // 63 is arpl outside long mode, not movsxd.
+        assert_eq!(d16(&[0x63, 0xd8]).insn.mnemonic.as_ref(), "arpl");
+    }
     fn d64(bytes: &[u8]) -> Decoded {
         Decoder::new(64)
             .unwrap()

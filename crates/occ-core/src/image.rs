@@ -36,6 +36,12 @@ pub enum Format {
     MachOFat,
     /// Archive (`ar`) of object files.
     Archive,
+    /// DOS `.COM`: a headerless image loaded at offset `0x100` of one segment.
+    ///
+    /// There is no container to parse — no magic, no section table, no
+    /// header — so this variant exists to say that the *whole file* is the
+    /// image and that its code is 16-bit real mode.
+    Com,
     /// Recognised as a binary but not as anything supported.
     Unknown,
 }
@@ -51,6 +57,7 @@ impl Format {
             Format::Wasm => "wasm",
             Format::MachOFat => "macho-fat",
             Format::Archive => "archive",
+            Format::Com => "com",
             Format::Unknown => "unknown",
         }
     }
@@ -492,8 +499,13 @@ pub enum CompilerFamily {
     Zig,
     /// Microsoft Visual Basic 6 runtime (MSVBVM50/60).
     Msvb,
-    /// Borland/Embarcadero Delphi or C++ Builder.
+    /// Delphi: Borland/Embarcadero's Pascal toolchain.
     Delphi,
+    /// The Borland/Embarcadero toolchain, when the artefact says Borland but
+    /// not which of its languages produced it. Delphi and C++ Builder share
+    /// the RTL and the section layout, so the layout alone cannot separate
+    /// them.
+    Borland,
     /// A CLR image: the entry point is the CLR stub, not native code.
     DotNet,
     /// Not determined.
@@ -513,6 +525,7 @@ impl CompilerFamily {
             CompilerFamily::Zig => "zig",
             CompilerFamily::Msvb => "msvb",
             CompilerFamily::Delphi => "delphi",
+            CompilerFamily::Borland => "borland",
             CompilerFamily::DotNet => "dotnet",
             CompilerFamily::Unknown => "unknown",
         }

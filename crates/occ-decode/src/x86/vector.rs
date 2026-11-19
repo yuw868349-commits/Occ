@@ -1656,6 +1656,7 @@ fn with_vsib(op: super::Operand, bits: u16, high: u8) -> super::Operand {
             size,
             broadcast,
             mask,
+            addr16,
             ..
         } => super::Operand::Mem {
             base,
@@ -1663,6 +1664,7 @@ fn with_vsib(op: super::Operand, bits: u16, high: u8) -> super::Operand {
             scale,
             disp,
             rip_relative,
+            addr16,
             size,
             broadcast,
             vsib: Some(bits),
@@ -1684,6 +1686,7 @@ fn with_mem_mask(op: super::Operand, mask: u8) -> super::Operand {
             size,
             broadcast,
             vsib,
+            addr16,
             ..
         } => super::Operand::Mem {
             base,
@@ -1691,6 +1694,7 @@ fn with_mem_mask(op: super::Operand, mask: u8) -> super::Operand {
             scale,
             disp,
             rip_relative,
+            addr16,
             size,
             broadcast,
             vsib,
@@ -1711,6 +1715,7 @@ fn with_broadcast(op: super::Operand, size: super::Size, lanes: u8) -> super::Op
             rip_relative,
             vsib,
             mask,
+            addr16,
             ..
         } => super::Operand::Mem {
             base,
@@ -1718,6 +1723,7 @@ fn with_broadcast(op: super::Operand, size: super::Size, lanes: u8) -> super::Op
             scale,
             disp,
             rip_relative,
+            addr16,
             size: Some(size),
             broadcast: Some(lanes),
             vsib,
