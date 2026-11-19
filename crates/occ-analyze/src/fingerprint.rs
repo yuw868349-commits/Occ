@@ -49,8 +49,15 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     // than C++ Builder.
     let borland_layout = borland_sections(image);
     let borland_marker = borland_product(view);
-    let delphi =
-        delphi_symbols(&symbols) || matches!(borland_marker, Some((CompilerFamily::Delphi, _)));
+    // A stripped Delphi build loses the Pascal-mangled symbols, but it keeps
+    // the VCL unit names the RTL registers at startup ("Classes", "Forms",
+    // "Controls", ...). C++ Builder carries the same units *and* its own
+    // product string, so the string is the tie-breaker: without it, a
+    // Borland layout plus several VCL unit names is Delphi, not C++.
+    let vcl_units = borland_layout && borland_marker.is_none() && vcl_unit_names(view.file());
+    let delphi = delphi_symbols(&symbols)
+        || matches!(borland_marker, Some((CompilerFamily::Delphi, _)))
+        || vcl_units;
     // CODE/DATA/BSS is not Borland's alone: TASM and hand-written Win32
     // assembly produce the same section names, and so do a few linkers for
     // other toolchains. The layout is a hint that needs one corroborating
@@ -212,6 +219,15 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             0.6,
         ));
     }
+    if vcl_units {
+        claim = claim.with(Evidence::support(
+            EvidenceKind::FormatMeta,
+            EvidenceSource::Loader,
+            "the file registers the VCL unit names Classes, Forms and Controls; \
+             with no C++ Builder product string this is Delphi",
+            0.6,
+        ));
+    }
     if delphi {
         claim = claim.with(Evidence::support(
             EvidenceKind::FormatMeta,
@@ -363,7 +379,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
     // output buffer. Optimised compilers do not emit one: W^X is the norm on
     // every platform this tool reads. Two or more is a wrapper's fingerprint
     // regardless of which packer it is, which is what catches the builds that
-    // rename their sections (`.kaine0`, `.kaine1`) to defeat the name list.
+    // rename their sections to values no packer name list contains.
     let rwx: Vec<&str> = image
         .sections
         .iter()
@@ -550,6 +566,30 @@ fn delphi_symbols(symbols: &str) -> bool {
     symbols.lines().any(|l| {
         l.starts_with("@System@") || l.starts_with("@Classes@") || l.starts_with("System@@")
     })
+}
+
+/// Unit names a VCL application registers at startup. A stripped Delphi
+/// binary has no `@System@` symbols left, but these strings remain because
+/// the RTL looks them up by name.
+fn vcl_unit_names(data: &[u8]) -> bool {
+    const UNITS: &[&str] = &[
+        "Classes",
+        "Forms",
+        "Controls",
+        "StdCtrls",
+        "SysUtils",
+        "Graphics",
+    ];
+    let mut found = 0;
+    for unit in UNITS {
+        if data
+            .windows(unit.len())
+            .any(|window| window == unit.as_bytes())
+        {
+            found += 1;
+        }
+    }
+    found >= 2
 }
 
 /// The compiler's own product string, when the file carries one.
@@ -752,6 +792,25 @@ mod tests {
     }
 
     #[test]
+    fn vcl_unit_names_identify_delphi_without_symbols() {
+        // A stripped Delphi build keeps no Pascal-mangled symbols, but the
+        // RTL still registers its unit names. With a Borland section layout
+        // and no C++ Builder product string, that is Delphi.
+        let data = b"Classes\0Forms\0Controls\0TForm1\0".to_vec();
+        let len = data.len() as u64;
+        let img = image_with_sections(vec![
+            section("CODE", 0, len),
+            section("DATA", len, 0),
+            section("BSS", len, 0),
+            section(".tls", len, 0),
+        ]);
+        let v = View::new(&img, &data);
+        let fp = fingerprint(&img, &v);
+        assert_eq!(fp.compiler, CompilerFamily::Delphi);
+        assert_eq!(fp.language, LangGuess::Pascal);
+    }
+
+    #[test]
     fn ucrt_forwarders_are_not_mistaken_for_glibc() {
         let data = vec![0u8; 16];
         let base = image_with_sections(vec![section(".text", 0, 16)]);
@@ -829,7 +888,7 @@ mod tests {
         let img = image_with_sections(vec![
             Section {
                 index: 1,
-                name: ".kaine0".into(),
+                name: ".rwx0".into(),
                 addr: Addr(0x1000),
                 file_offset: 0,
                 size: 32,
@@ -839,7 +898,7 @@ mod tests {
             },
             Section {
                 index: 2,
-                name: ".pack".into(),
+                name: ".rwx1".into(),
                 addr: Addr(0x1020),
                 file_offset: 32,
                 size: 32,
