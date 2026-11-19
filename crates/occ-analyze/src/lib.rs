@@ -27,6 +27,7 @@ pub mod fingerprint;
 pub mod jumptable;
 pub mod sig;
 pub mod strings;
+pub mod vcl;
 pub mod view;
 pub mod xref;
 

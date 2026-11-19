@@ -81,7 +81,7 @@ macro_rules! tool {
     };
 }
 
-static TOOLS: [ToolDef; 40] = [
+static TOOLS: [ToolDef; 41] = [
     tool!(
         "session.info",
         "List open images and their ids, plus hypotheses and notes. Call this first when continuing a conversation to see what state exists.",
@@ -123,6 +123,12 @@ static TOOLS: [ToolDef; 40] = [
         "List PE resource leaves: type, name, language, address, size. Dialog templates and string-table bundles are the two kinds that carry text a GUI never references by address.",
         r#"{"type":"object","properties":{"image":{"type":"integer"},"type":{"type":"string","description":"substring of the resource type label, e.g. dialog or string-table"},"filter":{"type":"string","description":"substring of a string name"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
         binary_resources
+    ),
+    tool!(
+        "binary.vcl_methods",
+        "List Borland/VCL published methods: the names form resources refer to (OnClick = Button1Click) and the code address behind each. This is the bridge from a TForm caption to the handler that reads it.",
+        r#"{"type":"object","properties":{"image":{"type":"integer"},"filter":{"type":"string","description":"substring of the method name"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
+        binary_vcl_methods
     ),
     tool!(
         "binary.imports",
@@ -688,6 +694,31 @@ fn binary_resources(session: &Session, args: &Args) -> Result<Value, String> {
         .field("total", Value::from(total))
         .truncated(truncated)
         .next(vec!["binary.hexdump at a resource address".into()])
+        .build())
+}
+
+fn binary_vcl_methods(session: &Session, args: &Args) -> Result<Value, String> {
+    let file = args.file(session)?;
+    let view = occ_analyze::view::View::new(&file.image, &file.data);
+    let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
+    let (offset, limit) = args.page(200, 2000)?;
+    let methods: Vec<Value> = occ_analyze::vcl::published_methods(&view, &file.image)
+        .into_iter()
+        .filter(|m| {
+            filter
+                .as_ref()
+                .map(|f| m.name.to_ascii_lowercase().contains(f))
+                .unwrap_or(true)
+        })
+        .map(|m| obj!("name" => m.name, "addr" => addr(m.addr)))
+        .collect();
+    let total = methods.len();
+    let (page, truncated) = paginate(&methods, offset, limit);
+    Ok(Envelope::ok(format!("{total} published method(s)"))
+        .field("methods", Value::Array(page))
+        .field("total", Value::from(total))
+        .truncated(truncated)
+        .next(vec!["code.decompile at a method address".into()])
         .build())
 }
 

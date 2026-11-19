@@ -123,6 +123,18 @@ fn decode_native(
 ) -> (Vec<Function>, Vec<(Addr, String)>) {
     let thunks = find_thunks(view, dec);
     let mut seeds = collect_seeds(view, &thunks);
+    // A VCL form names its event handlers only in a resource, and the class
+    // publishes the name-to-address table that the form loader resolves at
+    // run time. That table is a symbol table in data form: treating its
+    // entries as seeds is what makes a handler recoverable at all.
+    for method in crate::vcl::published_methods(view, view.image()) {
+        seeds.push(Seed {
+            addr: method.addr,
+            size: None,
+            name: Some(method.name),
+            source: Some("VCL published method table"),
+        });
+    }
     if seeds.is_empty() {
         notes.push("image provides no code entry point or function symbols".into());
     }
