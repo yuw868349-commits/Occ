@@ -52,7 +52,7 @@ end)`. There is `code.function target=<handle>`, `code.explore`, `code.taint`,
 `trace.run`. The engine decides how much to decode, how far to follow control
 flow, and how much to render; the caller says how much it wants to read.
 
-**5. Zero dependencies.** `Cargo.lock` contains twelve path crates and no
+**5. Zero dependencies.** `Cargo.lock` contains fourteen path crates and no
 registry source. JSON, SHA-256, demangling, ELF/PE/Mach-O/WASM parsing, x86,
 ARM32, AArch64, RISC-V and WASM decoding, DWARF, and the MCP transport are all
 implemented here. The only external symbols are the Linux system calls in
