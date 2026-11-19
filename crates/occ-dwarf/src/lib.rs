@@ -1037,6 +1037,28 @@ fn build_unit(
                 // Children of this subprogram.
                 let mut j = i + 1;
                 while j < dies.len() && dies[j].depth > d.depth {
+                    // An inlined subroutine brings its own parameters and
+                    // its own locals, and they sit under it in the tree.
+                    // They are the inlined function's, not the host's: a
+                    // `printf` inlined into `main` has a parameter named
+                    // after the format string, and that name belongs to
+                    // the `printf`, so counting it as a parameter of
+                    // `main` would say that `main` takes three arguments
+                    // when it takes two. The nesting is what says so —
+                    // there is no tag on the parameter to say it.
+                    if dies[j].tag == DW_TAG_INLINE_SUBROUTINE {
+                        if owner_of[j] == Some(i) {
+                            if let Some(frame) = inline_frame(dies, &by_offset, j, unit, ctx) {
+                                f.inlined.push(frame);
+                            }
+                        }
+                        let inline_depth = dies[j].depth;
+                        j += 1;
+                        while j < dies.len() && dies[j].depth > inline_depth {
+                            j += 1;
+                        }
+                        continue;
+                    }
                     if owner_of[j] == Some(i) {
                         match dies[j].tag {
                             DW_TAG_PARAM | DW_TAG_VARIABLE => {
@@ -1074,12 +1096,6 @@ fn build_unit(
                                     f.params.push(var);
                                 } else {
                                     f.locals.push(var);
-                                }
-                            }
-                            DW_TAG_INLINE_SUBROUTINE => {
-                                if let Some(frame) = inline_frame(dies, &by_offset, j, unit, ctx)
-                                {
-                                    f.inlined.push(frame);
                                 }
                             }
                             _ => {}
