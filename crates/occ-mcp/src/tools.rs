@@ -393,16 +393,23 @@ fn handle_target(session: &Session, id: u32, target: &str) -> Result<Target, Str
             .resolve(id, target, occ_core::HandleKind::Function)
             .map_err(|e| e.to_string());
     }
+    // A bare address names the instruction at that address, not the function
+    // that happens to contain it. `code.disasm` must be able to start in the
+    // middle of a function, and `code.xrefs` must resolve an address inside a
+    // function to that address rather than silently widening it to the entry.
+    // Tools that want the surrounding function (`code.function`,
+    // `code.decompile`) resolve it through `function_of` below.
     if let Some(addr) = occ_core::addr::parse_addr(target) {
-        if let Some(f) = file.analysis.function_covering(addr) {
-            return Ok(Target::Function {
-                image: id,
-                entry: f.entry,
-                name: f.display_name(),
-                size: f.size,
-            });
-        }
         return Ok(Target::Insn {
+            image: id,
+            addr,
+            text: String::new(),
+        });
+    }
+    if let Some(rest) = target.strip_prefix("str:") {
+        let addr = occ_core::addr::parse_addr(rest)
+            .ok_or_else(|| format!("bad string handle {target:?}: {rest:?} is not an address"))?;
+        return Ok(Target::Str {
             image: id,
             addr,
             text: String::new(),
