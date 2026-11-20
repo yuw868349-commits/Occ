@@ -266,6 +266,39 @@ impl Trace {
     }
 }
 
+/// Explain why a file cannot be executed before `Command::spawn` turns the
+/// answer into a bare `Permission denied`.
+///
+/// A PE or ELF copied out of an archive usually has no execute bit. `execve`
+/// reports EACCES, and the caller sees "Permission denied" next to a path it
+/// can read — the missing piece is that the failure is the file mode, not the
+/// directory or the user. Checking the mode here names the fix.
+fn check_executable(path: &Path) -> Result<()> {
+    let meta = std::fs::metadata(path).map_err(|e| CoreError::Io {
+        path: path.display().to_string(),
+        source: e,
+    })?;
+    if meta.is_dir() {
+        return Err(CoreError::Backend(format!(
+            "{} is a directory, not a program",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode();
+        if mode & 0o111 == 0 {
+            return Err(CoreError::Backend(format!(
+                "{} is not executable (mode 0o{mode:03o}); add the execute bit with `chmod +x {}`",
+                path.display(),
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Run `path` under `ptrace` and record what it does.
 ///
 /// `image` is the file `path` was loaded from; it supplies the entry point and
@@ -289,6 +322,7 @@ pub fn run(path: &Path, image: &Image, cfg: &RunConfig) -> Result<Trace> {
         )));
     }
 
+    check_executable(path)?;
     let mut cmd = Command::new(path);
     if let Some(a0) = &cfg.argv0 {
         // `Command::new` always execs `path`; `arg0` only changes what the

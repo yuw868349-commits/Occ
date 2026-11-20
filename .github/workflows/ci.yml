@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
+
+      - name: Build
+        run: cargo build --release --workspace
+
+      - name: Tests
+        run: cargo test --release --workspace
+
+      - name: MCP smoke
+        run: python3 scripts/mcp_smoke.py target/release/occ /bin/ls
+
+      - name: C interface
+        run: scripts/ffi_check.sh /bin/true

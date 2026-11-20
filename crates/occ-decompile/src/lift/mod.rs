@@ -110,6 +110,13 @@ pub enum Operand {
     Vec(VecClass, u8),
     /// A slot of the x87 register stack.
     Fpu(u8),
+    /// A segment selector register, `ds`/`es`/`cs`/`ss`/`fs`/`gs`.
+    ///
+    /// These are operands of `push` and `pop`, and on 16-bit code of `mov`.
+    /// The flat model has no segment base to change; naming the operand
+    /// keeps `pop ds` from being reported as unparsed and lets the lifter
+    /// say exactly what it does and does not track.
+    Seg(&'static str),
     /// Memory reference.
     Mem {
         /// Access width in bytes; zero when the instruction did not say.
@@ -271,6 +278,7 @@ impl Operand {
             Operand::Cond(_) => 1,
             Operand::Vec(class, _) => class.size(),
             Operand::Fpu(_) => 8,
+            Operand::Seg(_) => 2,
             Operand::Mem { size, .. } => {
                 if *size == 0 {
                     8
@@ -671,6 +679,12 @@ pub struct Core<'a> {
     pub clobbered: HashSet<u8>,
     /// Notes about approximations, one per address.
     pub notes: Vec<(Addr, String)>,
+    /// Address of the instruction currently being lifted.
+    ///
+    /// Shared code can emit a note from inside an operand read, where the
+    /// instruction address is not a parameter. Keeping it here means those
+    /// notes point at the instruction instead of at address zero.
+    pub current_addr: Addr,
     /// Absolute address the current instruction's PC-relative operand refers
     /// to.
     pub pc_target: Option<u64>,
@@ -693,6 +707,7 @@ impl<'a> Core<'a> {
             ever_written: HashSet::new(),
             clobbered: HashSet::new(),
             notes: Vec::new(),
+            current_addr: Addr::NULL,
             pc_target: None,
         }
     }
@@ -738,6 +753,7 @@ impl<'a> Core<'a> {
             // them read them element by element instead.
             Operand::Vec(..) => Expr::Unknown("vector register".into()),
             Operand::Fpu(_) => Expr::Unknown("x87 slot".into()),
+            Operand::Seg(name) => Expr::Unknown(format!("segment selector {name}")),
         }
     }
 
@@ -982,7 +998,7 @@ impl<'a> Core<'a> {
             // Writing a whole vector register or an x87 slot as one word
             // would lose the elements the register holds, so the
             // architectures that have them write them element by element.
-            Operand::Vec(..) | Operand::Fpu(_) => {}
+            Operand::Vec(..) | Operand::Fpu(_) | Operand::Seg(_) => {}
         }
     }
 
@@ -1016,7 +1032,7 @@ impl<'a> Core<'a> {
                 return Expr::var(format!("{seg}:{:#x}", *disp as u64));
             }
             self.notes.push((
-                Addr::NULL,
+                self.current_addr,
                 format!("segment override {seg} on a computed address ignored"),
             ));
         }
@@ -1510,6 +1526,25 @@ pub trait Lifter {
 
     /// The name of the stack pointer register itself.
     fn sp_reg_name(&self) -> String;
+
+    /// Net x87 stack depth change of one instruction.
+    ///
+    /// A block is lifted with the depth its predecessors left behind; without
+    /// that, a block reached by a path that pushed two values starts every
+    /// lift thinking the stack is empty, and the first `fstp` reports an
+    /// underflow that the program never performed. Architectures without an
+    /// x87 stack return zero.
+    fn x87_effect(&self, _insn: &Instruction) -> i32 {
+        0
+    }
+
+    /// True when a call at `at` returns a value on the x87 stack.
+    fn call_returns_x87(&self, _insns: &[Instruction], _at: usize) -> bool {
+        false
+    }
+
+    /// Tell the lifter the x87 depth at the start of the next block.
+    fn set_x87_depth(&mut self, _depth: u8) {}
 
     /// Notes about approximations made while lifting.
     fn notes(&mut self) -> Vec<(Addr, String)>;

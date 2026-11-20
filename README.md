@@ -115,7 +115,7 @@ statement the binary contradicts comes back `refuted`, not `inconclusive`.
 
 ## Tools
 
-Thirty-eight, in seven groups. The names carry the intent.
+Forty-one, in seven groups. The names carry the intent.
 
 **Session — what state exists**
 
@@ -132,6 +132,8 @@ Thirty-eight, in seven groups. The names carry the intent.
 | `binary.open` | Load, analyse and fingerprint a file. Every other tool takes the returned image id. |
 | `binary.info` | Headers, segments, sections, fingerprint, coverage. |
 | `binary.sections` | Section map, filterable by name or kind. |
+| `binary.resources` | PE resource leaves: type, name, language, address and size; dialog templates and string-table bundles carry text a GUI never references by address. |
+| `binary.vcl_methods` | Borland/VCL published methods: the names form resources refer to, and the code address behind each. |
 | `binary.imports` | Imports, with the GOT/IAT slot each occupies when the container records it. |
 | `binary.exports` | Exported symbols and their addresses. |
 | `binary.symbols` | Symbol search; says whether the image is stripped, which changes how far the names can be trusted. |
@@ -146,9 +148,9 @@ Thirty-eight, in seven groups. The names carry the intent.
 
 | Tool | Answers |
 | --- | --- |
-| `code.functions` | Recovered functions with size, block count and call degree; sortable. |
+| `code.functions` | Recovered functions with size, block count, call degree and boundary confidence; speculative sweep bodies are omitted unless asked for. |
 | `code.function` | One function: blocks, edges, callers, callees, imports called, strings referenced, complexity, boundary evidence. |
-| `code.disasm` | Instructions from an address, each with flow kind and resolved target. |
+| `code.disasm` | Instructions from a function handle or an exact address; a bare address starts at that byte and reports when recovery chose a different boundary. |
 | `code.blocks` | Control-flow graph with typed edges — loop and branch structure without reading instructions. |
 | `code.decompile` | Pseudo-C: lifting, SSA, structuring, rendering. Unmodelled statements stay as comments and the `goto` count is reported. |
 | `code.explore` | Execute one function along its paths; each path reports the inputs that reach it and the value it returns. |
@@ -667,10 +669,10 @@ the evidence."*
 | `occ-dynamic` | `ptrace` tracing, `/proc/pid/maps`, syscall names, trace/static correlation. | 1.3k |
 | `occ-vsa` | Value sets: what an indirect branch or call can reach, and why. | 1.8k |
 | `occ-session` | Session state, handle resolution, envelopes, persistence, diff, pattern scan. | 2.7k |
-| `occ-mcp` | The 39 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.6k |
+| `occ-mcp` | The 41 tool definitions, JSON-RPC transport, stdio and HTTP. | 3.6k |
 | `occ-ffi` | The C interface: thirteen functions, one hand-written header. | 0.7k |
 
-64.7k lines of Rust, 625 tests, 82 end-to-end MCP checks. The line count is the
+64.7k lines of Rust, 655 tests, 82 end-to-end MCP checks. The line count is the
 code, not the comments and not the blank lines, and it leaves out the SVE
 encoding tables, which are generated from the architecture manual rather than
 written by hand and which run to a hundred thousand lines on their own.
@@ -681,7 +683,7 @@ Unit tests are necessary and not sufficient: most of the serious bugs found whil
 building this were invisible to them and obvious against a real file.
 
 ```bash
-cargo test --workspace                                         # 625 tests
+cargo test --workspace                                         # 655 tests
 cargo clippy --workspace --all-targets -- -D warnings          # clean
 python3 scripts/mcp_smoke.py target/release/occ             # 82 checks
 scripts/ffi_check.sh /bin/true                                 # the C interface
@@ -873,7 +875,7 @@ Stated because the tool is supposed to state them, not because they are temporar
   regions the bytecode is built from, which produces a body, but not the
   register-level program the symbolic executor explores: there is no
   register file to fork and no condition flags to read, so `code.explore`
-  and `code.paths` report that they have nothing to execute rather than
+  and `code.taint` report that they have nothing to execute rather than
   guessing. The operand stack could be modelled as that state, and that
   work has not been done.
 - **ARM32's 32-bit Thumb space is not finished.** The 16-bit set is, and in

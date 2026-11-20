@@ -248,7 +248,12 @@ fn lifter_for<'a>(
         occ_core::Arch::X86 => {
             static CDECL: lift::x86::X86Target = lift::x86::X86Target::cdecl();
             static STDCALL: lift::x86::X86Target = lift::x86::X86Target::stdcall();
+            static CDECL16: lift::x86::X86Target = lift::x86::X86Target::cdecl16();
             let target = match format {
+                // A `.COM` image is real-mode code, not a 32-bit program
+                // that happens to be small: `ax` and `sp` are the names it
+                // uses, and every stack slot is two bytes.
+                occ_core::Format::Com => &CDECL16,
                 occ_core::Format::Pe | occ_core::Format::Coff => &STDCALL,
                 _ => &CDECL,
             };
@@ -393,6 +398,78 @@ fn show(stage: &str, blocks: &[Block]) {
     }
 }
 
+/// x87 stack depth at the start of every block, from the recovered CFG.
+///
+/// The lifter used to carry one `fpu_top` across blocks in address order, so a
+/// block reached by a path that had pushed two values started at empty and its
+/// first pop reported an underflow the program never performed. A worklist
+/// over the real edges gives each block the depth its predecessors agree on.
+/// Two predecessors that disagree are a fact about the code; the block then
+/// starts empty and the disagreement is reported once.
+fn x87_entry_depths(func: &Function, lifter: &dyn lift::Lifter) -> (Vec<u8>, usize) {
+    let n = func.blocks.len();
+    let mut depth: Vec<Option<i32>> = vec![None; n];
+    let entry = func
+        .blocks
+        .iter()
+        .position(|b| b.start == func.entry)
+        .unwrap_or(0);
+    let mut queue: Vec<usize> = vec![entry];
+    depth[entry] = Some(0);
+    let mut conflicts = 0usize;
+    while let Some(i) = queue.pop() {
+        let start = depth[i].unwrap_or(0).max(0);
+        let mut out = start;
+        let insns = &func.insns[func.blocks[i].insn_start..func.blocks[i].insn_end];
+        for (j, insn) in insns.iter().enumerate() {
+            let mut delta = lifter.x87_effect(insn);
+            // A call whose result is popped from the x87 stack by the next
+            // instruction returns a long double. The callee's signature is
+            // not in the image, but the pop right after the call is.
+            if matches!(insn.mnemonic.as_ref(), "call" | "callq")
+                && lifter.call_returns_x87(insns, j)
+            {
+                delta += 1;
+            }
+            out += delta;
+        }
+        out = out.clamp(0, 8);
+        for e in &func.blocks[i].edges {
+            if matches!(
+                e.kind,
+                occ_core::EdgeKind::Call | occ_core::EdgeKind::Return
+            ) {
+                continue;
+            }
+            let Some(to) = func.blocks.iter().position(|b| b.start == e.to) else {
+                continue;
+            };
+            match depth[to] {
+                None => {
+                    depth[to] = Some(out);
+                    queue.push(to);
+                }
+                Some(was) if was != out => {
+                    conflicts += 1;
+                    // The join is the place a block is entered from two
+                    // paths with different stacks. Empty is the only state
+                    // that cannot invent a value at the top.
+                    if was != 0 {
+                        depth[to] = Some(0);
+                        queue.push(to);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    let depths = depth
+        .into_iter()
+        .map(|d| d.unwrap_or(0).max(0) as u8)
+        .collect();
+    (depths, conflicts)
+}
+
 /// Lift and normalise one function, without recovering control flow.
 pub fn build_program(
     image: &Image,
@@ -439,6 +516,12 @@ pub fn build_program(
     // Where the block a conditional return jumps to will live.
     let mut return_block_at: Option<Addr> = None;
     let arg_reg_names = lifter.arg_reg_names();
+    let (x87_depths, x87_conflicts) = x87_entry_depths(func, &*lifter);
+    if x87_conflicts > 0 {
+        notes.push(format!(
+            "the x87 stack depth differs at {x87_conflicts} join(s); those blocks start with an empty stack"
+        ));
+    }
     for (i, bb) in func.blocks.iter().enumerate() {
         if i >= opts.max_blocks {
             truncated = true;
@@ -448,6 +531,7 @@ pub fn build_program(
             .insns
             .get(bb.insn_start..bb.insn_end)
             .unwrap_or_default();
+        lifter.set_x87_depth(x87_depths.get(i).copied().unwrap_or(0));
         let lifted = lifter.lift_block(insns);
         let last = insns.last();
         let term = match last {
@@ -746,8 +830,28 @@ pub fn build_program(
         }
     }
 
+    // One diagnostic per instruction, not one per time the lifter walked
+    // the instruction. A stack underflow reported sixteen times at address
+    // zero said neither where it happened nor how often; the count now
+    // belongs to the address and the text.
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut ordered: Vec<(String, usize)> = Vec::new();
     for (addr, note) in lifter.notes() {
-        notes.push(format!("{addr}: {note}"));
+        let line = format!("{addr}: {note}");
+        match seen.get(&line) {
+            Some(&at) => ordered[at].1 += 1,
+            None => {
+                seen.insert(line.clone(), ordered.len());
+                ordered.push((line, 1));
+            }
+        }
+    }
+    for (line, count) in ordered {
+        if count > 1 {
+            notes.push(format!("{line} ({count} occurrences)"));
+        } else {
+            notes.push(line);
+        }
     }
     if blocks.is_empty() {
         return Program {

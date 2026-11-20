@@ -40,6 +40,10 @@ pub enum Mode {
     Bits64,
     /// 32-bit: eight general-purpose registers, `eax` through `edi`.
     Bits32,
+    /// 16-bit real mode, as a DOS `.COM` image runs: eight registers named
+    /// `ax` through `di`, two-byte stack slots, and addresses relative to a
+    /// segment base the flat model treats as zero.
+    Bits16,
 }
 
 impl Mode {
@@ -48,12 +52,22 @@ impl Mode {
         match self {
             Mode::Bits64 => 8,
             Mode::Bits32 => 4,
+            Mode::Bits16 => 2,
         }
     }
 
-    /// True for the 32-bit mode.
+    /// True when arguments arrive on the stack rather than in registers.
+    ///
+    /// The name is historical; both 16-bit and 32-bit x86 use stack
+    /// arguments, and every caller that asks this question wants that fact,
+    /// not the register width.
     pub const fn is_32(self) -> bool {
-        matches!(self, Mode::Bits32)
+        matches!(self, Mode::Bits32 | Mode::Bits16)
+    }
+
+    /// True for the 16-bit real-mode model.
+    pub const fn is_16(self) -> bool {
+        matches!(self, Mode::Bits16)
     }
 }
 
@@ -145,6 +159,9 @@ const REG64: [&str; 17] = [
 /// sees one width's names.
 const REG32: [&str; 8] = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"];
 
+/// Canonical 16-bit names by index.
+const REG16: [&str; 8] = ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"];
+
 /// Registers of the 32-bit mode: name, index, size, bit offset.
 ///
 /// The high-byte forms (`ah`, `ch`, …) exist here as they do in 64-bit mode.
@@ -177,10 +194,34 @@ const REG32_TABLE: &[(&str, u8, u8, u8)] = &[
     ("di", 7, 2, 0),
 ];
 
+/// Registers of the 16-bit real-mode model: name, index, size, bit offset.
+const REG16_TABLE: &[(&str, u8, u8, u8)] = &[
+    ("ax", 0, 2, 0),
+    ("al", 0, 1, 0),
+    ("ah", 0, 1, 8),
+    ("cx", 1, 2, 0),
+    ("cl", 1, 1, 0),
+    ("ch", 1, 1, 8),
+    ("dx", 2, 2, 0),
+    ("dl", 2, 1, 0),
+    ("dh", 2, 1, 8),
+    ("bx", 3, 2, 0),
+    ("bl", 3, 1, 0),
+    ("bh", 3, 1, 8),
+    ("sp", 4, 2, 0),
+    ("bp", 5, 2, 0),
+    ("si", 6, 2, 0),
+    ("di", 7, 2, 0),
+];
+
 const RSP: u8 = 4;
 const RBP: u8 = 5;
+const RSI: u8 = 6;
+const RDI: u8 = 7;
 const RAX: u8 = 0;
 const RCX: u8 = 1;
+const RDX: u8 = 2;
+const RBX: u8 = 3;
 const RIP: u8 = 16;
 
 /// Registers a call may overwrite, in 64-bit mode: every general-purpose
@@ -203,7 +244,7 @@ const CALLER_SAVED_32: &[u8] = &[0, 1, 2];
 /// half of it that the mnemonic can answer.
 const fn is_callee_saved(mode: Mode, idx: u8) -> bool {
     match mode {
-        Mode::Bits32 => matches!(idx, 3 | 5 | 6 | 7),
+        Mode::Bits32 | Mode::Bits16 => matches!(idx, 3 | 5 | 6 | 7),
         Mode::Bits64 => matches!(idx, 3 | 5 | 12 | 13 | 14 | 15),
     }
 }
@@ -290,6 +331,23 @@ impl X86Target {
         }
     }
 
+    /// The 16-bit real-mode target a DOS `.COM` image needs.
+    pub const fn cdecl16() -> Self {
+        X86Target {
+            abi: Abi::Cdecl,
+            mode: Mode::Bits16,
+        }
+    }
+
+    /// The 16-bit `stdcall` variant, for a PE or COFF image built for real
+    /// mode.
+    pub const fn stdcall16() -> Self {
+        X86Target {
+            abi: Abi::Stdcall,
+            mode: Mode::Bits16,
+        }
+    }
+
     /// Which width this target models.
     pub const fn mode(&self) -> Mode {
         self.mode
@@ -318,6 +376,10 @@ fn lookup_reg_in(mode: Mode, name: &str) -> Option<Reg> {
             .iter()
             .find(|(n, _, _, _)| *n == name)
             .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset)),
+        Mode::Bits16 => REG16_TABLE
+            .iter()
+            .find(|(n, _, _, _)| *n == name)
+            .map(|(_, idx, size, offset)| Reg::view(*idx, *size, *offset)),
     }
 }
 
@@ -330,6 +392,7 @@ impl Target for X86Target {
         let table = match self.mode {
             Mode::Bits64 => REG64.get(usize::from(idx)).copied(),
             Mode::Bits32 => REG32.get(usize::from(idx)).copied(),
+            Mode::Bits16 => REG16.get(usize::from(idx)).copied(),
         };
         table.unwrap_or("rax").to_string()
     }
@@ -633,6 +696,20 @@ fn parse_operand(mode: Mode, s: &str) -> Option<Operand> {
     if let Some(reg) = lookup_reg_in(mode, rest) {
         return Some(Operand::Reg(reg));
     }
+    // `pop ds` and `push es` name a segment register without a colon.
+    // The bracketed and `ds:addr` forms are handled above; this is the
+    // bare-operand form, which is what 16-bit code uses.
+    if let Some(seg) = match rest {
+        "ds" => Some("ds"),
+        "es" => Some("es"),
+        "cs" => Some("cs"),
+        "ss" => Some("ss"),
+        "fs" => Some("fs"),
+        "gs" => Some("gs"),
+        _ => None,
+    } {
+        return Some(Operand::Seg(seg));
+    }
     // A vector register is not a general-purpose register: it holds
     // elements, and the lifter reads and writes them one at a time.
     if let Some(n) = vector_index(rest, "xmm") {
@@ -789,6 +866,11 @@ pub struct Lifter<'a> {
     pub core: Core<'a>,
     /// True once the prologue has been consumed.
     pub prologue_seen: bool,
+    /// Address of the instruction being lifted, for notes that belong to it.
+    ///
+    /// A note filed at address zero says nothing about where the problem is
+    /// and makes every such note look identical.
+    current_addr: Addr,
     /// The x87 stack's top, as the physical slot it lives in.
     ///
     /// Eight means the stack is empty, which is the state every function
@@ -823,6 +905,13 @@ pub struct Lifter<'a> {
     /// last one pushed is the first one passed. The list is emptied when the
     /// call is lifted, because the next call pushes its own.
     pushed: Vec<Expr>,
+    /// True when the call about to be lifted is followed by an x87 pop.
+    ///
+    /// A call's return type is not in the instruction. When the next
+    /// instruction pops the x87 stack, the only value it can pop is the
+    /// callee's result, so treating the call as one push is exact for that
+    /// pattern and avoids a false underflow.
+    call_returns_x87: bool,
     /// True once the prologue is over.
     ///
     /// The prologue of a 32-bit function is a run of `push ebx`, `push esi`
@@ -857,18 +946,20 @@ impl<'a> Lifter<'a> {
         Lifter {
             core: Core::new(target, name_of).with_symbols(symbols),
             prologue_seen: false,
+            current_addr: Addr::NULL,
             fpu_top: 8,
             temps: 0,
             wrote_vector: false,
             wrote_x87: false,
             float_width: 0,
             loop_condition: None,
-            mode: if target.reg_width(0) == 4 {
-                Mode::Bits32
-            } else {
-                Mode::Bits64
+            mode: match target.reg_width(0) {
+                2 => Mode::Bits16,
+                4 => Mode::Bits32,
+                _ => Mode::Bits64,
             },
             pushed: Vec::new(),
+            call_returns_x87: false,
             frame_ready: false,
             pops: None,
         }
@@ -992,6 +1083,8 @@ impl<'a> Lifter<'a> {
     }
 
     fn lift_insn(&mut self, insn: &Instruction, out: &mut Lifted) {
+        self.current_addr = insn.addr;
+        self.core.current_addr = insn.addr;
         let Some(mut p) = self.core.target.parse(&insn.text) else {
             out.stmts
                 .push(Stmt::Comment(format!("{} ; unparsed", insn.text)));
@@ -1064,7 +1157,10 @@ impl<'a> Lifter<'a> {
                 // change and dropping the write is exact, not an omission.
                 self.core.notes.push((
                     insn.addr,
-                    format!("{}: selector move; the flat model's base is unchanged", insn.text),
+                    format!(
+                        "{}: selector move; the flat model's base is unchanged",
+                        insn.text
+                    ),
                 ));
             }
             "push" if p.ops.is_empty() => {
@@ -1072,6 +1168,15 @@ impl<'a> Lifter<'a> {
                     insn.addr,
                     format!("{}: selector push; the value is not tracked", insn.text),
                 ));
+            }
+            "pusha" | "pushad" => self.lift_pusha(&mut out.stmts),
+            "popa" | "popad" => self.lift_popa(&mut out.stmts),
+            "arpl" => self.lift_arpl(&p.ops, &mut out.stmts),
+            // `fwait` and `wait` wait for a pending x87 operation. They
+            // change no value this model tracks, and leaving them as
+            // "not lifted" made an x87 function look partly unread.
+            "fwait" | "wait" => {
+                self.note("fwait: waits for the x87 unit; no tracked state changes");
             }
             "push" => self.lift_push(&p.ops, &mut out.stmts),
             "pop" => self.lift_pop(&p.ops, &mut out.stmts),
@@ -1108,9 +1213,7 @@ impl<'a> Lifter<'a> {
             }
             "call" => self.lift_call(insn, &p.ops, &mut out.stmts),
             "jmp" => self.lift_jmp(&p.ops, &mut out.stmts),
-            "ret" | "retn" | "retf" | "retfq" => {
-                self.lift_ret(&p.ops, insn.addr, &mut out.stmts)
-            }
+            "ret" | "retn" | "retf" | "retfq" => self.lift_ret(&p.ops, insn.addr, &mut out.stmts),
             other => {
                 if cond_of_jcc(other).is_some() {
                     // Handled by take_condition once the block ends.
@@ -2067,6 +2170,13 @@ impl<'a> Lifter<'a> {
     /// `[esp+N]` one slot out.
     fn lift_push(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let Some(op) = ops.first() else { return };
+        if let Operand::Seg(name) = op {
+            self.core.adjust_sp(-i64::from(self.width()));
+            self.note(format!(
+                "push {name}: segment selector pushed; the value is not tracked in the flat model"
+            ));
+            return;
+        }
         self.core.adjust_sp(-i64::from(self.width()));
         if let Operand::Reg(r) = op {
             // `push rbp` anchors the frame: the value saved is the caller's
@@ -2110,6 +2220,13 @@ impl<'a> Lifter<'a> {
 
     fn lift_pop(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
         let Some(op) = ops.first() else { return };
+        if let Operand::Seg(name) = op {
+            self.core.adjust_sp(i64::from(self.width()));
+            self.note(format!(
+                "pop {name}: selector loaded; the base is unchanged in the flat model"
+            ));
+            return;
+        }
         self.core.adjust_sp(i64::from(self.width()));
         if let Operand::Reg(r) = op {
             if Some(r.idx) == self.core.target.fp_reg() {
@@ -2123,6 +2240,120 @@ impl<'a> Lifter<'a> {
                 "pop {name} ; restored from the frame"
             )));
         }
+    }
+
+    /// A fixed stack slot at `disp` from the current stack pointer.
+    fn stack_mem(&self, disp: i64) -> Operand {
+        Operand::Mem {
+            size: self.width(),
+            base: Some(Reg::full(RSP, self.width())),
+            index: None,
+            scale: 1,
+            disp,
+            abs: None,
+            seg: None,
+            base_update: None,
+        }
+    }
+
+    /// `pusha`/`pushad`: save the eight general-purpose registers.
+    ///
+    /// The hardware pushes `ax, cx, dx, bx, sp, bp, si, di` in that order,
+    /// so the last one pushed — `di` — is at the new top. The saved `sp` is
+    /// the value before the instruction, not the decremented one. Storing
+    /// the registers as stack variables means a later `popa` can restore
+    /// them without inventing a memory read at an unknown address.
+    fn lift_pusha(&mut self, stmts: &mut Vec<Stmt>) {
+        let width = self.width();
+        if width == 8 {
+            self.note("pusha in 64-bit mode is not a valid instruction; ignored");
+            return;
+        }
+        let total = 8 * i64::from(width);
+        let old_sp = self.new_temp_named("sp_before_pusha");
+        let sp = self.reg(RSP);
+        self.core.assign(&old_sp, Expr::var(sp), stmts);
+        self.core.adjust_sp(-total);
+        // Offset 0 is the last push. `sp` is the pre-instruction value.
+        let order = [RDI, RSI, RBP, RSP, RBX, RDX, RCX, RAX];
+        for (i, idx) in order.iter().enumerate() {
+            let value = if *idx == RSP {
+                Expr::var(old_sp.clone())
+            } else {
+                self.core.read_reg(Reg::full(*idx, width))
+            };
+            self.core
+                .write(&self.stack_mem(i as i64 * i64::from(width)), value, stmts);
+        }
+    }
+
+    /// `popa`/`popad`: restore the seven registers the instruction restores.
+    ///
+    /// The stack pointer slot is skipped by the hardware; reading it and
+    /// assigning it would undo the increment below. All values are read
+    /// before the pointer moves, because after it moves the same offsets
+    /// name different slots.
+    fn lift_popa(&mut self, stmts: &mut Vec<Stmt>) {
+        let width = self.width();
+        if width == 8 {
+            self.note("popa in 64-bit mode is not a valid instruction; ignored");
+            return;
+        }
+        let total = 8 * i64::from(width);
+        let mut values = Vec::with_capacity(8);
+        for i in 0..8 {
+            values.push(
+                self.core
+                    .read(&self.stack_mem(i as i64 * i64::from(width)), stmts),
+            );
+        }
+        self.core.adjust_sp(total);
+        let order = [RDI, RSI, RBP, RSP, RBX, RDX, RCX, RAX];
+        for (i, idx) in order.iter().enumerate() {
+            if *idx == RSP {
+                continue;
+            }
+            self.core.write(
+                &Operand::Reg(Reg::full(*idx, width)),
+                values[i].clone(),
+                stmts,
+            );
+        }
+    }
+
+    /// `arpl`: lower the requested privilege level of a selector.
+    ///
+    /// In the flat model the selector's base and limit are not used, but the
+    /// destination is still a value the code may compare. Modelling the
+    /// two-bit adjustment keeps it visible; the flags it sets are not
+    /// reconstructed because the next branch would need the full selector
+    /// comparison, which the model has no representation for.
+    fn lift_arpl(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
+        let (Some(dst), Some(src)) = (ops.first(), ops.get(1)) else {
+            return;
+        };
+        let old = self.snapshot(dst, stmts);
+        let selector = self.snapshot(src, stmts);
+        let low = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(selector),
+            rhs: Box::new(Expr::Const(3)),
+            bits: 16,
+        };
+        let base = Expr::Bin {
+            op: BinOp::And,
+            lhs: Box::new(old),
+            rhs: Box::new(Expr::Const(!3u64)),
+            bits: 16,
+        };
+        let value = Expr::Bin {
+            op: BinOp::Or,
+            lhs: Box::new(base),
+            rhs: Box::new(low),
+            bits: 16,
+        };
+        self.core.write(dst, value, stmts);
+        self.note("arpl: selector RPL adjusted; selector base and limit are not modelled");
     }
 
     fn lift_xchg(&mut self, ops: &[Operand], stmts: &mut Vec<Stmt>) {
@@ -2710,7 +2941,7 @@ impl<'a> Lifter<'a> {
                 Expr::var(self.reg(8)),
                 Expr::var(self.reg(9)),
             ],
-            Mode::Bits32 => vec![
+            Mode::Bits32 | Mode::Bits16 => vec![
                 Expr::var(self.reg(RAX)),
                 Expr::var(self.reg(3)),
                 Expr::var(self.reg(RCX)),
@@ -2740,7 +2971,12 @@ impl<'a> Lifter<'a> {
     /// than guessing which.
     fn lift_int(&mut self, ops: &[Operand], addr: Addr, stmts: &mut Vec<Stmt>) {
         match ops.first() {
-            Some(Operand::Imm(0x80)) if self.mode.is_32() => self.lift_syscall(addr, stmts),
+            // `int 0x80` is the 32-bit Linux gate. In a 16-bit COM file the
+            // same vector is a DOS/BIOS call, and naming it a syscall would
+            // invent arguments the platform never passes.
+            Some(Operand::Imm(0x80)) if matches!(self.mode, Mode::Bits32) => {
+                self.lift_syscall(addr, stmts)
+            }
             Some(Operand::Imm(0x2e)) => {
                 stmts.push(Stmt::Call {
                     name: "sysenter".into(),
@@ -2882,7 +3118,7 @@ impl<'a> Lifter<'a> {
         let ret_reg = self.reg(RAX);
         if !matches!(insn.flow, FlowKind::Return) {
             stmts.push(Stmt::Call {
-                name,
+                name: name.clone(),
                 args,
                 ret: Some(ret_reg),
                 addr: insn.addr,
@@ -2901,9 +3137,13 @@ impl<'a> Lifter<'a> {
             self.core.ever_written.insert(RAX);
             let caller_saved = match self.mode {
                 Mode::Bits64 => CALLER_SAVED,
-                Mode::Bits32 => CALLER_SAVED_32,
+                Mode::Bits32 | Mode::Bits16 => CALLER_SAVED_32,
             };
             self.core.clobber(caller_saved, RAX);
+            if self.call_returns_x87 {
+                let value = Expr::Unknown(format!("{name}() x87 result"));
+                self.fpu_push(value, stmts);
+            }
         } else {
             stmts.push(Stmt::Call {
                 name,
@@ -3751,10 +3991,12 @@ impl<'a> Lifter<'a> {
     /// narrowing is recorded as a note: the output then says what was
     /// approximated instead of pretending the width was right.
     fn vec_narrow_note(&mut self) {
-        self.core.notes.push((
-            Addr::NULL,
-            "a vector instruction on 8- or 16-bit elements is modelled at 32-bit width".into(),
-        ));
+        self.note("a vector instruction on 8- or 16-bit elements is modelled at 32-bit width");
+    }
+
+    /// Record a diagnostic against the instruction being lifted.
+    fn note(&mut self, text: impl Into<String>) {
+        self.core.notes.push((self.current_addr, text.into()));
     }
 
     // ------------------------------------------------------------------
@@ -3774,10 +4016,7 @@ impl<'a> Lifter<'a> {
     /// Push a value onto the x87 stack.
     fn fpu_push(&mut self, value: Expr, stmts: &mut Vec<Stmt>) {
         if self.fpu_top == 0 {
-            self.core.notes.push((
-                Addr::NULL,
-                "the x87 stack overflowed: the pushed value is lost".into(),
-            ));
+            self.note("the x87 stack overflowed: the pushed value is lost");
             return;
         }
         self.fpu_top -= 1;
@@ -3795,11 +4034,11 @@ impl<'a> Lifter<'a> {
 
     /// Pop a value off the x87 stack.
     fn fpu_pop(&mut self) {
-        if self.fpu_top >= 7 {
-            self.core.notes.push((
-                Addr::NULL,
-                "the x87 stack underflowed: there was nothing to pop".into(),
-            ));
+        // Eight is empty; seven is one live value. The old test treated the
+        // one-value state as empty, so every function that pushed once and
+        // popped once reported an underflow it never performed.
+        if self.fpu_top >= 8 {
+            self.note("the x87 stack underflowed: there was nothing to pop");
             return;
         }
         self.fpu_top += 1;
@@ -4091,10 +4330,7 @@ impl<'a> Lifter<'a> {
                 // source last would leave the value it started with.
                 self.core.write(src, held, stmts);
                 self.core.write(dst, sum, stmts);
-                self.core.notes.push((
-                    Addr::NULL,
-                    "xadd: an atomic read-modify-write; no other thread sees the half state".into(),
-                ));
+                self.note("xadd: an atomic read-modify-write; no other thread sees the half state");
             }
             "cmpxchg" => {
                 let width = dst.size();
@@ -4153,9 +4389,7 @@ impl<'a> Lifter<'a> {
                     },
                     stmts,
                 );
-                self.core
-                    .notes
-                    .push((Addr::NULL, "cmpxchg: an atomic compare-and-exchange".into()));
+                self.note("cmpxchg: an atomic compare-and-exchange");
             }
             _ => return false,
         }
@@ -4359,7 +4593,57 @@ fn fpu_slot_name(physical: u8) -> String {
     format!("st_{}", 7u8.saturating_sub(physical))
 }
 
+/// True when the next x87 operation after `at` pops the stack.
+///
+/// The callee's return type is not encoded, but a call followed by a stack
+/// cleanup and then a pop can only be popping the callee's long double. The
+/// scan stops at the first x87 push or pop; an intervening integer
+/// instruction is part of the caller's cleanup and does not change that.
+fn x87_result_after_call(insns: &[Instruction], at: usize) -> bool {
+    for next in insns.iter().skip(at + 1).take(6) {
+        match next.mnemonic.as_ref() {
+            "fstp" | "fistp" | "fisttp" | "fcomp" | "fcompp" | "fcomip" | "fucomip" | "faddp"
+            | "fmulp" | "fsubp" | "fsubrp" | "fdivp" | "fdivrp" => return true,
+            "fld" | "fild" | "fldz" | "fld1" | "fldpi" | "fldl2e" | "fldlg2" | "fldln2"
+            | "fldl2t" | "fcom" | "fcomi" | "fucomi" | "fxch" | "fadd" | "fmul" | "fsub"
+            | "fsubr" | "fdiv" | "fdivr" | "fchs" | "fabs" | "fsqrt" | "frndint" | "fscale"
+            | "fprem" | "fprem1" | "fxtract" | "f2xm1" | "fyl2x" | "fpatan" | "fptan" | "fsin"
+            | "fcos" | "fsincos" | "fst" | "fist" | "fnstsw" | "fnstcw" | "fldcw" | "fnstenv"
+            | "fldenv" | "frstor" | "fnsave" | "finit" | "fnclex" | "fwait" | "wait" => {
+                return false;
+            }
+            "call" | "callq" => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 impl super::Lifter for Lifter<'_> {
+    fn x87_effect(&self, insn: &Instruction) -> i32 {
+        // Every x87 mnemonic either pushes one, pops one, or does neither.
+        // The two double pops are named explicitly because the effect is the
+        // only thing that keeps the next block's depth right.
+        match insn.mnemonic.as_ref() {
+            "fld" | "fild" | "fldz" | "fld1" | "fldpi" | "fldl2e" | "fldlg2" | "fldln2"
+            | "fldl2t" => 1,
+            "fstp" | "fistp" | "fisttp" | "fcomp" | "fcomip" | "fucomip" => -1,
+            "fcompp" => -2,
+            "faddp" | "fmulp" | "fsubp" | "fsubrp" | "fdivp" | "fdivrp" => -1,
+            _ => 0,
+        }
+    }
+
+    fn call_returns_x87(&self, insns: &[Instruction], at: usize) -> bool {
+        x87_result_after_call(insns, at)
+    }
+
+    fn set_x87_depth(&mut self, depth: u8) {
+        // `fpu_top` is the physical slot of the top; eight is empty. The
+        // hardware's stack grows towards slot zero.
+        self.fpu_top = 8u8.saturating_sub(depth.min(8));
+    }
+
     fn lift_block(&mut self, insns: &[Instruction]) -> Lifted {
         let mut out = Lifted::default();
         // The register state is per block, not per function. A block that
@@ -4373,7 +4657,8 @@ impl super::Lifter for Lifter<'_> {
         // list across a block boundary would give the next call arguments
         // that belong to a path this block cannot see.
         self.pushed.clear();
-        for insn in insns {
+        for (i, insn) in insns.iter().enumerate() {
+            self.call_returns_x87 = x87_result_after_call(insns, i);
             let before = out.stmts.len();
             self.lift_insn(insn, &mut out);
             for _ in before..out.stmts.len() {
@@ -4425,19 +4710,23 @@ impl super::Lifter for Lifter<'_> {
         if !self.mode.is_32() {
             return Vec::new();
         }
-        // A 32-bit function reads its arguments at fixed offsets above the
-        // return address, so they are the slots at 4, 8, 12 and so on from
-        // the frame base. The frame slot naming already calls those `arg_N`,
-        // which is what makes them findable here without another table.
+        // A stack-argument function reads its arguments at fixed offsets
+        // above the return address: four-byte slots in 32-bit mode, two-byte
+        // slots in 16-bit real mode. The frame slot naming already calls
+        // those `arg_N`, which is what makes them findable without another
+        // table.
+        let first = if self.mode.is_16() { 2 } else { 4 };
+        let step = i64::from(self.width());
         (0..MAX_STACK_ARGS)
-            .map(|i| slot_name(4 + 4 * i as i64, self.width()))
+            .map(|i| slot_name(first + step * i as i64, self.width()))
             .collect()
     }
 
     fn declared_args(&self) -> Option<usize> {
-        // `ret imm` states the argument bytes a callee removes. Only the
-        // 32-bit mode has a fixed argument width for that to be a count
-        // rather than a lower bound.
+        // `ret imm` states the argument bytes a callee removes. A
+        // stack-argument mode has a fixed slot width, so the byte count is
+        // also a count of arguments; a register-argument ABI would make it
+        // only a lower bound.
         let bytes = self.pops?;
         if !self.mode.is_32() || bytes % u64::from(self.width()) != 0 {
             return None;
@@ -4472,7 +4761,11 @@ impl super::Lifter for Lifter<'_> {
             // A 32-bit function returns what fits in `eax`, and calling that
             // `u64` would tell a caller the value has an upper half it has
             // never held.
-            return Some(if self.mode.is_32() { "u32" } else { "u64" });
+            return Some(match self.mode {
+                Mode::Bits16 => "u16",
+                Mode::Bits32 => "u32",
+                Mode::Bits64 => "u64",
+            });
         }
         if self.wrote_vector {
             return Some(match self.float_width {
@@ -4605,6 +4898,28 @@ mod tests {
             .collect();
         let branch = lifted.branch.as_ref().map(crate::render::expr);
         (stmts, branch)
+    }
+
+    /// Instructions for the lift helpers: uniform eight-byte spans whose
+    /// addresses advance, so an instruction's address identifies it.
+    fn texts(texts: &[&str]) -> Vec<Instruction> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| Instruction {
+                addr: Addr((i as u64) * 8),
+                len: 8,
+                bytes: [0; MAX_INSN_LEN],
+                text: (*text).to_string(),
+                mnemonic: text.split_whitespace().next().unwrap_or("").into(),
+                flow: FlowKind::Next,
+                target: None,
+                mem_reads: Vec::new(),
+                mem_writes: Vec::new(),
+                mem_addr: Vec::new(),
+                imm_values: Vec::new(),
+            })
+            .collect()
     }
 
     fn lift_texts(texts: &[&str]) -> Vec<String> {
@@ -4821,6 +5136,104 @@ mod tests {
         // there is no zero flag to read.
         let (_, branch) = lift_branch(&["loope 0x40"]);
         assert_eq!(branch.as_deref(), Some("<flags>"));
+    }
+
+    #[test]
+    fn one_x87_push_leaves_a_value_the_pop_can_take() {
+        // Empty is eight and full is zero. A single push leaves the top at
+        // seven, which is one live value, not an empty stack: the off-by-one
+        // test here used to report an underflow on the very first pop of any
+        // function.
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        static SYSV: X86Target = X86Target::sysv();
+        let mut lifter = Lifter::new(&SYSV, &name_of, &symbols);
+        let insns = texts(&["fld qword ptr [rsp]", "fstp qword ptr [rsp + 0x8]"]);
+        let _ = LifterTrait::lift_block(&mut lifter, &insns);
+        assert!(
+            !lifter.notes().iter().any(|n| n.1.contains("underflow")),
+            "{:?}",
+            lifter.notes()
+        );
+    }
+
+    #[test]
+    fn a_call_that_returns_a_long_double_is_on_the_stack_at_the_next_pop() {
+        // The caller cleans the argument with `pop ecx`, then stores the
+        // result. x86 keeps the two stacks apart, so the integer pop is not
+        // an x87 pop and `fstp` has the long double the call returned.
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        static SYSV: X86Target = X86Target::sysv();
+        let mut lifter = Lifter::new(&SYSV, &name_of, &symbols);
+        let insns = texts(&[
+            "call 0x40b210 (rel +0x782f)",
+            "pop ecx",
+            "fstp qword ptr [ebp - 0x38]",
+        ]);
+        let lifted = LifterTrait::lift_block(&mut lifter, &insns);
+        assert!(
+            !lifter.notes().iter().any(|n| n.1.contains("underflow")),
+            "{:?}",
+            lifter.notes()
+        );
+        // The store survives: the decompiler does not lose the result.
+        assert!(
+            lifted.stmts.iter().any(|s| matches!(s, Stmt::Store { .. })),
+            "{:?}",
+            lifted.stmts
+        );
+    }
+
+    #[test]
+    fn a_sixteen_bit_lifter_names_sixteen_bit_registers() {
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        static CDECL16: X86Target = X86Target::cdecl16();
+        let mut lifter = Lifter::new(&CDECL16, &name_of, &symbols);
+        let insns = texts(&["mov ax, bx", "add ax, 0x10", "ret"]);
+        let lifted = LifterTrait::lift_block(&mut lifter, &insns);
+        let rendered: Vec<String> = lifted
+            .stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Assign { dest, value } => {
+                    format!("{dest} = {}", crate::render::expr(value))
+                }
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert!(rendered.iter().any(|s| s.contains("ax")), "{rendered:?}");
+        assert!(!rendered.iter().any(|s| s.contains("eax")), "{rendered:?}");
+    }
+
+    #[test]
+    fn sixteen_bit_segment_and_bcd_instructions_lift_without_unparsed_comments() {
+        // These are the 16-bit forms a DOS COM file uses and a 32/64-bit
+        // lifter has no register table for. Segment loads move only the
+        // selector, `arpl` adjusts a selector, and `pusha`/`popa` cover the
+        // eight general registers. Each must produce a statement or an
+        // explicit note, never a silent `unparsed` comment.
+        let name_of = |_: Addr| "f".to_string();
+        let symbols = |_: &str| None;
+        static CDECL16: X86Target = X86Target::cdecl16();
+        let mut lifter = Lifter::new(&CDECL16, &name_of, &symbols);
+        let insns = texts(&["push ds", "pop ds", "arpl ax, bx", "pusha", "popa", "fwait"]);
+        let lifted = LifterTrait::lift_block(&mut lifter, &insns);
+        assert!(
+            !lifted
+                .stmts
+                .iter()
+                .any(|s| matches!(s, Stmt::Comment(c) if c.contains("unparsed"))),
+            "{:?}",
+            lifted.stmts
+        );
+        let notes = lifter.notes();
+        assert!(
+            notes.iter().any(|(_, n)| n.contains("selector")),
+            "{notes:?}"
+        );
+        assert!(notes.iter().any(|(_, n)| n.contains("arpl")), "{notes:?}");
     }
 
     #[test]

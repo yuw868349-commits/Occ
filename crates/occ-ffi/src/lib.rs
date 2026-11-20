@@ -41,6 +41,15 @@
 // The library boundary may not panic; a test may.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+// A C ABI that catches panics is only true under unwinding. `catch_unwind`
+// returns immediately under `panic = "abort"`, and a panic in a cdylib then
+// aborts the calling process instead of producing the NULL the header
+// promises. Refusing to build is the only way that promise cannot rot.
+#[cfg(panic = "abort")]
+compile_error!(
+    "occ-ffi requires `panic = \"unwind\"`: its C ABI catches panics and reports them as NULL"
+);
+
 use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
@@ -967,6 +976,32 @@ mod tests {
         unsafe { occ_free(j) };
         assert!(text.contains("\"count\""), "{text}");
         unsafe { occ_close(s) };
+    }
+
+    #[test]
+    fn a_panic_becomes_null_with_a_message() {
+        let mut err = [0 as c_char; 256];
+        let p = call_json(err.as_mut_ptr(), err.len(), || -> Result<String, String> {
+            panic!("deliberate test panic")
+        });
+        assert!(p.is_null());
+        let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_str().unwrap();
+        assert!(msg.contains("internal panic"), "{msg}");
+        assert!(msg.contains("deliberate test panic"), "{msg}");
+    }
+
+    #[test]
+    fn a_panic_in_a_scalar_call_returns_the_failure_value() {
+        let mut err = [0 as c_char; 256];
+        let n = call_raw(
+            err.as_mut_ptr(),
+            err.len(),
+            0u32,
+            || -> Result<u32, String> { panic!("scalar panic") },
+        );
+        assert_eq!(n, 0);
+        let msg = unsafe { CStr::from_ptr(err.as_ptr()) }.to_str().unwrap();
+        assert!(msg.contains("scalar panic"), "{msg}");
     }
 
     #[test]

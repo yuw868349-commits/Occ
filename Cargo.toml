@@ -42,7 +42,10 @@ occ-vsa = { path = "crates/occ-vsa" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# occ-ffi promises C callers that a panic is caught and reported as NULL.
+# `catch_unwind` is a no-op under `panic = "abort"`, so the release profile
+# must unwind; the compile guard in occ-ffi enforces this.
+panic = "unwind"
 strip = "symbols"
 
 [profile.dev]

@@ -12,6 +12,7 @@
 //!    image lists the open ones. An error a model can read is a retry that
 //!    works.
 
+use occ_analyze::view::View;
 use occ_core::{
     Addr, Depth, Evidence, EvidenceKind, EvidenceSource, Function, Handle, ResourceName,
 };
@@ -186,8 +187,8 @@ static TOOLS: [ToolDef; 41] = [
     ),
     tool!(
         "code.functions",
-        "Recovered functions with size, block count and call degree. Sort by size or instruction count to find the interesting ones; filter by name substring.",
-        r#"{"type":"object","properties":{"image":{"type":"integer"},"filter":{"type":"string"},"min_insns":{"type":"integer"},"sort":{"type":"string","description":"addr, size, insns, complexity, callers, callees"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
+        "Recovered functions with size, block count, call degree and boundary confidence. Speculative sweep bodies are omitted by default; a name filter includes them, and `include_speculative` asks for them explicitly.",
+        r#"{"type":"object","properties":{"image":{"type":"integer"},"filter":{"type":"string"},"min_insns":{"type":"integer"},"min_confidence":{"type":"integer","description":"0-100; keep functions whose boundary confidence is at least this percentage"},"include_speculative":{"type":"boolean","description":"include sweep bodies with no caller, symbol or format evidence (default: true only when filter is set)"},"sort":{"type":"string","description":"addr, size, insns, complexity, callers, callees"},"limit":{"type":"integer"},"offset":{"type":"integer"}},"additionalProperties":false}"#,
         code_functions
     ),
     tool!(
@@ -198,7 +199,7 @@ static TOOLS: [ToolDef; 41] = [
     ),
     tool!(
         "code.disasm",
-        "Disassemble from an address or function entry for up to N instructions. Each instruction reports its flow kind and resolved target.",
+        "Disassemble from a function handle or an exact address for up to N instructions. A bare address starts decoding at that byte; a function handle returns the recovered linear body. Each instruction reports its flow kind and resolved target.",
         r#"{"type":"object","properties":{"image":{"type":"integer"},"target":{"type":"string","description":"function handle, symbol, or address"},"count":{"type":"integer","description":"instructions, default 40, max 2000"},"depth":{"type":"string"}},"required":["target"],"additionalProperties":false}"#,
         code_disasm
     ),
@@ -1074,26 +1075,62 @@ fn binary_fingerprint(session: &Session, args: &Args) -> Result<Value, String> {
 // code tools
 // ---------------------------------------------------------------------------
 
+/// Caveats that say a body is a guess rather than a verified function.
+///
+/// A sweep body with no caller, symbol or format evidence gets a confidence
+/// below one half. Printing its instructions as if they were a function is
+/// exactly the failure this avoids: the body may span several functions and
+/// a jump table, and every instruction after the first boundary is then
+/// attributed to the wrong name.
+fn speculative_caveats(f: &Function) -> Vec<String> {
+    if !f.is_speculative() {
+        return Vec::new();
+    }
+    vec![format!(
+        "boundary is speculative (confidence {:.2}): it lacks a symbol, format record or caller that confirms the start; {} instructions may span more than one function, so treat this body as a starting point, not a verified function",
+        f.boundary_confidence,
+        f.insns.len()
+    )]
+}
+
 fn code_functions(session: &Session, args: &Args) -> Result<Value, String> {
     let file = args.file(session)?;
     let filter = args.opt_str("filter").map(|s| s.to_ascii_lowercase());
     let min_insns = args.u64_in("min_insns", 0, 0, u64::MAX)? as usize;
+    // A sweep with no caller, symbol or format evidence produces bodies that
+    // can be thousands of instructions long and still be guesses. They are
+    // excluded by default because a reader that sorts by `insns` otherwise
+    // sees them first and has no way to know they are unverified. Asking for
+    // one by name is a deliberate act, so a filter includes them; the row still
+    // carries `speculative: true` and the confidence that made it so.
+    let include_speculative = args.bool_or("include_speculative", filter.is_some())?;
+    let min_confidence = args.u64_in("min_confidence", 0, 0, 100)? as f32 / 100.0;
     let sort = args.one_of(
         "sort",
         "addr",
         &["addr", "size", "insns", "complexity", "callers", "callees"],
     )?;
     let (offset, limit) = args.page(100, 2000)?;
+    let mut omitted_speculative = 0usize;
     let mut items: Vec<&Function> = file
         .analysis
         .functions
         .iter()
         .filter(|f| f.insns.len() >= min_insns)
+        .filter(|f| f.boundary_confidence + f32::EPSILON >= min_confidence)
         .filter(|f| {
             filter
                 .as_ref()
                 .map(|x| f.display_name().to_ascii_lowercase().contains(x))
                 .unwrap_or(true)
+        })
+        .filter(|f| {
+            if include_speculative || !f.is_speculative() {
+                true
+            } else {
+                omitted_speculative += 1;
+                false
+            }
         })
         .collect();
     match sort {
@@ -1117,19 +1154,37 @@ fn code_functions(session: &Session, args: &Args) -> Result<Value, String> {
                 "complexity" => Value::from(f.cyclomatic_complexity()),
                 "callers" => Value::from(f.callers.len()),
                 "callees" => Value::from(f.callees.len()),
+                "confidence" => Value::from(f64::from(f.boundary_confidence)),
+                "speculative" => f.is_speculative(),
+                "swept" => f.from_sweep,
+                "overlap_skips" => Value::from(f.overlap_skips),
                 "thunk" => f.is_thunk,
             )
         })
         .collect();
     let total = rows.len();
     let (page, truncated) = paginate(&rows, offset, limit);
+    let mut caveats = Vec::new();
+    if omitted_speculative > 0 {
+        caveats.push(format!(
+            "{omitted_speculative} speculative function(s) with no caller, symbol or format evidence were omitted; pass include_speculative=true to inspect them"
+        ));
+    }
+    if min_confidence > 0.0 {
+        caveats.push(format!(
+            "only functions with boundary confidence >= {:.0}% are listed",
+            min_confidence * 100.0
+        ));
+    }
     Ok(Envelope::ok(format!(
         "{total} function(s); sorted by {sort}; {} total instructions",
         file.analysis.coverage.insns
     ))
     .field("functions", Value::Array(page))
     .field("total", Value::from(total))
+    .field("omitted_speculative", Value::from(omitted_speculative))
     .truncated(truncated)
+    .caveats(caveats)
     .next(vec!["code.function with a fn: handle".into()])
     .build())
 }
@@ -1169,6 +1224,7 @@ fn code_function(session: &Session, args: &Args) -> Result<Value, String> {
     .field("function", data)
     .evidence(f.boundary_evidence.clone())
     .confidence(f.boundary_confidence)
+    .caveats(speculative_caveats(f))
     .next(vec![
         format!("code.blocks for {}", Handle::function(f.entry)),
         format!(
@@ -1239,7 +1295,8 @@ fn code_decompile(session: &Session, args: &Args) -> Result<Value, String> {
     .field("code", Value::from(code))
     .field("notes", Value::Array(notes))
     .evidence(f.boundary_evidence.clone())
-    .confidence((f.boundary_confidence * 0.9).clamp(0.0, 1.0));
+    .confidence((f.boundary_confidence * 0.9).clamp(0.0, 1.0))
+    .caveats(speculative_caveats(f));
     match &opts.debug {
         Some(dbg) => {
             e = e.field(
@@ -1817,40 +1874,84 @@ fn code_disasm(session: &Session, args: &Args) -> Result<Value, String> {
     let target = args.req_str("target")?;
     let count = args.u64_in("count", 40, 1, 2000)? as usize;
     let t = handle_target(session, id, target)?;
-    let start = match &t {
-        Target::Function { entry, .. } => *entry,
-        Target::Insn { addr, .. } => *addr,
+    let f = match &t {
+        Target::Function { entry, .. } => file.analysis.function_at(*entry),
+        Target::Insn { addr, .. } => file.analysis.function_covering(*addr),
         _ => return Err("target must be a function or an address".into()),
     };
-    let f = file.analysis.function_covering(start);
-    let mut out = Vec::new();
-    for i in 0..count {
-        let addr = match f {
-            Some(f) => {
-                let idx = f.insns.iter().position(|x| x.addr == start).unwrap_or(0);
-                match f.insns.get(idx + i) {
-                    Some(x) => x,
-                    None => break,
-                }
+    let (start, rows) = match &t {
+        // A function handle asks for the recovered body. That body is now one
+        // linear stream by construction: adjacent instructions never share a
+        // byte, and blocks index the same list. Slicing it by index is safe,
+        // unlike the address lookup that used to silently fall back to entry.
+        Target::Function { entry, .. } => {
+            let f = f.ok_or_else(|| format!("no function at {entry}"))?;
+            (
+                f.entry,
+                f.insns.iter().take(count).cloned().collect::<Vec<_>>(),
+            )
+        }
+        // A bare address asks what the processor sees from that byte. Recovery
+        // may have chosen a different boundary; the linear walk starts exactly
+        // here, and the caveat below says when that disagrees with the body.
+        Target::Insn { addr, .. } => {
+            let limit = f.and_then(|f| (f.size > 0).then(|| f.entry.add(f.size)));
+            (
+                *addr,
+                occ_analyze::disasm::disassemble_linear(
+                    &View::new(&file.image, &file.data),
+                    *addr,
+                    count,
+                    limit,
+                ),
+            )
+        }
+        _ => unreachable!(),
+    };
+    let mut rows = rows;
+    // Wasm instructions are structural, not a byte stream. Its function body
+    // is already the linear list the format defines, so use it directly.
+    if matches!(t, Target::Insn { .. }) && rows.is_empty() {
+        if let Some(f) = f {
+            if let Some(i) = f.insns.iter().position(|x| x.addr == start) {
+                rows = f.insns[i..].iter().take(count).cloned().collect();
             }
-            None => match file.analysis.insn_at(start) {
-                Some(x) if i == 0 => x,
-                _ => break,
-            },
-        };
-        let mut v = insn_json(addr);
-        // Every instruction says which source line produced it, when the image
-        // carries a line table. This is the join that turns a disassembly into
-        // something a reader can check against the source.
-        if let Some((file, line, _col)) = file.dwarf.as_ref().and_then(|d| d.line_for(addr.addr))
+        }
+    }
+    if rows.is_empty() {
+        return Err(format!("no instruction at {start}"));
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for insn in &rows {
+        let mut v = insn_json(insn);
+        if let Some((file, line, _col)) = file.dwarf.as_ref().and_then(|d| d.line_for(insn.addr))
             && let Some(obj) = v.as_object_mut()
         {
             obj.insert("source", Value::from(format!("{file}:{line}")));
         }
         out.push(v);
     }
-    if out.is_empty() {
-        return Err(format!("no instruction at {start}"));
+    let mut caveats = Vec::new();
+    if matches!(t, Target::Insn { .. })
+        && let Some(f) = f
+        && let Some(insn) = f.insn_at(start)
+        && insn.addr != start
+    {
+        caveats.push(format!(
+            "{} is inside the instruction at {} ({} bytes); the listing starts at the exact byte",
+            start, insn.addr, insn.len
+        ));
+    }
+    if let Some(f) = f
+        && f.overlap_skips > 0
+    {
+        caveats.push(format!(
+            "{} control-flow target(s) landed inside an already decoded instruction and were left out; the body is the first decode of each byte",
+            f.overlap_skips
+        ));
+    }
+    if let Some(f) = f {
+        caveats.extend(speculative_caveats(f));
     }
     Ok(
         Envelope::ok(format!("{} instruction(s) from {}", out.len(), start))
@@ -1858,6 +1959,7 @@ fn code_disasm(session: &Session, args: &Args) -> Result<Value, String> {
             .field("addr", addr(start))
             .field("function", f.map(|f| f.display_name()).unwrap_or_default())
             .field("insns", Value::Array(out))
+            .caveats(caveats)
             .build(),
     )
 }
@@ -1884,6 +1986,7 @@ fn code_blocks(session: &Session, args: &Args) -> Result<Value, String> {
     .field("entry", addr(f.entry))
     .field("blocks", Value::Array(blocks))
     .field("loops", Value::from(diff::has_loop(f)))
+    .caveats(speculative_caveats(f))
     .next(vec![format!(
         "code.disasm target={} to read the body",
         Handle::function(f.entry)
@@ -2945,6 +3048,7 @@ fn coverage_json(corr: &occ_dynamic::Correlated, limit: usize) -> Value {
                     "blocks" => Value::from(u64::from(f.blocks)),
                     "total_blocks" => Value::from(u64::from(f.blocks_total)),
                     "hits" => Value::from(f.hits),
+                    "overlap" => Value::from(u64::from(f.overlap)),
                 ))
                 .collect()
         ),
@@ -2965,6 +3069,19 @@ fn coverage_json(corr: &occ_dynamic::Correlated, limit: usize) -> Value {
                 .map(|o| obj!(
                     "addr" => addr(o.addr),
                     "section" => Value::from(o.section as u64),
+                ))
+                .collect()
+        ),
+        "overlap_addresses" => Value::from(corr.overlaps.len() as u64),
+        "overlaps" => Value::Array(
+            corr.overlaps
+                .iter()
+                .take(limit)
+                .map(|o| obj!(
+                    "addr" => addr(o.addr),
+                    "insn" => addr(o.insn),
+                    "fn" => Value::from(format!("fn:{}", o.function)),
+                    "count" => Value::from(o.count),
                 ))
                 .collect()
         ),

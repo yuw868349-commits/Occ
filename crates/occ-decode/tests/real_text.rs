@@ -208,7 +208,7 @@ fn rip_relative_operands_resolve_to_the_target_objdump_prints() {
         let d = dec.decode(Addr(row.addr), &l.bytes[rel..]).expect("decode");
         let ours = d
             .rip_target
-            .or_else(|| d.insn.mem_reads.first().map(|m| *m))
+            .or_else(|| d.insn.mem_reads.first().copied())
             .unwrap_or_else(|| panic!("at {:#x}: no resolved target in {}", row.addr, d.insn.text));
         assert_eq!(ours.get(), target, "at {:#x}: {}", row.addr, d.insn.text);
         checked += 1;

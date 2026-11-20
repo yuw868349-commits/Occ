@@ -61,7 +61,7 @@ pub fn published_methods(view: &View, image: &Image) -> Vec<PublishedMethod> {
         while i + 7 <= bytes.len() {
             let size = u16::from_le_bytes([bytes[i], bytes[i + 1]]) as usize;
 
-            if size < 7 || size > 96 {
+            if !(7..=96).contains(&size) {
                 i += 1;
                 continue;
             }

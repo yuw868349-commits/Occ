@@ -229,6 +229,19 @@ pub struct Function {
     pub is_thunk: bool,
     /// Dispatch tables recovered from computed jumps in this function.
     pub jump_tables: Vec<JumpTable>,
+    /// True when the boundary came from the sweep, not from a seed.
+    ///
+    /// A swept body is a guess at a start address that looked like code; it
+    /// is useful in a stripped image but it is not a function declaration.
+    pub from_sweep: bool,
+    /// Control-flow targets that landed inside an already decoded instruction
+    /// and were therefore left out of the body.
+    ///
+    /// These are not errors in the decoder; they are places where two seeds
+    /// disagreed about a byte. The first decode owns the byte, and the count
+    /// makes the disagreement visible instead of silently producing two
+    /// overlapping instructions.
+    pub overlap_skips: usize,
 }
 
 /// A jump table behind a computed branch, and the cases it reaches.
@@ -277,6 +290,8 @@ impl Function {
             boundary_evidence: Vec::new(),
             is_thunk: false,
             jump_tables: Vec::new(),
+            from_sweep: false,
+            overlap_skips: 0,
         }
     }
 
@@ -288,17 +303,42 @@ impl Function {
         }
     }
 
+    /// True when the body is a sweep guess rather than a supported boundary.
+    ///
+    /// A swept body has no caller, no symbol and no format evidence behind it;
+    /// its only support is a prologue-looking first instruction. Such a body
+    /// is still useful — a stripped binary has nothing else — but it is a
+    /// guess, and a guess that is 2778 instructions long is more likely to be
+    /// several functions and a run of data than one function. Listing it
+    /// beside a symbol-backed body without saying so is the problem.
+    pub fn is_speculative(&self) -> bool {
+        self.boundary_confidence < 0.5 && (self.from_sweep || self.callers.is_empty())
+    }
+
+    /// True when the instruction list is a linear stream.
+    ///
+    /// Every instruction must start at or after the byte that ended the one
+    /// before it. A function whose list violates this holds two meanings for
+    /// one byte; its blocks, lifting, decompilation and trace attribution
+    /// cannot agree on what executed, so the invariant is checked rather than
+    /// assumed.
+    pub fn is_linear(&self) -> bool {
+        self.insns.windows(2).all(|w| w[1].addr.0 >= w[0].end().0)
+    }
+
     /// Instruction covering `addr`, if any.
+    ///
+    /// Exact start first, then the instruction that ends after `addr`. Linear
+    /// instructions mean there is at most one candidate: the last one whose
+    /// start is at or before the address. A linear scan here made trace
+    /// attribution quadratic in the number of executed addresses.
     pub fn insn_at(&self, addr: Addr) -> Option<&Instruction> {
-        self.insns
-            .binary_search_by(|i| i.addr.cmp(&addr))
-            .ok()
-            .map(|idx| &self.insns[idx])
-            .or_else(|| {
-                self.insns
-                    .iter()
-                    .find(|i| addr.within(i.addr, u64::from(i.len)))
-            })
+        let at = self.insns.partition_point(|i| i.addr <= addr);
+        if at == 0 {
+            return None;
+        }
+        let i = &self.insns[at - 1];
+        (addr.0 < i.end().0).then_some(i)
     }
 
     /// Block containing `addr`, if any.

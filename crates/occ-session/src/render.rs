@@ -476,6 +476,9 @@ pub fn function_json(f: &Function, an: &Analysis, depth: Depth, image: &Image) -
     m.insert("complexity", Value::from(f.cyclomatic_complexity()));
     m.insert("is_thunk", f.is_thunk);
     m.insert("confidence", Value::from(f64::from(f.boundary_confidence)));
+    m.insert("speculative", f.is_speculative());
+    m.insert("swept", f.from_sweep);
+    m.insert("overlap_skips", Value::from(f.overlap_skips));
     m.insert(
         "callers",
         Value::Array(

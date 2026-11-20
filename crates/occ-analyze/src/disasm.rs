@@ -169,6 +169,7 @@ fn decode_native(
     };
 
     let mut total_insns = 0usize;
+    let mut overlap_skips = 0usize;
     let mut budget_hit = false;
 
     'outer: while let Some(seed) = queue.pop_front() {
@@ -196,6 +197,7 @@ fn decode_native(
             _ => next_entry,
         };
         let outcome = decode_function(view, dec, seed.addr, seed.size, limit, &owned, opts);
+        overlap_skips += outcome.overlap_skips;
         if outcome.func.insns.is_empty() {
             continue;
         }
@@ -209,6 +211,7 @@ fn decode_native(
             budget_hit = true;
         }
         let mut f = outcome.func;
+        f.overlap_skips = outcome.overlap_skips;
         if let Some(source) = seed.source {
             f.boundary_confidence = 1.0;
             f.boundary_evidence.push(Evidence::support(
@@ -243,6 +246,12 @@ fn decode_native(
 
     if opts.sweep_uncovered {
         sweep(view, dec, &mut functions, &mut owned, opts, notes);
+    }
+    if overlap_skips > 0 {
+        notes.push(format!(
+            "{overlap_skips} control-flow target(s) landed inside an already decoded instruction; \
+             they were kept out of the linear body and are reported as coverage conflicts"
+        ));
     }
 
     (functions, thunks)
@@ -392,7 +401,9 @@ pub fn recover(view: &View, opts: &RecoverOptions) -> Recovery {
                 });
             let out = decode_function(view, dec, main_addr, None, limit, &owned, opts);
             if out.func.insns.len() >= 2 {
-                functions.push(out.func);
+                let mut f = out.func;
+                f.overlap_skips = out.overlap_skips;
+                functions.push(f);
             }
         }
         if let Some(f) = functions.iter_mut().find(|f| f.entry == main_addr) {
@@ -507,9 +518,75 @@ pub fn recover(view: &View, opts: &RecoverOptions) -> Recovery {
     }
 }
 
+/// Decode a linear instruction stream starting exactly at `start`.
+///
+/// This is deliberately not a slice of a recovered function's instruction set.
+/// Recovery follows branches and may have decoded a byte from more than one
+/// seed before the linear invariant was enforced; a disassembly request asks
+/// what the processor sees from one address, which is one instruction, then
+/// the next at `addr + len`, and so on. The walk stops at a terminator or at
+/// `limit`; a conditional branch continues on its fall-through because that is
+/// the next byte in the stream.
+///
+/// WebAssembly has no byte-addressed instruction stream in this sense and
+/// returns an empty list; callers with a `Function` should use its decoded
+/// body there.
+pub fn disassemble_linear(
+    view: &View,
+    start: Addr,
+    count: usize,
+    limit: Option<Addr>,
+) -> Vec<Instruction> {
+    let image = view.image();
+    let Some(dec) = AnyDecoder::new(image.arch, image.bits) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(count.min(256));
+    let mut pc = start;
+    while out.len() < count {
+        if let Some(end) = limit
+            && pc.0 >= end.0
+        {
+            break;
+        }
+        let Some(bytes) = view.bytes_to_end(pc) else {
+            break;
+        };
+        let Some(decoded) = decode_at(view, &dec, pc, bytes) else {
+            break;
+        };
+        let insn = decoded.insn;
+        let len = u64::from(insn.len);
+        if len == 0 {
+            break;
+        }
+        let next = pc.add(len);
+        if let Some(end) = limit
+            && next.0 > end.0
+        {
+            break;
+        }
+        let flow = insn.flow;
+        out.push(insn);
+        if matches!(
+            flow,
+            FlowKind::Return
+                | FlowKind::Exception
+                | FlowKind::UnconditionalBranch
+                | FlowKind::IndirectBranch
+        ) {
+            break;
+        }
+        pc = next;
+    }
+    out
+}
+
 struct Outcome {
     func: Function,
     callees: Vec<Addr>,
+    /// Seeds skipped because they landed inside an already decoded instruction.
+    overlap_skips: usize,
 }
 
 /// The conditions an `it` block imposes on the instructions after it.
@@ -566,6 +643,31 @@ impl ItConditions {
     }
 }
 
+/// The instruction that already owns `addr`, if any.
+///
+/// A function body is a linear stream: one byte belongs to one instruction.
+/// Recursive recovery follows several seeds, and a branch target can land in
+/// the middle of an instruction another seed already decoded. Keeping both
+/// makes `Function::insns` non-linear and every consumer — blocks, lift,
+/// decompile, trace correlation — disagree about what the byte is. The first
+/// decoder that claimed the byte wins; the later target is recorded as a
+/// conflict instead of inserted.
+fn owning_insn(insns: &BTreeMap<u64, Instruction>, addr: Addr) -> Option<&Instruction> {
+    insns
+        .range(..=addr.0)
+        .next_back()
+        .and_then(|(_, insn)| (addr.0 < insn.end().0).then_some(insn))
+}
+
+/// The instruction that already owns `addr` in an address-sorted slice.
+fn owning_slice(insns: &[Instruction], addr: Addr) -> Option<&Instruction> {
+    let after = insns.partition_point(|i| i.addr <= addr);
+    after
+        .checked_sub(1)
+        .and_then(|i| insns.get(i))
+        .filter(|insn| addr.0 < insn.end().0)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_function(
     view: &View,
@@ -583,6 +685,7 @@ fn decode_function(
     let mut visited: HashSet<u64> = HashSet::new();
     let mut callees: Vec<Addr> = Vec::new();
     let mut budget = opts.max_insns.min(200_000);
+    let mut overlap_skips = 0usize;
     // The conditions of the `it` block whose instructions are being read.
     //
     // The block is Thumb's only way of saying "this happens on one path",
@@ -610,6 +713,13 @@ fn decode_function(
                 break;
             }
             if insns.contains_key(&pc.0) {
+                break;
+            }
+            if owning_insn(&insns, pc).is_some() {
+                // A branch or call target landed inside an instruction this
+                // function already decoded. Keeping it would create two
+                // meanings for one byte; the linear body keeps the first one.
+                overlap_skips += 1;
                 break;
             }
             let Some(bytes) = view.bytes_to_end(pc) else {
@@ -762,6 +872,7 @@ fn decode_function(
         return Outcome {
             func,
             callees: Vec::new(),
+            overlap_skips,
         };
     }
     let end = func.insns.last().map(|i| i.end()).unwrap_or(entry);
@@ -771,7 +882,11 @@ fn decode_function(
     func.boundary_evidence = evidence;
     callees.sort_by_key(|a| a.0);
     callees.dedup();
-    Outcome { func, callees }
+    Outcome {
+        func,
+        callees,
+        overlap_skips,
+    }
 }
 
 /// Make every function's body and range exclusive.
@@ -799,8 +914,20 @@ fn resolve_overlaps(functions: &mut [Function]) {
         else {
             continue;
         };
-        functions[i].insns.retain(|insn| insn.addr.0 < next);
+        // A later entry wins, and an instruction that straddles it cannot be
+        // split: dropping the instruction is the only linear answer. Keeping
+        // a start before `next` whose end is after it leaves the earlier
+        // function claiming bytes the later one owns.
+        functions[i].insns.retain(|insn| insn.end().0 <= next);
         let f = &mut functions[i];
+        // The retained body is the function's real extent. Leaving `size`
+        // at the pre-trim value makes the range claim bytes the later
+        // function owns, which is what `function_covering` and the trace
+        // span check read.
+        f.size = f
+            .insns
+            .last()
+            .map_or(0, |last| last.end().0.saturating_sub(f.entry.0));
         let mut targets: BranchTargets = BranchTargets::new();
         for table in &f.jump_tables {
             targets.insert(table.at.0, table.targets.clone());
@@ -856,13 +983,19 @@ fn fill_holes(
         let cap = opts.max_insns.min(4096);
         let mut extra: Vec<Instruction> = Vec::new();
         for target in wanted {
-            if have.contains(&target) {
+            if have.contains(&target) || owning_slice(&f.insns, Addr(target)).is_some() {
                 continue;
             }
             let mut chain: Vec<Instruction> = Vec::new();
             let mut pc = Addr(target);
             let mut connected = false;
             while pc.0 < end && !have.contains(&pc.0) && chain.len() < cap {
+                // A chain may run into an instruction that was decoded after
+                // the target list was collected. The linear body keeps that
+                // instruction and the chain stops here.
+                if owning_slice(&f.insns, pc).is_some() {
+                    break;
+                }
                 let Some(bytes) = view.bytes_to_end(pc) else {
                     break;
                 };
@@ -1774,7 +1907,7 @@ fn starts_like_code(insns: &[Instruction]) -> bool {
     let head: Vec<&str> = insns.iter().take(8).map(|i| i.text.as_str()).collect();
     let mut duplicates = 0usize;
     for (i, text) in head.iter().enumerate() {
-        if head[..i].iter().any(|t| *t == *text) {
+        if head[..i].contains(text) {
             duplicates += 1;
         }
     }
@@ -2003,6 +2136,8 @@ fn sweep(
             continue;
         }
         let mut f = out.func;
+        f.overlap_skips = out.overlap_skips;
+        f.from_sweep = true;
         f.is_thunk = is_thunk(&f);
         owned.insert(f.entry.0, f.end().0);
         pending.extend(out.callees.iter().copied());

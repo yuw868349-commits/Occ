@@ -257,9 +257,7 @@ pub fn fingerprint(image: &Image, view: &View) -> Fingerprint {
             CompilerFamily::Go
         } else if symbols.contains("$s") {
             CompilerFamily::Swift
-        } else if mingw && !msvc_link {
-            CompilerFamily::Gcc
-        } else if comment.as_deref().is_some_and(|c| c.contains("GCC:")) {
+        } else if (mingw && !msvc_link) || comment.as_deref().is_some_and(|c| c.contains("GCC:")) {
             CompilerFamily::Gcc
         } else if msvc_link || msvc_rt.is_some() {
             CompilerFamily::Msvc
@@ -573,12 +571,7 @@ fn delphi_symbols(symbols: &str) -> bool {
 /// the RTL looks them up by name.
 fn vcl_unit_names(data: &[u8]) -> bool {
     const UNITS: &[&str] = &[
-        "Classes",
-        "Forms",
-        "Controls",
-        "StdCtrls",
-        "SysUtils",
-        "Graphics",
+        "Classes", "Forms", "Controls", "StdCtrls", "SysUtils", "Graphics",
     ];
     let mut found = 0;
     for unit in UNITS {

@@ -383,6 +383,59 @@ fn a_run_does_not_hang_when_the_program_waits_for_input() {
 }
 
 #[test]
+fn an_address_inside_an_instruction_is_an_overlap_not_an_orphan() {
+    // Recovery and the CPU can disagree about where one instruction ends
+    // without the function being absent. The trace recorded the byte the CPU
+    // really executed; if that byte is inside an instruction the body already
+    // recovered, the function must keep the hit and report an overlap, and the
+    // address must not also appear as an orphan.
+    let Some(l) = fixture() else { return };
+    let view = View::new(&l.image, &l.data);
+    let analysis = Analysis::build(&view, &AnalysisOptions::default());
+    let (entry, insn) = analysis
+        .functions
+        .iter()
+        .find_map(|f| {
+            f.insns
+                .iter()
+                .find(|i| i.len > 1)
+                .map(|i| (f.entry, i.clone()))
+        })
+        .expect("a multi-byte instruction");
+    let inside = Addr(insn.addr.0 + 1);
+    let mut t = trace_of(&l, &RunConfig::default());
+    // Keep only the synthetic byte: without the overlap path this address
+    // would be an orphan, and the function would be listed as never executed.
+    t.path_taken = vec![inside];
+    let corr = correlate(&t, &l.image, &analysis);
+
+    let hit = corr
+        .functions
+        .iter()
+        .find(|h| h.entry == entry)
+        .expect("the owning function keeps the hit");
+    assert_eq!(hit.overlap, 1, "{hit:?}");
+    assert_eq!(hit.hits, 1, "{hit:?}");
+    let overlap = corr
+        .overlaps
+        .iter()
+        .find(|o| o.addr == inside)
+        .expect("the overlap is reported");
+    assert_eq!(overlap.insn, insn.addr);
+    assert_eq!(overlap.function, entry);
+    assert!(
+        !corr.orphans.iter().any(|o| o.addr == inside),
+        "{:?}",
+        corr.orphans
+    );
+    assert!(
+        !corr.missed.iter().any(|(e, _)| *e == entry),
+        "{:?}",
+        corr.missed
+    );
+}
+
+#[test]
 fn a_second_thread_is_traced_and_does_not_deadlock_the_join() {
     let Some(l) = build("threaded", THREADED).map(load) else {
         return;

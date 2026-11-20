@@ -36,6 +36,14 @@ pub struct FunctionHit {
     pub blocks: u32,
     /// Basic blocks the recovery found.
     pub blocks_total: u32,
+    /// Distinct executed addresses inside this function that fall inside a
+    /// recovered instruction rather than at its start.
+    ///
+    /// This is a recovery disagreement, not an orphan: the program ran a byte
+    /// the body claims belongs to another instruction. It is counted apart so
+    /// the function is not reported as never executed, and so `insns` never
+    /// exceeds `total`.
+    pub overlap: u32,
 }
 
 /// An executed address inside the image that no recovered function covers.
@@ -45,6 +53,20 @@ pub struct Orphan {
     pub addr: Addr,
     /// Index of the section it falls in.
     pub section: usize,
+}
+
+/// An executed address inside an instruction, at a boundary the recovery did
+/// not choose.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overlap {
+    /// Executed address, in image coordinates.
+    pub addr: Addr,
+    /// Start of the recovered instruction that contains it.
+    pub insn: Addr,
+    /// Entry of the function that owns that instruction.
+    pub function: Addr,
+    /// Times the address was executed.
+    pub count: u32,
 }
 
 /// One target a call site reached.
@@ -87,6 +109,9 @@ pub struct Correlated {
     pub missed: Vec<(Addr, String)>,
     /// Executed addresses inside the image that no function covers.
     pub orphans: Vec<Orphan>,
+    /// Executed addresses that fall inside a recovered instruction instead of
+    /// at its start, with the instruction and function that claim the byte.
+    pub overlaps: Vec<Overlap>,
     /// Call sites, ordered by address.
     pub calls: Vec<CallSite>,
 }
@@ -155,6 +180,7 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
     struct Acc {
         hits: u64,
         distinct: u32,
+        overlap: u32,
     }
     let mut acc = vec![Acc::default(); functions.len()];
 
@@ -169,20 +195,44 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
     // caller has no way to resolve. The tightest function wins, so a body
     // recovered inside another one is credited to the inner one.
     let mut owner: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut ranges: BTreeMap<u64, (usize, Addr, u32)> = BTreeMap::new();
     let mut by_span: Vec<usize> = (0..functions.len()).collect();
     by_span.sort_by_key(|&i| functions[i].end().0.saturating_sub(functions[i].entry.0));
     for i in by_span {
         for insn in &functions[i].insns {
             owner.entry(insn.addr.0).or_insert(i);
+            ranges
+                .entry(insn.addr.0)
+                .or_insert((i, insn.addr, insn.len));
         }
     }
 
     let mut orphans = Vec::new();
+    let mut overlaps = Vec::new();
     for (&addr, &count) in &hits {
         let a = Addr(addr);
         if let Some(&i) = owner.get(&addr) {
             acc[i].hits += u64::from(count);
             acc[i].distinct += 1;
+            continue;
+        }
+        // Exact starts miss when recovery chose a different boundary. The
+        // byte still belongs to a recovered instruction; treating it as an
+        // orphan made a function that demonstrably ran look unreachable and
+        // made the coverage table disagree with the attribution table. The
+        // address is counted as an overlap, not as a distinct instruction,
+        // because the body has no instruction starting there.
+        if let Some((_, &(i, insn, len))) = ranges.range(..addr).next_back()
+            && addr < insn.0 + u64::from(len)
+        {
+            acc[i].hits += u64::from(count);
+            acc[i].overlap += 1;
+            overlaps.push(Overlap {
+                addr: a,
+                insn,
+                function: functions[i].entry,
+                count,
+            });
             continue;
         }
         if let Some(s) = image.section_at(a)
@@ -194,6 +244,7 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
             });
         }
     }
+    overlaps.sort_by_key(|o| o.addr.0);
     let executed_in_image = hits.len();
     let external = trace.external_steps;
 
@@ -215,6 +266,7 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
             hits: acc[i].hits,
             blocks,
             blocks_total: f.blocks.len() as u32,
+            overlap: acc[i].overlap,
         });
     }
     rows.sort_by(|a, b| b.hits.cmp(&a.hits).then(a.entry.cmp(&b.entry)));
@@ -222,7 +274,7 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
     let missed: Vec<(Addr, String)> = functions
         .iter()
         .enumerate()
-        .filter(|(i, f)| !f.insns.is_empty() && acc[*i].distinct == 0)
+        .filter(|(i, f)| !f.insns.is_empty() && acc[*i].distinct == 0 && acc[*i].overlap == 0)
         .map(|(_, f)| (f.entry, f.display_name()))
         .collect();
 
@@ -260,6 +312,7 @@ pub fn correlate(trace: &Trace, image: &Image, analysis: &Analysis) -> Correlate
         functions: rows,
         missed,
         orphans,
+        overlaps,
         calls,
     }
 }
